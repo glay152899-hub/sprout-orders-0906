@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
-  <title>Sprout 📱 小豆苗訂單助手 V2.6.3 (Firebase RTDB 實時同步版)</title>
+  <title>Sprout 📱 小豆苗訂單助手 V2.7.0 (Firebase RTDB 實時同步版)</title>
   <!-- Tailwind CSS CDN -->
   <script src="https://cdn.tailwindcss.com"></script>
   <!-- React & ReactDOM Core Libraries -->
@@ -708,6 +708,47 @@
     // 統一四捨五入成整數，避免小數單價造成 99.99999 之類的顯示
     const calcOrderTotal = (order) =>
       Math.round(calcOrderSubtotal(order) + (Number(order?.shippingFee) || 0));
+
+    // ==========================================
+    // [V2.7] 回收桶 + 操作日誌 共用工具
+    // ==========================================
+    const ORDER_FIELD_LABELS = {
+      orderNo: '單號',
+      customerName: '姓名',
+      customerPhone: '電話',
+      deliveryMethod: '物流方式',
+      storeName: '門市/地址',
+      shippingFee: '運費',
+      paymentStatus: '付款狀態',
+      shipmentStatus: '出貨狀態',
+      note: '備註',
+      items: '商品明細'
+    };
+
+    const formatLogTime = (ts) => {
+      const d = new Date(Number(ts));
+      if (isNaN(d.getTime())) return '';
+      const pad = (n) => String(n).padStart(2, '0');
+      return `${d.getMonth() + 1}/${d.getDate()} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    };
+
+    const shortUser = (email) => String(email || '').split('@')[0] || '（未知）';
+
+    const formatLogValue = (key, value) => {
+      if (key === 'paymentStatus') return value ? '已付款' : '未付款';
+      if (key === 'shipmentStatus') return value === 'shipped' ? '已出貨' : '待出貨';
+      if (value === '' || value === null || value === undefined) return '（空）';
+      return String(value);
+    };
+
+    // 把「編輯訂單」日誌的 before / after 轉成一行看得懂的文字（商品明細只說有修改）
+    const describeEditDiff = (entry) => {
+      if (!entry?.before || !entry?.after) return '';
+      return Object.keys(entry.after).map(key => {
+        if (key === 'items') return '商品明細已修改';
+        return `${ORDER_FIELD_LABELS[key] || key}：${formatLogValue(key, entry.before[key])} → ${formatLogValue(key, entry.after[key])}`;
+      }).join('；');
+    };
 
     // [V2.6.3] 單號若只是「日期 + 姓名」（例如 0914王振婷），跟卡片上已有的日期、姓名重複，展開時就不再顯示
     const isOrderNoRedundant = (order) => {
@@ -1631,6 +1672,221 @@
       );
     }
 
+
+    // ==========================================
+    // [V2.7] 回收桶視窗：還原 / 永久刪除
+    // ==========================================
+    function TrashModal({ trashOrders, trashProducts, onRestore, onPurge, onPurgeAll, onClose }) {
+      const [tab, setTab] = React.useState('orders');
+      const list = tab === 'orders' ? trashOrders : trashProducts;
+
+      return (
+        <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-sm flex items-end sm:items-center justify-center" onClick={onClose}>
+          <div
+            className="bg-white w-full sm:max-w-lg rounded-t-3xl sm:rounded-2xl shadow-2xl flex flex-col max-h-[88vh]"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="px-5 pt-4 pb-3 flex items-center justify-between border-b border-slate-100">
+              <div>
+                <h3 className="font-bold text-base text-slate-800">🗑️ 回收桶</h3>
+                <p className="text-[11px] text-slate-400">刪除的資料會先放在這裡，按「還原」就會回到原本的位置</p>
+              </div>
+              <button type="button" onClick={onClose} className="p-1.5 text-slate-400 hover:text-slate-700 rounded-lg hover:bg-slate-100">
+                <IconX size={22} />
+              </button>
+            </div>
+
+            <div className="px-4 pt-3 flex items-center gap-2">
+              {[
+                { key: 'orders', label: `訂單 (${trashOrders.length})` },
+                { key: 'products', label: `商品 (${trashProducts.length})` }
+              ].map(t => (
+                <button
+                  key={t.key}
+                  type="button"
+                  onClick={() => setTab(t.key)}
+                  className={`px-3.5 py-1.5 rounded-xl text-xs font-bold transition ${
+                    tab === t.key ? 'bg-slate-900 text-white' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                  }`}
+                >
+                  {t.label}
+                </button>
+              ))}
+            </div>
+
+            <div className="flex-1 overflow-y-auto mt-2 border-t border-slate-100">
+              {list.length === 0 ? (
+                <div className="text-center text-sm text-slate-400 py-12">
+                  {tab === 'orders' ? '沒有已刪除的訂單' : '沒有已刪除的商品'}
+                </div>
+              ) : list.map(item => (
+                <div key={item.id} className="px-4 py-3 border-b border-slate-100 space-y-2">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="text-sm font-bold text-slate-800 leading-snug break-words">
+                        {tab === 'orders' ? item.customerName : item.name}
+                      </div>
+                      <div className="text-[11px] text-slate-500 mt-0.5">
+                        {tab === 'orders'
+                          ? `${(item.items || []).filter(i => !isAdjustmentItem(i)).length} 項商品 · ${item.deliveryMethod}`
+                          : `${item.sku || '無款號'} · ${item.category || '未分類'} · 尺寸 ${item.sizes}`}
+                      </div>
+                    </div>
+                    <div className="text-base font-black text-emerald-600 flex-shrink-0">
+                      ${tab === 'orders' ? calcOrderTotal(item) : item.price}
+                    </div>
+                  </div>
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-[11px] text-slate-400">
+                      刪除於 {formatLogTime(item.deletedAt)} · {shortUser(item.deletedBy)}
+                    </span>
+                    <div className="flex items-center gap-1.5 flex-shrink-0">
+                      <button
+                        type="button"
+                        onClick={() => onRestore(tab, item)}
+                        className="px-3 py-1.5 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 font-bold rounded-lg text-xs whitespace-nowrap"
+                      >
+                        ♻️ 還原
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => onPurge(tab, item)}
+                        className="px-2.5 py-1.5 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded-lg text-xs whitespace-nowrap"
+                      >
+                        永久刪除
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <div className="p-3 border-t border-slate-100 flex items-center justify-between gap-2">
+              <span className="text-[11px] text-slate-400">回收桶的資料不會自動清除</span>
+              <button
+                type="button"
+                disabled={trashOrders.length + trashProducts.length === 0}
+                onClick={onPurgeAll}
+                className="px-3 py-1.5 text-xs font-bold text-red-600 bg-red-50 hover:bg-red-100 disabled:opacity-40 disabled:cursor-not-allowed rounded-lg whitespace-nowrap"
+              >
+                清空回收桶
+              </button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ==========================================
+    // [V2.7] 操作日誌視窗：最近 200 筆，編輯訂單可「還原此次修改」
+    // ==========================================
+    function LogModal({ orders, onRevert, onClose }) {
+      const [entries, setEntries] = React.useState(null); // null = 載入中
+      const [filter, setFilter] = React.useState('all');
+
+      React.useEffect(() => {
+        const query = dbRef('logs').orderByKey().limitToLast(200); // 推播 ID 依時間排序，不需要另外建索引
+        const handler = query.on('value', (snapshot) => {
+          const val = snapshot.val() || {};
+          const list = Object.entries(val)
+            .map(([id, data]) => ({ id, ...data }))
+            .sort((a, b) => (b.ts || 0) - (a.ts || 0));
+          setEntries(list);
+        }, (error) => {
+          console.error('Logs error:', error);
+          setEntries([]);
+        });
+        return () => query.off('value', handler);
+      }, []);
+
+      const isDangerAction = (a) => /delete|purge/.test(a || '');
+      const filtered = (entries || []).filter(e => {
+        if (filter === 'all') return true;
+        if (filter === 'order') return e.target === 'order';
+        if (filter === 'product') return e.target === 'product';
+        if (filter === 'danger') return isDangerAction(e.action) || /restore/.test(e.action || '');
+        return true;
+      });
+
+      const actionBadge = (a) => {
+        if (isDangerAction(a)) return { text: '刪除', cls: 'bg-red-100 text-red-700' };
+        if (/restore|revert/.test(a || '')) return { text: '還原', cls: 'bg-emerald-100 text-emerald-700' };
+        if (/create|import/.test(a || '')) return { text: '新增', cls: 'bg-blue-100 text-blue-700' };
+        return { text: '修改', cls: 'bg-amber-100 text-amber-800' };
+      };
+
+      return (
+        <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-sm flex items-end sm:items-center justify-center" onClick={onClose}>
+          <div
+            className="bg-white w-full sm:max-w-lg rounded-t-3xl sm:rounded-2xl shadow-2xl flex flex-col max-h-[88vh]"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="px-5 pt-4 pb-3 flex items-center justify-between border-b border-slate-100">
+              <div>
+                <h3 className="font-bold text-base text-slate-800">📒 操作日誌</h3>
+                <p className="text-[11px] text-slate-400">最近 200 筆 · 記錄誰在什麼時候改了什麼</p>
+              </div>
+              <button type="button" onClick={onClose} className="p-1.5 text-slate-400 hover:text-slate-700 rounded-lg hover:bg-slate-100">
+                <IconX size={22} />
+              </button>
+            </div>
+
+            <div className="px-4 pt-3 flex items-center gap-1.5 overflow-x-auto scrollbar-none">
+              {[
+                { key: 'all', label: '全部' },
+                { key: 'order', label: '訂單' },
+                { key: 'product', label: '商品' },
+                { key: 'danger', label: '刪除與還原' }
+              ].map(f => (
+                <button
+                  key={f.key}
+                  type="button"
+                  onClick={() => setFilter(f.key)}
+                  className={`px-3 py-1 rounded-xl text-xs font-semibold flex-shrink-0 transition ${
+                    filter === f.key ? 'bg-slate-900 text-white' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                  }`}
+                >
+                  {f.label}
+                </button>
+              ))}
+            </div>
+
+            <div className="flex-1 overflow-y-auto mt-2 border-t border-slate-100">
+              {entries === null ? (
+                <div className="text-center text-sm text-slate-400 py-12">載入中...</div>
+              ) : filtered.length === 0 ? (
+                <div className="text-center text-sm text-slate-400 py-12">還沒有紀錄</div>
+              ) : filtered.map(e => {
+                const badge = actionBadge(e.action);
+                const diff = e.action === 'order_edit' ? describeEditDiff(e) : '';
+                const canRevert = e.action === 'order_edit' && e.before && orders.some(o => o.id === e.targetId);
+                return (
+                  <div key={e.id} className="px-4 py-2.5 border-b border-slate-100 space-y-1">
+                    <div className="flex items-center gap-2 text-[11px] text-slate-400">
+                      <span className={`px-1.5 py-0.5 rounded font-bold ${badge.cls}`}>{badge.text}</span>
+                      <span className="font-mono">{formatLogTime(e.ts)}</span>
+                      <span>· {shortUser(e.user)}</span>
+                    </div>
+                    <div className="text-xs sm:text-sm text-slate-800 leading-snug break-words">{e.summary}</div>
+                    {diff && <div className="text-[11px] text-slate-500 leading-snug break-words">{diff}</div>}
+                    {canRevert && (
+                      <button
+                        type="button"
+                        onClick={() => onRevert(e)}
+                        className="mt-1 px-2.5 py-1 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 font-bold rounded-lg text-[11px]"
+                      >
+                        ↩︎ 還原此次修改
+                      </button>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
     // ==========================================
     // [V2.5] 登入：只有 Firebase 裡建立的帳號能進來
     // 帳號由管理者在 Firebase Console 建立（畫面上沒有「註冊」）。
@@ -1839,6 +2095,12 @@
       const [isProductBatchDeleting, setIsProductBatchDeleting] = React.useState(false);
       const productsFlagSynced = React.useRef(false);
 
+      // [V2.7] 回收桶與操作日誌
+      const [trashOrders, setTrashOrders] = React.useState([]);
+      const [trashProducts, setTrashProducts] = React.useState([]);
+      const [isTrashOpen, setIsTrashOpen] = React.useState(false);
+      const [isLogOpen, setIsLogOpen] = React.useState(false);
+
       const showToast = (msg) => {
         setToastMessage(msg);
         setTimeout(() => setToastMessage(''), 2500);
@@ -1919,10 +2181,24 @@
           setTallyChecked(snapshot.val() || {});
         });
 
+        // 5. [V2.7] 回收桶
+        const trashRef = dbRef('trash');
+        trashRef.on('value', (snapshot) => {
+          const val = snapshot.val() || {};
+          const build = (node, sanitize) => Object.entries(node || {})
+            .map(([id, data]) => ({ ...sanitize({ id, ...data }), deletedAt: data.deletedAt || 0, deletedBy: data.deletedBy || '' }))
+            .sort((a, b) => b.deletedAt - a.deletedAt);
+          setTrashOrders(build(val.orders, sanitizeOrder));
+          setTrashProducts(build(val.products, sanitizeProduct));
+        }, (error) => {
+          console.error("RTDB Trash Error:", error);
+        });
+
         return () => {
           ordersRef.off();
           productsRef.off();
           tallyRef.off();
+          trashRef.off();
           connectedRef.off();
         };
       }, []);
@@ -2173,6 +2449,40 @@
       const currentOrderTotal = currentOrderSubtotal + Number(shippingFee || 0);
 
       // Create New Order in RTDB
+      // ==========================================
+      // [V2.7] 操作日誌 + 回收桶：共用工具
+      // ==========================================
+      const userEmail = user?.email || '';
+
+      // 寫入日誌（失敗不影響主要操作）。日誌只記姓名與金額，不記電話、地址。
+      const cleanForDb = (obj) => JSON.parse(JSON.stringify(obj));
+      const logAction = (action, target, targetId, summary, extra = {}) => {
+        try {
+          dbRef('logs').push({
+            ts: Date.now(),
+            user: userEmail,
+            action,
+            target,
+            targetId: targetId || '',
+            summary,
+            ...cleanForDb(extra)
+          }).catch((err) => console.error('Log write error:', err));
+        } catch (err) {
+          console.error('Log error:', err);
+        }
+      };
+
+      // 要放進回收桶的資料：去掉 id（id 當作路徑），加上刪除時間與刪除者
+      const trashEntry = (data) => {
+        const { id, ...rest } = data;
+        return cleanForDb({ ...rest, deletedAt: Date.now(), deletedBy: userEmail });
+      };
+
+      const summarizeNames = (names) => {
+        const shown = names.slice(0, 5).join('、');
+        return names.length > 5 ? `${shown} 等 ${names.length} 筆` : shown;
+      };
+
       const handleSubmitNewOrder = async (e) => {
         e.preventDefault();
         if (!customerName.trim()) {
@@ -2199,8 +2509,10 @@
         };
 
         try {
-          await dbRef('orders').push(newOrderObj);
-          
+          const newRef = dbRef('orders').push();
+          await newRef.set(newOrderObj);
+          logAction('order_create', 'order', newRef.key, `建立訂單：${customerName}（$${calcOrderTotal(newOrderObj)}）`);
+
           setCustomerName('');
           setCustomerPhone('');
           setStoreName('');
@@ -2222,6 +2534,8 @@
           await dbRef(`orders/${orderId}`).update({
             paymentStatus: !currentStatus
           });
+          const target = orders.find(o => o.id === orderId);
+          logAction('order_payment', 'order', orderId, `付款狀態：${target?.customerName || ''}　${currentStatus ? '已付款' : '未付款'} → ${currentStatus ? '未付款' : '已付款'}`);
           showToast('更新付款狀態成功');
         } catch (err) {
           console.error("Toggle payment error:", err);
@@ -2233,6 +2547,8 @@
           await dbRef(`orders/${orderId}`).update({
             shipmentStatus: currentStatus === 'shipped' ? 'unshipped' : 'shipped'
           });
+          const target = orders.find(o => o.id === orderId);
+          logAction('order_shipment', 'order', orderId, `出貨狀態：${target?.customerName || ''}　${currentStatus === 'shipped' ? '已出貨' : '待出貨'} → ${currentStatus === 'shipped' ? '待出貨' : '已出貨'}`);
           showToast('更新出貨狀態成功');
         } catch (err) {
           console.error("Toggle shipment error:", err);
@@ -2241,9 +2557,17 @@
 
       const handleDeleteOrderConfirm = async () => {
         if (!confirmDeleteId) return;
+        const target = orders.find(o => o.id === confirmDeleteId);
         try {
-          await dbRef(`orders/${confirmDeleteId}`).remove();
-          showToast('訂單已從雲端刪除');
+          if (target) {
+            // 一次寫入：從 orders 移除 + 放進 trash/orders（要嘛都成功、要嘛都不動）
+            await dbRoot().update({
+              [`orders/${target.id}`]: null,
+              [`trash/orders/${target.id}`]: trashEntry(target)
+            });
+            logAction('order_delete', 'order', target.id, `刪除訂單：${target.customerName}（$${calcOrderTotal(target)}）→ 回收桶`);
+            showToast('🗑️ 訂單已移到回收桶（報表匯出 → 回收桶 可還原）');
+          }
         } catch (err) {
           console.error("Delete order error:", err);
         } finally {
@@ -2282,6 +2606,13 @@
 
         try {
           await dbRef(`orders/${original.id}`).update(changes);
+
+          // 日誌保留「修改前」的值，之後可以在日誌裡一鍵還原
+          const before = {};
+          Object.keys(changes).forEach(k => { before[k] = original[k]; });
+          const labels = Object.keys(changes).map(k => ORDER_FIELD_LABELS[k] || k);
+          logAction('order_edit', 'order', original.id, `編輯訂單：${edited.customerName}（${labels.join('、')}）`, { before, after: changes });
+
           showToast(`✅ 訂單「${edited.customerName}」已更新並同步雲端`);
           setEditingOrder(null);
         } catch (err) {
@@ -2365,6 +2696,7 @@
           });
 
           await dbRef('orders').update(updates);
+          logAction('order_import', 'order', '', `匯入 Excel 訂單 ${selectedDrafts.length} 筆：${summarizeNames(selectedDrafts.map(d => d.customerName))}`);
           showToast(`🎉 成功匯入 ${selectedDrafts.length} 筆訂單至雲端！`);
           setIsOrderImportModalOpen(false);
           setOrderImportDrafts([]);
@@ -2440,15 +2772,19 @@
 
       const handleBatchDeleteConfirm = async () => {
         // 只刪「目前畫面上看得到、且有勾選」的訂單，避免刪到被篩選隱藏的資料
-        const ids = filteredOrders.filter(o => selectedOrderIds.has(o.id)).map(o => o.id);
-        if (ids.length === 0) return;
+        const targets = filteredOrders.filter(o => selectedOrderIds.has(o.id));
+        if (targets.length === 0) return;
 
         setIsBatchDeleting(true);
         try {
           const updates = {};
-          ids.forEach(id => { updates[id] = null; }); // 設成 null = 刪除；一次寫入，要嘛全刪要嘛全不刪
-          await dbRef('orders').update(updates);
-          showToast(`🗑️ 已刪除 ${ids.length} 筆訂單`);
+          targets.forEach(o => {
+            updates[`orders/${o.id}`] = null;                 // null = 從訂單移除
+            updates[`trash/orders/${o.id}`] = trashEntry(o);  // 同時放進回收桶（一次寫入，要嘛全成功、要嘛全不動）
+          });
+          await dbRoot().update(updates);
+          logAction('order_batch_delete', 'order', '', `批次刪除 ${targets.length} 筆訂單 → 回收桶：${summarizeNames(targets.map(o => o.customerName))}`);
+          showToast(`🗑️ 已移到回收桶：${targets.length} 筆訂單`);
           setSelectedOrderIds(new Set());
           setSelectMode(false);
           setConfirmBatchDelete(false);
@@ -2502,16 +2838,22 @@
 
       const handleProductBatchDeleteConfirm = async () => {
         // 只刪「目前畫面上看得到、且有勾選」的商品
-        const ids = filteredProducts.filter(p => selectedProductIds.has(p.id)).map(p => p.id);
-        if (ids.length === 0) return;
+        const targets = filteredProducts
+          .filter(p => selectedProductIds.has(p.id))
+          .map(p => products.find(raw => raw.id === p.id) || p); // 回收桶存原始資料，不含即時計算的欄位
+        if (targets.length === 0) return;
 
         setIsProductBatchDeleting(true);
         try {
           const updates = {};
-          ids.forEach(id => { updates[`products/${id}`] = null; }); // null = 刪除
-          updates['settings/productsSeeded'] = true;                // 標記已初始化，全刪後不會自動補回範例商品
-          await dbRoot().update(updates);                           // 一次寫入：要嘛全刪、要嘛全不刪
-          showToast(`🗑️ 已刪除 ${ids.length} 項商品`);
+          targets.forEach(p => {
+            updates[`products/${p.id}`] = null;                 // null = 從商品庫移除
+            updates[`trash/products/${p.id}`] = trashEntry(p);  // 同時放進回收桶
+          });
+          updates['settings/productsSeeded'] = true;            // 標記已初始化，全刪後不會自動補回範例商品
+          await dbRoot().update(updates);                       // 一次寫入：要嘛全成功、要嘛全不動
+          logAction('product_batch_delete', 'product', '', `批次刪除 ${targets.length} 項商品 → 回收桶：${summarizeNames(targets.map(p => p.name))}`);
+          showToast(`🗑️ 已移到回收桶：${targets.length} 項商品`);
           setSelectedProductIds(new Set());
           setProductSelectMode(false);
           setConfirmProductBatchDelete(false);
@@ -2520,6 +2862,75 @@
           showToast('❌ 批次刪除失敗，請檢查權限或網路連線');
         } finally {
           setIsProductBatchDeleting(false);
+        }
+      };
+
+      // ---------- [V2.7] 回收桶：還原 / 永久刪除 ----------
+      const handleRestoreTrash = async (kind, item) => {
+        const { id, deletedAt, deletedBy, ...data } = item; // kind: 'orders' | 'products'
+        const isOrder = kind === 'orders';
+        try {
+          await dbRoot().update({
+            [`${kind}/${id}`]: cleanForDb(data),
+            [`trash/${kind}/${id}`]: null
+          });
+          logAction(isOrder ? 'order_restore' : 'product_restore', isOrder ? 'order' : 'product', id,
+            `還原${isOrder ? '訂單' : '商品'}：${isOrder ? item.customerName : item.name}`);
+          showToast('♻️ 已還原');
+        } catch (err) {
+          console.error("Restore error:", err);
+          showToast('❌ 還原失敗，請檢查網路連線');
+        }
+      };
+
+      const handlePurgeTrash = async (kind, item) => {
+        const isOrder = kind === 'orders';
+        const label = isOrder ? item.customerName : item.name;
+        if (!window.confirm(`確定要永久刪除「${label}」嗎？\n這個動作無法復原。`)) return;
+        try {
+          await dbRoot().update({ [`trash/${kind}/${item.id}`]: null });
+          logAction(isOrder ? 'order_purge' : 'product_purge', isOrder ? 'order' : 'product', item.id, `永久刪除${isOrder ? '訂單' : '商品'}：${label}`);
+          showToast('已永久刪除');
+        } catch (err) {
+          console.error("Purge error:", err);
+          showToast('❌ 刪除失敗');
+        }
+      };
+
+      const handlePurgeAllTrash = async () => {
+        const total = trashOrders.length + trashProducts.length;
+        if (total === 0) return;
+        if (!window.confirm(`確定要清空回收桶嗎？\n共 ${total} 筆資料會被永久刪除，無法復原。`)) return;
+        try {
+          await dbRoot().update({ trash: null });
+          logAction('trash_purge_all', 'system', '', `清空回收桶（${trashOrders.length} 筆訂單、${trashProducts.length} 項商品）`);
+          showToast('🧹 回收桶已清空');
+        } catch (err) {
+          console.error("Purge all error:", err);
+          showToast('❌ 清空失敗');
+        }
+      };
+
+      // ---------- [V2.7] 日誌：還原「編輯訂單」 ----------
+      const handleRevertOrderEdit = async (entry) => {
+        const order = orders.find(o => o.id === entry.targetId);
+        if (!order) {
+          showToast('這張訂單已不存在（可能已在回收桶，請先還原訂單）');
+          return;
+        }
+        if (!entry.before) return;
+        const labels = Object.keys(entry.before).map(k => ORDER_FIELD_LABELS[k] || k);
+        if (!window.confirm(`要把「${order.customerName}」的這些欄位還原到修改前嗎？\n${labels.join('、')}\n（之後又改過的內容會被蓋回去）`)) return;
+
+        try {
+          const current = {};
+          Object.keys(entry.before).forEach(k => { current[k] = order[k]; }); // 還原前的值，也記進日誌，之後還能再改回來
+          await dbRef(`orders/${entry.targetId}`).update(entry.before);
+          logAction('order_edit_revert', 'order', entry.targetId, `還原修改：${order.customerName}（${labels.join('、')}）`, { before: current, after: entry.before });
+          showToast('↩︎ 已還原到修改前');
+        } catch (err) {
+          console.error("Revert error:", err);
+          showToast('❌ 還原失敗，請檢查網路連線');
         }
       };
 
@@ -2619,9 +3030,12 @@
         try {
           if (editingProduct.id) {
             await dbRef(`products/${editingProduct.id}`).update(prodData);
+            logAction('product_edit', 'product', editingProduct.id, `編輯商品：${prodData.name}`);
             showToast('已成功更新商品資料！');
           } else {
-            await dbRef('products').push(prodData);
+            const newRef = dbRef('products').push();
+            await newRef.set(prodData);
+            logAction('product_create', 'product', newRef.key, `新增商品：${prodData.name}（$${prodData.price}）`);
             showToast('🎉 新商品已新增至雲端庫！');
           }
           setIsProductModalOpen(false);
@@ -2645,7 +3059,9 @@
             status: 'active',
             createdAt: new Date().toISOString()
           };
-          await dbRef('products').push(dupData);
+          const newRef = dbRef('products').push();
+          await newRef.set(dupData);
+          logAction('product_create', 'product', newRef.key, `複製商品：${prod.name}`);
           showToast(`已成功複製商品：「${prod.name}」`);
         } catch (err) {
           console.error("Duplicate product error:", err);
@@ -2656,6 +3072,7 @@
         const nextStatus = prod.status === 'archived' ? 'active' : 'archived';
         try {
           await dbRef(`products/${prod.id}`).update({ status: nextStatus });
+          logAction('product_archive', 'product', prod.id, `${nextStatus === 'archived' ? '下架歸檔' : '重新上架'}：${prod.name}`);
           showToast(nextStatus === 'archived' ? '商品已下架歸檔' : '商品已重新上架');
         } catch (err) {
           console.error("Archive product error:", err);
@@ -2663,10 +3080,17 @@
       };
 
       const handleDeleteProduct = async (prodId) => {
-        if (!window.confirm('確定要永久刪除此商品嗎？')) return;
+        if (!window.confirm('確定要刪除此商品嗎？\n（會移到回收桶，之後可以還原）')) return;
+        const target = products.find(p => p.id === prodId);
         try {
-          await dbRef(`products/${prodId}`).remove();
-          showToast('商品已從雲端刪除');
+          if (target) {
+            await dbRoot().update({
+              [`products/${target.id}`]: null,
+              [`trash/products/${target.id}`]: trashEntry(target)
+            });
+            logAction('product_delete', 'product', target.id, `刪除商品：${target.name}（$${target.price}）→ 回收桶`);
+            showToast('🗑️ 商品已移到回收桶（報表匯出 → 回收桶 可還原）');
+          }
         } catch (err) {
           console.error("Delete product error:", err);
         }
@@ -2732,6 +3156,7 @@
 
           // 一次性寫入，要嘛全成功、要嘛全失敗
           await dbRef('products').update(updates);
+          logAction('product_import', 'product', '', `匯入 Excel 商品 ${toImport.length} 項：${summarizeNames(toImport.map(p => p.name))}`);
           showToast(`🎉 成功匯入 ${toImport.length} 項商品！`);
           setIsImportModalOpen(false);
           setImportRawRows([]);
@@ -3040,7 +3465,7 @@
                   <IconTrash2 size={24} />
                 </div>
                 <h3 className="font-bold text-slate-800 text-base">確定刪除此筆訂單？</h3>
-                <p className="text-xs text-slate-500">刪除後資料將無法恢復，請確認是否繼續。</p>
+                <p className="text-xs text-slate-500">訂單會先移到回收桶，之後可到「報表匯出 → 回收桶」還原。</p>
                 <div className="flex gap-2 pt-2">
                   <button
                     type="button"
@@ -3059,6 +3484,25 @@
                 </div>
               </div>
             </div>
+          )}
+
+          {/* [V2.7] Trash + Log modals */}
+          {isTrashOpen && (
+            <TrashModal
+              trashOrders={trashOrders}
+              trashProducts={trashProducts}
+              onRestore={handleRestoreTrash}
+              onPurge={handlePurgeTrash}
+              onPurgeAll={handlePurgeAllTrash}
+              onClose={() => setIsTrashOpen(false)}
+            />
+          )}
+          {isLogOpen && (
+            <LogModal
+              orders={orders}
+              onRevert={handleRevertOrderEdit}
+              onClose={() => setIsLogOpen(false)}
+            />
           )}
 
           {/* [V2.4] Product Picker Panel (bottom sheet) */}
@@ -3085,8 +3529,8 @@
                 </div>
                 <h3 className="font-bold text-slate-800 text-base">確定刪除 {selectedProductVisibleCount} 項商品？</h3>
                 <p className="text-xs text-slate-500">
-                  刪除後<b className="text-red-600">無法復原</b>。已建立的訂單不會受影響（訂單內保留自己的商品資料），
-                  但這些商品將不能再從商品庫快速帶入訂單。
+                  商品會先<b className="text-emerald-700">移到回收桶</b>，之後可到「報表匯出 → 回收桶」還原。
+                  已建立的訂單不受影響，但刪除期間不能從商品庫快速帶入這些商品。
                   {IS_TEST_MODE ? '（目前是測試模式，只會刪到測試資料）' : '（目前是「正式資料」）'}
                 </p>
                 <div className="flex gap-2 pt-1">
@@ -3120,8 +3564,8 @@
                 </div>
                 <h3 className="font-bold text-slate-800 text-base">確定刪除 {selectedVisibleCount} 筆訂單？</h3>
                 <p className="text-xs text-slate-500">
-                  這些訂單合計 ${selectedVisibleTotal.toLocaleString()}。刪除後<b className="text-red-600">無法復原</b>，
-                  建議先按「匯出 Excel」留一份備份。
+                  這些訂單合計 ${selectedVisibleTotal.toLocaleString()}。會先<b className="text-emerald-700">移到回收桶</b>，
+                  之後可到「報表匯出 → 回收桶」還原。
                   {IS_TEST_MODE ? '（目前是測試模式，只會刪到測試資料）' : '（目前是「正式資料」）'}
                 </p>
                 <div className="flex gap-2 pt-1">
@@ -3445,7 +3889,7 @@
                 <div>
                   <h1 className="text-base sm:text-lg lg:text-xl font-bold leading-tight flex items-center gap-2">
                     小豆苗訂單助手
-                    <span className="text-[10px] sm:text-xs bg-emerald-700 text-emerald-100 px-2 py-0.5 rounded-full font-mono">v2.6.3 RTDB</span>
+                    <span className="text-[10px] sm:text-xs bg-emerald-700 text-emerald-100 px-2 py-0.5 rounded-full font-mono">v2.7.0 RTDB</span>
                     {IS_TEST_MODE && (
                       <span className="text-[10px] sm:text-xs bg-amber-400 text-slate-900 px-2 py-0.5 rounded-full font-bold">🧪 測試模式</span>
                     )}
@@ -4291,7 +4735,7 @@
                           <div className="px-3.5 pb-2.5 pt-1 sm:px-4 sm:pb-3 flex items-center justify-between gap-2">
                             <div className="flex items-baseline gap-2 min-w-0">
                               <span className="font-bold text-base sm:text-lg text-emerald-600">${totalAmount}</span>
-                              <span className="text-[11px] sm:text-xs text-slate-400 whitespace-nowrap">{dateShort}</span>
+                              <span className="text-sm font-medium text-slate-500 whitespace-nowrap">{dateShort}</span>
                             </div>
 
                             <div className="flex items-center gap-0.5 flex-shrink-0">
@@ -4948,6 +5392,30 @@
                     >
                       <IconDownload size={18} />
                       下載商品庫與滯銷分析 Excel
+                    </button>
+                  </div>
+                </div>
+
+                {/* [V2.7] Data protection: trash + log */}
+                <div className="bg-white rounded-2xl border border-slate-200/80 p-4 sm:p-5 shadow-sm space-y-2.5">
+                  <h3 className="font-bold text-sm sm:text-base text-slate-800">🛡️ 資料保護</h3>
+                  <p className="text-xs sm:text-sm text-slate-500">
+                    刪除的訂單和商品會先放進回收桶，可以還原；重要操作都會記在日誌裡，改錯的訂單可以還原到修改前。
+                  </p>
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setIsTrashOpen(true)}
+                      className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs sm:text-sm rounded-xl border border-slate-200 transition whitespace-nowrap"
+                    >
+                      🗑️ 回收桶 ({trashOrders.length + trashProducts.length})
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setIsLogOpen(true)}
+                      className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs sm:text-sm rounded-xl border border-slate-200 transition whitespace-nowrap"
+                    >
+                      📒 操作日誌
                     </button>
                   </div>
                 </div>
