@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
-  <title>Sprout 📱 小豆苗訂單助手 V2.7.0 (Firebase RTDB 實時同步版)</title>
+  <title>Sprout 📱 小豆苗訂單助手 V2.7.1 (Firebase RTDB 實時同步版)</title>
   <!-- Tailwind CSS CDN -->
   <script src="https://cdn.tailwindcss.com"></script>
   <!-- React & ReactDOM Core Libraries -->
@@ -3889,7 +3889,7 @@
                 <div>
                   <h1 className="text-base sm:text-lg lg:text-xl font-bold leading-tight flex items-center gap-2">
                     小豆苗訂單助手
-                    <span className="text-[10px] sm:text-xs bg-emerald-700 text-emerald-100 px-2 py-0.5 rounded-full font-mono">v2.7.0 RTDB</span>
+                    <span className="text-[10px] sm:text-xs bg-emerald-700 text-emerald-100 px-2 py-0.5 rounded-full font-mono">v2.7.1 RTDB</span>
                     {IS_TEST_MODE && (
                       <span className="text-[10px] sm:text-xs bg-amber-400 text-slate-900 px-2 py-0.5 rounded-full font-bold">🧪 測試模式</span>
                     )}
@@ -5347,26 +5347,6 @@
             {/* Tab 5: Reports Dashboard & Export */}
             {activeTab === 'export' && (
               <div className="space-y-4 sm:space-y-6">
-                {/* Analytics Dashboard */}
-                <div className="grid grid-cols-2 md:grid-cols-4 gap-3 sm:gap-4">
-                  <div className="bg-white p-4 sm:p-5 rounded-2xl border border-slate-200/80 shadow-sm">
-                    <span className="text-xs sm:text-sm text-slate-400 font-medium block mb-1">總營業額 (含運費)</span>
-                    <span className="text-xl sm:text-2xl lg:text-3xl font-bold text-emerald-600">${stats.totalRevenue}</span>
-                  </div>
-                  <div className="bg-white p-4 sm:p-5 rounded-2xl border border-slate-200/80 shadow-sm">
-                    <span className="text-xs sm:text-sm text-slate-400 font-medium block mb-1">總訂單數</span>
-                    <span className="text-xl sm:text-2xl lg:text-3xl font-bold text-slate-800">{stats.totalOrders} 筆</span>
-                  </div>
-                  <div className="bg-white p-4 sm:p-5 rounded-2xl border border-slate-200/80 shadow-sm">
-                    <span className="text-xs sm:text-sm text-slate-400 font-medium block mb-1">賣出商品件數</span>
-                    <span className="text-xl sm:text-2xl lg:text-3xl font-bold text-slate-800">{stats.totalItemsCount} 件</span>
-                  </div>
-                  <div className="bg-white p-4 sm:p-5 rounded-2xl border border-slate-200/80 shadow-sm">
-                    <span className="text-xs sm:text-sm text-slate-400 font-medium block mb-1">滯銷預警商品數</span>
-                    <span className="text-xl sm:text-2xl lg:text-3xl font-bold text-red-600">{stats.stagnantAlertCount} 項</span>
-                  </div>
-                </div>
-
                 {/* Export Card */}
                 <div className="bg-gradient-to-br from-slate-900 to-slate-800 text-white rounded-2xl p-6 sm:p-8 shadow-lg space-y-4">
                   <div className="flex items-center gap-3">
