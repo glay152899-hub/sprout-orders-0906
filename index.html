@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
-  <title>Sprout 📱 小豆苗訂單助手 V2.7.1 (Firebase RTDB 實時同步版)</title>
+  <title>Sprout 📱 小豆苗訂單助手 V2.7.2 (Firebase RTDB 實時同步版)</title>
   <!-- Tailwind CSS CDN -->
   <script src="https://cdn.tailwindcss.com"></script>
   <!-- React & ReactDOM Core Libraries -->
@@ -255,6 +255,23 @@
         <polyline points="23 4 23 10 17 10"></polyline>
         <polyline points="1 20 1 14 7 14"></polyline>
         <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
+      </svg>
+    );
+
+    const IconMore = ({ size = 20, className = "" }) => (
+      <svg width={size} height={size} viewBox="0 0 24 24" fill="currentColor" stroke="none" className={className}>
+        <circle cx="5" cy="12" r="2"></circle>
+        <circle cx="12" cy="12" r="2"></circle>
+        <circle cx="19" cy="12" r="2"></circle>
+      </svg>
+    );
+
+    const IconFileDown = ({ size = 20, className = "" }) => (
+      <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}>
+        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+        <polyline points="14 2 14 8 20 8"></polyline>
+        <line x1="12" y1="11" x2="12" y2="17"></line>
+        <polyline points="9 14 12 17 15 14"></polyline>
       </svg>
     );
 
@@ -748,6 +765,48 @@
         if (key === 'items') return '商品明細已修改';
         return `${ORDER_FIELD_LABELS[key] || key}：${formatLogValue(key, entry.before[key])} → ${formatLogValue(key, entry.after[key])}`;
       }).join('；');
+    };
+
+    // [V2.7.2] 訂單時間戳記：Excel 匯入的訂單時間是我們固定填的「中午 12 點」（沒有真實時間），
+    // 只有在程式裡建立的訂單才有真實時間，所以匯入的訂單只顯示日期。
+    const isSyntheticNoonTs = (ts) => {
+      const d = new Date(Number(ts));
+      if (isNaN(d.getTime())) return true;
+      const noon = new Date(d.getFullYear(), d.getMonth(), d.getDate(), 12, 0, 0, 0).getTime();
+      return Math.abs(d.getTime() - noon) <= 5000; // 匯入時為了維持順序會差幾毫秒
+    };
+
+    const formatOrderTimeShort = (ts) => {
+      if (isSyntheticNoonTs(ts)) return '';
+      const d = new Date(Number(ts));
+      return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+    };
+
+    // 例如「9/21 14:32」；匯入的訂單只有「9/16」
+    const formatOrderStamp = (order) => {
+      const date = formatOrderDateShort(order?.createdAt);
+      const time = formatOrderTimeShort(order?.timestamp);
+      return time ? `${date} ${time}` : date;
+    };
+
+    // 「相同訂單」：同一位客人、同樣的商品明細、同樣的總金額
+    const orderSignature = (o) => {
+      const items = (o.items || [])
+        .map(i => `${String(i.name || '').trim()}|${i.color || ''}|${i.size || ''}|${Number(i.price) || 0}|${Number(i.qty) || 0}`)
+        .sort()
+        .join(';');
+      return `${String(o.customerName || '').trim()}#${calcOrderTotal(o)}#${items}`;
+    };
+
+    const findDuplicateOrder = (item, orders) => {
+      const sig = orderSignature(item);
+      return (orders || []).find(o => o.id !== item.id && orderSignature(o) === sig) || null;
+    };
+
+    const findDuplicateProduct = (item, products) => {
+      const key = String(item.name || '').trim().toLowerCase();
+      if (!key) return null;
+      return (products || []).find(p => p.id !== item.id && String(p.name || '').trim().toLowerCase() === key) || null;
     };
 
     // [V2.6.3] 單號若只是「日期 + 姓名」（例如 0914王振婷），跟卡片上已有的日期、姓名重複，展開時就不再顯示
@@ -1676,7 +1735,7 @@
     // ==========================================
     // [V2.7] 回收桶視窗：還原 / 永久刪除
     // ==========================================
-    function TrashModal({ trashOrders, trashProducts, onRestore, onPurge, onPurgeAll, onClose }) {
+    function TrashModal({ trashOrders, trashProducts, orders, products, onRestore, onPurge, onPurgeAll, onClose }) {
       const [tab, setTab] = React.useState('orders');
       const list = tab === 'orders' ? trashOrders : trashProducts;
 
@@ -1728,7 +1787,7 @@
                       </div>
                       <div className="text-[11px] text-slate-500 mt-0.5">
                         {tab === 'orders'
-                          ? `${(item.items || []).filter(i => !isAdjustmentItem(i)).length} 項商品 · ${item.deliveryMethod}`
+                          ? `${(item.items || []).filter(i => !isAdjustmentItem(i)).length} 項商品 · ${item.deliveryMethod} · 建立 ${formatOrderStamp(item)}`
                           : `${item.sku || '無款號'} · ${item.category || '未分類'} · 尺寸 ${item.sizes}`}
                       </div>
                     </div>
@@ -1736,6 +1795,16 @@
                       ${tab === 'orders' ? calcOrderTotal(item) : item.price}
                     </div>
                   </div>
+                  {(() => {
+                    const dup = tab === 'orders' ? findDuplicateOrder(item, orders) : findDuplicateProduct(item, products);
+                    return dup ? (
+                      <div className="text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-2 py-1 leading-snug">
+                        ⚠️ {tab === 'orders'
+                          ? `目前已有相同的訂單（${formatOrderStamp(dup)} 建立），還原後會變成兩筆`
+                          : '目前已有同名的商品，還原後會有兩個同名商品'}
+                      </div>
+                    ) : null;
+                  })()}
                   <div className="flex items-center justify-between gap-2">
                     <span className="text-[11px] text-slate-400">
                       刪除於 {formatLogTime(item.deletedAt)} · {shortUser(item.deletedBy)}
@@ -2566,7 +2635,7 @@
               [`trash/orders/${target.id}`]: trashEntry(target)
             });
             logAction('order_delete', 'order', target.id, `刪除訂單：${target.customerName}（$${calcOrderTotal(target)}）→ 回收桶`);
-            showToast('🗑️ 訂單已移到回收桶（報表匯出 → 回收桶 可還原）');
+            showToast('🗑️ 訂單已移到回收桶（更多 → 回收桶 可還原）');
           }
         } catch (err) {
           console.error("Delete order error:", err);
@@ -2869,6 +2938,16 @@
       const handleRestoreTrash = async (kind, item) => {
         const { id, deletedAt, deletedBy, ...data } = item; // kind: 'orders' | 'products'
         const isOrder = kind === 'orders';
+
+        // [V2.7.2] 還原前先比對：目前已有「相同的訂單 / 同名商品」就提醒，由使用者決定要不要還原
+        const dup = isOrder ? findDuplicateOrder(item, orders) : findDuplicateProduct(item, products);
+        if (dup) {
+          const msg = isOrder
+            ? `目前已經有一筆看起來相同的訂單：\n${dup.customerName}　$${calcOrderTotal(dup)}　${formatOrderStamp(dup)} 建立\n\n仍要還原嗎？（還原後會有兩筆）`
+            : `目前已經有同名的商品：「${dup.name}」\n\n仍要還原嗎？（還原後會有兩個同名商品）`;
+          if (!window.confirm(msg)) return;
+        }
+
         try {
           await dbRoot().update({
             [`${kind}/${id}`]: cleanForDb(data),
@@ -3089,7 +3168,7 @@
               [`trash/products/${target.id}`]: trashEntry(target)
             });
             logAction('product_delete', 'product', target.id, `刪除商品：${target.name}（$${target.price}）→ 回收桶`);
-            showToast('🗑️ 商品已移到回收桶（報表匯出 → 回收桶 可還原）');
+            showToast('🗑️ 商品已移到回收桶（更多 → 回收桶 可還原）');
           }
         } catch (err) {
           console.error("Delete product error:", err);
@@ -3444,7 +3523,7 @@
         { id: 'list', label: '訂單列表', icon: IconList },
         { id: 'tally', label: '理貨清單', icon: IconCheckSquare, badge: stats.unshippedCount },
         { id: 'products', label: '商品庫', icon: IconDatabase },
-        { id: 'export', label: '報表匯出', icon: IconDownload }
+        { id: 'export', label: '更多', icon: IconMore }
       ];
 
       return (
@@ -3465,7 +3544,7 @@
                   <IconTrash2 size={24} />
                 </div>
                 <h3 className="font-bold text-slate-800 text-base">確定刪除此筆訂單？</h3>
-                <p className="text-xs text-slate-500">訂單會先移到回收桶，之後可到「報表匯出 → 回收桶」還原。</p>
+                <p className="text-xs text-slate-500">訂單會先移到回收桶，之後可到「更多 → 回收桶」還原。</p>
                 <div className="flex gap-2 pt-2">
                   <button
                     type="button"
@@ -3491,6 +3570,8 @@
             <TrashModal
               trashOrders={trashOrders}
               trashProducts={trashProducts}
+              orders={orders}
+              products={products}
               onRestore={handleRestoreTrash}
               onPurge={handlePurgeTrash}
               onPurgeAll={handlePurgeAllTrash}
@@ -3529,7 +3610,7 @@
                 </div>
                 <h3 className="font-bold text-slate-800 text-base">確定刪除 {selectedProductVisibleCount} 項商品？</h3>
                 <p className="text-xs text-slate-500">
-                  商品會先<b className="text-emerald-700">移到回收桶</b>，之後可到「報表匯出 → 回收桶」還原。
+                  商品會先<b className="text-emerald-700">移到回收桶</b>，之後可到「更多 → 回收桶」還原。
                   已建立的訂單不受影響，但刪除期間不能從商品庫快速帶入這些商品。
                   {IS_TEST_MODE ? '（目前是測試模式，只會刪到測試資料）' : '（目前是「正式資料」）'}
                 </p>
@@ -3565,7 +3646,7 @@
                 <h3 className="font-bold text-slate-800 text-base">確定刪除 {selectedVisibleCount} 筆訂單？</h3>
                 <p className="text-xs text-slate-500">
                   這些訂單合計 ${selectedVisibleTotal.toLocaleString()}。會先<b className="text-emerald-700">移到回收桶</b>，
-                  之後可到「報表匯出 → 回收桶」還原。
+                  之後可到「更多 → 回收桶」還原。
                   {IS_TEST_MODE ? '（目前是測試模式，只會刪到測試資料）' : '（目前是「正式資料」）'}
                 </p>
                 <div className="flex gap-2 pt-1">
@@ -3889,7 +3970,7 @@
                 <div>
                   <h1 className="text-base sm:text-lg lg:text-xl font-bold leading-tight flex items-center gap-2">
                     小豆苗訂單助手
-                    <span className="text-[10px] sm:text-xs bg-emerald-700 text-emerald-100 px-2 py-0.5 rounded-full font-mono">v2.7.1 RTDB</span>
+                    <span className="text-[10px] sm:text-xs bg-emerald-700 text-emerald-100 px-2 py-0.5 rounded-full font-mono">v2.7.2 RTDB</span>
                     {IS_TEST_MODE && (
                       <span className="text-[10px] sm:text-xs bg-amber-400 text-slate-900 px-2 py-0.5 rounded-full font-bold">🧪 測試模式</span>
                     )}
@@ -4446,7 +4527,7 @@
                       title="匯入 Excel 訂單"
                       className={`cursor-pointer px-2.5 py-1.5 sm:px-3 sm:py-2 bg-slate-800 hover:bg-slate-900 text-white font-semibold text-xs sm:text-sm rounded-xl shadow transition flex items-center gap-1 whitespace-nowrap ${isOrderParsing ? 'opacity-50 pointer-events-none' : ''}`}
                     >
-                      <IconUpload size={15} />
+                      <IconDownload size={15} />
                       {isOrderParsing ? '解析中...' : '匯入訂單'}
                       <input type="file" accept=".xlsx, .xls" onChange={handleOrderFileUpload} className="hidden" />
                     </label>
@@ -4456,7 +4537,7 @@
                       className="px-2.5 py-1.5 sm:px-3 sm:py-2 bg-white hover:bg-slate-50 text-slate-700 font-semibold text-xs sm:text-sm rounded-xl border border-slate-200 shadow-sm transition flex items-center gap-1 whitespace-nowrap"
                       title="匯出目前篩選結果"
                     >
-                      <IconDownload size={15} />
+                      <IconUpload size={15} />
                       匯出
                     </button>
                     <button
@@ -4688,7 +4769,7 @@
                       const realItems = order.items.filter(i => !isAdjustmentItem(i));
                       const realItemCount = realItems.length;
 
-                      const dateShort = formatOrderDateShort(order.createdAt);
+                      const dateShort = formatOrderStamp(order); // 日期 + 時間（Excel 匯入的訂單沒有真實時間，只顯示日期）
 
                       return (
                         <div key={order.id} className={`bg-white rounded-2xl border border-slate-200/80 shadow-sm hover:shadow-md overflow-hidden transition ${selectMode && selectedOrderIds.has(order.id) ? 'ring-2 ring-red-400' : ''}`}>
@@ -4975,7 +5056,7 @@
 
                       {/* Excel Import/Export Buttons */}
                       <label className="cursor-pointer flex flex-col md:flex-row items-center justify-center gap-1 px-2 py-2.5 md:px-3 md:py-2 bg-slate-800 hover:bg-slate-900 text-white font-semibold text-[11px] md:text-sm rounded-xl shadow transition whitespace-nowrap">
-                        <IconUpload size={18} />
+                        <IconDownload size={18} />
                         匯入 Excel
                         <input type="file" accept=".xlsx, .xls, .csv" onChange={handleFileUpload} className="hidden" />
                       </label>
@@ -4985,7 +5066,7 @@
                         className="flex flex-col md:flex-row items-center justify-center gap-1 px-2 py-2.5 md:px-3 md:py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold text-[11px] md:text-sm rounded-xl transition border border-slate-200 whitespace-nowrap"
                         title="匯出 Excel 報表"
                       >
-                        <IconDownload size={18} />
+                        <IconUpload size={18} />
                         匯出
                       </button>
 
@@ -5362,7 +5443,7 @@
                       onClick={handleExportCSV}
                       className="px-6 py-3 bg-emerald-500 hover:bg-emerald-600 text-white font-bold text-xs sm:text-sm rounded-xl shadow transition flex items-center justify-center gap-2"
                     >
-                      <IconDownload size={18} />
+                      <IconFileDown size={18} />
                       下載訂單 CSV 報表
                     </button>
 
@@ -5370,7 +5451,7 @@
                       onClick={handleExportProductsExcel}
                       className="px-6 py-3 bg-slate-700 hover:bg-slate-600 text-white font-bold text-xs sm:text-sm rounded-xl shadow transition flex items-center justify-center gap-2"
                     >
-                      <IconDownload size={18} />
+                      <IconFileDown size={18} />
                       下載商品庫與滯銷分析 Excel
                     </button>
                   </div>
