@@ -3,9 +3,28 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
-  <title>Sprout 📱 小豆苗訂單助手 V2.8.0 (Firebase RTDB 實時同步版)</title>
+  <meta name="theme-color" content="#0A7C78" />
+  <title>Sprout 📱 小豆苗訂單助手 V2.8.2 (Firebase RTDB 實時同步版)</title>
   <!-- Tailwind CSS CDN -->
   <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    // [V2.8.1] 主色：接近蒂芙尼藍的青綠色（原本的 emerald 綠色整組換掉）。
+    // 300 / 500 是蒂芙尼藍本色（#81D8D0 / #0ABAB5），太亮，只用在淡色底、邊框、深色底上的字。
+    // 600 以上才用在「白字按鈕、標題列、金額文字」，對比度都在 4.5:1 以上，不影響閱讀。
+    // 沒有載入 Tailwind（例如 Claude 的檔案預覽環境）時就略過，避免出現「tailwind is not defined」
+    if (window.tailwind) tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            emerald: {
+              50: '#F0FBFA', 100: '#D6F4F1', 200: '#ADE9E4', 300: '#81D8D0', 400: '#3FC4BC',
+              500: '#0ABAB5', 600: '#0A7C78', 700: '#0A6864', 800: '#0B5350', 900: '#0C4240', 950: '#062A29'
+            }
+          }
+        }
+      }
+    };
+  </script>
   <!-- React & ReactDOM Core Libraries -->
   <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
   <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
@@ -32,7 +51,7 @@
     .scrollbar-none { -ms-overflow-style: none; scrollbar-width: none; }
   </style>
 </head>
-<body class="bg-slate-50 text-slate-800 antialiased selection:bg-emerald-500 selection:text-white min-h-screen flex flex-col">
+<body class="bg-slate-50 text-slate-800 antialiased selection:bg-emerald-600 selection:text-white min-h-screen flex flex-col">
   <!-- React Mounting Root -->
   <div id="root" class="flex-1 flex flex-col"></div>
 
@@ -4165,7 +4184,7 @@
                 <div>
                   <h1 className="text-base sm:text-lg lg:text-xl font-bold leading-tight flex items-center gap-2">
                     小豆苗訂單助手
-                    <span className="text-[10px] sm:text-xs bg-emerald-700 text-emerald-100 px-2 py-0.5 rounded-full font-mono">v2.8.0 RTDB</span>
+                    <span className="text-[10px] sm:text-xs bg-emerald-700 text-emerald-100 px-2 py-0.5 rounded-full font-mono">v2.8.2 RTDB</span>
                     {IS_TEST_MODE && (
                       <span className="text-[10px] sm:text-xs bg-amber-400 text-slate-900 px-2 py-0.5 rounded-full font-bold">🧪 測試模式</span>
                     )}
@@ -5010,7 +5029,7 @@
                                 onClick={() => handleTogglePayment(order.id, order.paymentStatus)}
                                 className={`px-2 py-1 rounded-full text-[11px] sm:text-xs font-bold transition whitespace-nowrap ${
                                   order.paymentStatus
-                                    ? 'bg-emerald-100 text-emerald-700'
+                                    ? 'bg-green-100 text-green-700'
                                     : 'bg-amber-100 text-amber-700'
                                 }`}
                               >
@@ -5659,7 +5678,7 @@
                   <div className="flex flex-wrap gap-3">
                     <button
                       onClick={handleExportCSV}
-                      className="px-6 py-3 bg-emerald-500 hover:bg-emerald-600 text-white font-bold text-xs sm:text-sm rounded-xl shadow transition flex items-center justify-center gap-2"
+                      className="px-6 py-3 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs sm:text-sm rounded-xl shadow transition flex items-center justify-center gap-2"
                     >
                       <IconFileDown size={18} />
                       下載訂單 CSV 報表
