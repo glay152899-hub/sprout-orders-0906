@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
   <meta name="theme-color" content="#0A7C78" />
-  <title>Sprout 📱 小豆苗訂單助手 V2.11.0 (Firebase RTDB 實時同步版)</title>
+  <title>Sprout 📱 小豆苗訂單助手 V2.12.0 (Firebase RTDB 實時同步版)</title>
   <!-- Tailwind CSS CDN -->
   <script src="https://cdn.tailwindcss.com"></script>
   <script>
@@ -1011,6 +1011,22 @@
       return /^[_＿\-－\s]*$/.test(s) ? '' : s;
     };
 
+    // [V2.12] 姓名欄常見「陳*羽(line:小羽)」「廖*芝(IG:chih913_)」的寫法，
+    // 把 LINE / IG 拆出來獨立存放，姓名欄只留乾淨的姓名。支援半形/全形括號、line/IG 不分大小寫、
+    // 中間冒號可有可無（例如「(line)」代表有留 LINE 但沒寫帳號，姓名照樣清乾淨）。
+    const extractContactFromName = (rawName) => {
+      let name = String(rawName || '');
+      let line = '';
+      let ig = '';
+      name = name.replace(/[（(]\s*(line|ig)\s*[:：]?\s*([^)）]*)[)）]/gi, (match, label, value) => {
+        const v = value.trim();
+        if (/^line$/i.test(label)) { if (v) line = v; }
+        else if (v) { ig = v; }
+        return '';
+      });
+      return { name: name.trim(), line, ig };
+    };
+
     // 這些名稱的工作表視為範本/備份頁，匯入時略過
     const ORDER_IMPORT_SKIP_SHEETS = ['原稿', '工作表37', 'Template', 'Sheet1'];
 
@@ -1051,6 +1067,8 @@
 
         let customerName = '';
         let customerPhone = '';
+        let customerLine = '';
+        let customerIG = '';
         let shippingMethod = '7-11';
         let storeAddress = '';
         let shippingFee = 38;
@@ -1085,6 +1103,13 @@
         customerName = cleanExcelPlaceholder(customerName);
         customerPhone = cleanExcelPlaceholder(customerPhone);
         storeAddress = cleanExcelPlaceholder(storeAddress);
+
+        // [V2.12] 姓名欄若夾帶 (line:xxx) / (IG:xxx)，拆出來放進獨立欄位
+        const contactInfo = extractContactFromName(customerName);
+        customerName = contactInfo.name;
+        customerLine = contactInfo.line;
+        customerIG = contactInfo.ig;
+
         if (!customerName) customerName = cleanedSheetName;
 
         // 2. 尋找商品表頭列 (品項, 金額, 數量)
@@ -1200,6 +1225,8 @@
             orderNo: cleanedSheetName,
             customerName,
             customerPhone,
+            customerLine,
+            customerIG,
             deliveryMethod: mapImportedDelivery(shippingMethod),
             storeName: storeAddress,
             shippingFee: draftShipping,
@@ -1622,7 +1649,10 @@
                         {r.adjustLine && <span className="text-[11px] bg-amber-100 text-amber-800 px-2 py-0.5 rounded-full font-bold">含差額調整</span>}
                       </div>
                       <div className="text-[11px] sm:text-xs text-slate-500 mt-0.5">
-                        {r.d.orderTimestamp ? `📅 ${new Date(r.d.orderTimestamp).toLocaleDateString('zh-TW')}` : '📅 匯入當天'} · {r.d.customerPhone || '無電話'} · {r.d.deliveryMethod} · {r.d.storeName || '無門市資訊'}
+                        {r.d.orderTimestamp ? `📅 ${new Date(r.d.orderTimestamp).toLocaleDateString('zh-TW')}` : '📅 匯入當天'} · {r.d.customerPhone || '無電話'}
+                        {r.d.customerLine && <> · 💬 {r.d.customerLine}</>}
+                        {r.d.customerIG && <> · 📷 {r.d.customerIG}</>}
+                        {' '}· {r.d.deliveryMethod} · {r.d.storeName || '無門市資訊'}
                       </div>
 
                       <div className="mt-2 space-y-0.5 text-[11px] sm:text-xs text-slate-600">
