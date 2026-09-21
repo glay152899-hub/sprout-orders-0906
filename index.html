@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
   <meta name="theme-color" content="#0A7C78" />
-  <title>Sprout 📱 小豆苗訂單助手 V2.10.0 (Firebase RTDB 實時同步版)</title>
+  <title>Sprout 📱 小豆苗訂單助手 V2.11.0 (Firebase RTDB 實時同步版)</title>
   <!-- Tailwind CSS CDN -->
   <script src="https://cdn.tailwindcss.com"></script>
   <script>
@@ -661,6 +661,8 @@
       orderNo: order?.orderNo || '', // [V2.1] 選填：Excel 匯入時帶入工作表名稱 (例如 0901林 涔)
       customerName: order?.customerName || '顧客',
       customerPhone: order?.customerPhone || '',
+      customerLine: order?.customerLine || '', // [V2.11] LINE ID（沒有電話的客人可用這個聯絡）
+      customerIG: order?.customerIG || '', // [V2.11] IG 帳號
       deliveryMethod: order?.deliveryMethod || '7-11 取貨付款',
       storeName: order?.storeName || '',
       shippingFee: Number(order?.shippingFee) ?? 60,
@@ -768,6 +770,8 @@
       orderNo: '單號',
       customerName: '姓名',
       customerPhone: '電話',
+      customerLine: 'LINE',
+      customerIG: 'IG',
       deliveryMethod: '物流方式',
       storeName: '門市/地址',
       shippingFee: '運費',
@@ -1241,6 +1245,8 @@
         orderNo: order.orderNo || '',
         customerName: order.customerName || '',
         customerPhone: order.customerPhone || '',
+        customerLine: order.customerLine || '',
+        customerIG: order.customerIG || '',
         deliveryMethod: order.deliveryMethod || '7-11 取貨付款',
         storeName: order.storeName || '',
         shippingFee: order.shippingFee,
@@ -1292,6 +1298,8 @@
           orderNo: form.orderNo.trim(),
           customerName: form.customerName.trim(),
           customerPhone: form.customerPhone.trim(),
+          customerLine: form.customerLine.trim(),
+          customerIG: form.customerIG.trim(),
           deliveryMethod: form.deliveryMethod,
           storeName: form.storeName.trim(),
           shippingFee: Number(form.shippingFee) || 0,
@@ -1330,6 +1338,17 @@
                 <div>
                   <label className="text-xs font-semibold text-slate-600 mb-1 block">手機號碼</label>
                   <input type="tel" value={form.customerPhone} onChange={(e) => setField('customerPhone', e.target.value)} className={inputCls} />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="text-xs font-semibold text-slate-600 mb-1 block">LINE</label>
+                  <input type="text" placeholder="LINE ID 或暱稱" value={form.customerLine} onChange={(e) => setField('customerLine', e.target.value)} className={inputCls} />
+                </div>
+                <div>
+                  <label className="text-xs font-semibold text-slate-600 mb-1 block">IG</label>
+                  <input type="text" placeholder="@ig帳號" value={form.customerIG} onChange={(e) => setField('customerIG', e.target.value)} className={inputCls} />
                 </div>
               </div>
 
@@ -2412,6 +2431,8 @@
       const [lineText, setLineText] = React.useState('');
       const [customerName, setCustomerName] = React.useState('');
       const [customerPhone, setCustomerPhone] = React.useState('');
+      const [customerLine, setCustomerLine] = React.useState('');
+      const [customerIG, setCustomerIG] = React.useState('');
       const [deliveryMethod, setDeliveryMethod] = React.useState('7-11 取貨付款');
       const [storeName, setStoreName] = React.useState('');
       const [shippingFee, setShippingFee] = React.useState(60);
@@ -2454,6 +2475,8 @@
               setLineText(d.lineText || '');
               setCustomerName(d.customerName || '');
               setCustomerPhone(d.customerPhone || '');
+              setCustomerLine(d.customerLine || '');
+              setCustomerIG(d.customerIG || '');
               setDeliveryMethod(d.deliveryMethod || '7-11 取貨付款');
               setStoreName(d.storeName || '');
               setShippingFee(Number.isFinite(Number(d.shippingFee)) ? Number(d.shippingFee) : 60);
@@ -2474,24 +2497,27 @@
         if (!draftReady) return;
         try {
           const hasContent = lineText.trim() || customerName.trim() || customerPhone.trim() ||
+            customerLine.trim() || customerIG.trim() ||
             storeName.trim() || orderNote.trim() || orderItems.length > 0;
           if (!hasContent) {
             localStorage.removeItem(draftKey);
             return;
           }
           localStorage.setItem(draftKey, JSON.stringify({
-            ts: Date.now(), lineText, customerName, customerPhone, deliveryMethod,
+            ts: Date.now(), lineText, customerName, customerPhone, customerLine, customerIG, deliveryMethod,
             storeName, shippingFee, orderNote, orderItems
           }));
         } catch (err) {
           // 私密瀏覽模式等情況無法儲存草稿，不影響正常使用
         }
-      }, [draftReady, lineText, customerName, customerPhone, deliveryMethod, storeName, shippingFee, orderNote, orderItems]);
+      }, [draftReady, lineText, customerName, customerPhone, customerLine, customerIG, deliveryMethod, storeName, shippingFee, orderNote, orderItems]);
 
       const handleDiscardDraft = () => {
         setLineText('');
         setCustomerName('');
         setCustomerPhone('');
+        setCustomerLine('');
+        setCustomerIG('');
         setStoreName('');
         setOrderNote('');
         setOrderItems([]);
@@ -2752,6 +2778,8 @@
         const newOrderObj = {
           customerName,
           customerPhone,
+          customerLine,
+          customerIG,
           deliveryMethod,
           storeName,
           shippingFee: Number(shippingFee),
@@ -2787,6 +2815,8 @@
 
           setCustomerName('');
           setCustomerPhone('');
+          setCustomerLine('');
+          setCustomerIG('');
           setStoreName('');
           setOrderNote('');
           setOrderItems([]);
@@ -3000,6 +3030,8 @@
           '單號': o.orderNo || '',
           '顧客姓名': o.customerName,
           '電話': o.customerPhone,
+          'LINE': o.customerLine || '',
+          'IG': o.customerIG || '',
           '配送方式': o.deliveryMethod,
           '門市/地址': o.storeName,
           '付款狀態': o.paymentStatus ? '已付款' : '未付款',
@@ -3570,6 +3602,8 @@
           const matchSearch = !q || (
             o.customerName.toLowerCase().includes(q) ||
             o.customerPhone.includes(searchTerm.trim()) ||
+            (o.customerLine || '').toLowerCase().includes(q) ||
+            (o.customerIG || '').toLowerCase().includes(q) ||
             o.storeName.toLowerCase().includes(q) ||
             o.orderNo.toLowerCase().includes(q) ||
             o.note.toLowerCase().includes(q) ||
@@ -3707,7 +3741,7 @@
         }
 
         let csvContent = '\uFEFF';
-        csvContent += '訂單編號,顧客姓名,電話,配送方式,門市或地址,購買品項細項,商品小計,運費,訂單總金額,付款狀態,出貨狀態,備註事項,建立時間\n';
+        csvContent += '訂單編號,顧客姓名,電話,LINE,IG,配送方式,門市或地址,購買品項細項,商品小計,運費,訂單總金額,付款狀態,出貨狀態,備註事項,建立時間\n';
 
         orders.forEach(o => {
           const itemsDetail = o.items.map(i => `[${i.sku}]${i.name}-${i.color}/${i.size} x${i.qty}`).join('; ');
@@ -3718,6 +3752,8 @@
             o.id,
             `"${o.customerName.replace(/"/g, '""')}"`,
             `"${o.customerPhone}"`,
+            `"${(o.customerLine || '').replace(/"/g, '""')}"`,
+            `"${(o.customerIG || '').replace(/"/g, '""')}"`,
             `"${o.deliveryMethod}"`,
             `"${o.storeName.replace(/"/g, '""')}"`,
             `"${itemsDetail.replace(/"/g, '""')}"`,
@@ -4420,6 +4456,29 @@
                           placeholder="0912345678"
                           value={customerPhone}
                           onChange={(e) => setCustomerPhone(e.target.value)}
+                          className="w-full text-xs sm:text-sm px-3 py-2 md:py-2.5 rounded-lg border border-slate-200 focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500 focus:outline-none"
+                        />
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-3">
+                      <div>
+                        <label className="text-xs sm:text-sm font-medium text-slate-600 mb-1 block">LINE</label>
+                        <input
+                          type="text"
+                          placeholder="LINE ID 或暱稱"
+                          value={customerLine}
+                          onChange={(e) => setCustomerLine(e.target.value)}
+                          className="w-full text-xs sm:text-sm px-3 py-2 md:py-2.5 rounded-lg border border-slate-200 focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500 focus:outline-none"
+                        />
+                      </div>
+                      <div>
+                        <label className="text-xs sm:text-sm font-medium text-slate-600 mb-1 block">IG</label>
+                        <input
+                          type="text"
+                          placeholder="@ig帳號"
+                          value={customerIG}
+                          onChange={(e) => setCustomerIG(e.target.value)}
                           className="w-full text-xs sm:text-sm px-3 py-2 md:py-2.5 rounded-lg border border-slate-200 focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500 focus:outline-none"
                         />
                       </div>
@@ -5133,7 +5192,7 @@
                           {/* 展開後才顯示（手機版：維持原本的緊湊排版） */}
                           {isExpanded && (
                             <div className="md:hidden border-t border-slate-100 bg-slate-50/60 px-3.5 py-3 space-y-2 text-xs">
-                              {((order.orderNo && !isOrderNoRedundant(order)) || order.customerPhone) && (
+                              {((order.orderNo && !isOrderNoRedundant(order)) || order.customerPhone || order.customerLine || order.customerIG) && (
                                 <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-slate-600">
                                   {order.orderNo && !isOrderNoRedundant(order) && (
                                     <span className="text-[11px] font-bold text-slate-700 bg-white border border-slate-200 px-2 py-0.5 rounded-lg">
@@ -5141,6 +5200,8 @@
                                     </span>
                                   )}
                                   {order.customerPhone && <span className="font-mono">📞 {order.customerPhone}</span>}
+                                  {order.customerLine && <span className="font-mono">💬 {order.customerLine}</span>}
+                                  {order.customerIG && <span className="font-mono">📷 {order.customerIG}</span>}
                                 </div>
                               )}
 
@@ -5209,6 +5270,18 @@
                                     <span className="text-slate-500">手機：</span>
                                     <span className="font-mono">{order.customerPhone || '＿＿＿＿＿＿'}</span>
                                   </span>
+                                  {order.customerLine && (
+                                    <span>
+                                      <span className="text-slate-500">LINE：</span>
+                                      <span className="font-mono">{order.customerLine}</span>
+                                    </span>
+                                  )}
+                                  {order.customerIG && (
+                                    <span>
+                                      <span className="text-slate-500">IG：</span>
+                                      <span className="font-mono">{order.customerIG}</span>
+                                    </span>
+                                  )}
                                   <span className="flex items-center gap-4">
                                     {['7-11', '全家', '宅配'].map(m => (
                                       <span key={m} className={(order.deliveryMethod || '').includes(m) ? 'font-bold text-slate-800' : 'text-slate-400'}>
