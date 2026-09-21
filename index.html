@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
   <meta name="theme-color" content="#0A7C78" />
-  <title>Sprout 📱 小豆苗訂單助手 V2.8.2 (Firebase RTDB 實時同步版)</title>
+  <title>Sprout 📱 小豆苗訂單助手 V2.10.0 (Firebase RTDB 實時同步版)</title>
   <!-- Tailwind CSS CDN -->
   <script src="https://cdn.tailwindcss.com"></script>
   <script>
@@ -2659,7 +2659,7 @@
 
       const handleTogglePinProduct = async (prod) => {
         try {
-          await dbRef(`products/${prod.id}`).update({ pinned: !prod.pinned });
+          await withSyncTracking(dbRef(`products/${prod.id}`).update({ pinned: !prod.pinned }));
           showToast(prod.pinned ? '已取消釘選' : `📌 已釘選：${prod.name}`);
         } catch (err) {
           console.error("Toggle pin error:", err);
@@ -2674,6 +2674,30 @@
       const currentOrderTotal = currentOrderSubtotal + Number(shippingFee || 0);
 
       // Create New Order in RTDB
+      // ==========================================
+      // [V2.9] 連線狀態：待同步計數 + 大量操作的連線檢查
+      // Firebase 網頁版的離線寫入只存在記憶體，網頁一關就沒了，
+      // 所以斷線時要明白告訴使用者「先暫存、請保持網頁開著」。
+      // ==========================================
+      const [pendingSyncCount, setPendingSyncCount] = React.useState(0);
+
+      // 包住所有寫入：期間計入「尚未同步」，完成或失敗才扣掉
+      const withSyncTracking = async (promise) => {
+        setPendingSyncCount(n => n + 1);
+        try {
+          return await promise;
+        } finally {
+          setPendingSyncCount(n => Math.max(0, n - 1));
+        }
+      };
+
+      // 大量操作（匯入、批次刪除、還原、清空）在沒有網路時直接擋下，避免大批資料只存在記憶體裡
+      const requireConnection = (actionLabel) => {
+        if (isConnected) return true;
+        showToast(`📵 目前沒有網路，${actionLabel}請連上網路後再操作`);
+        return false;
+      };
+
       // ==========================================
       // [V2.7] 操作日誌 + 回收桶：共用工具
       // ==========================================
@@ -2748,12 +2772,16 @@
         }
 
         setIsSubmittingOrder(true);
-        const slowTimer = setTimeout(() => {
+        // 已經知道沒網路 → 立刻說明；網路慢 → 8 秒後才提示，避免一般情況下干擾
+        if (!isConnected) {
+          showToast('📵 沒有網路：訂單先暫存在手機，請保持網頁開著，連上網路後會自動送出');
+        }
+        const slowTimer = isConnected ? setTimeout(() => {
           showToast('⏳ 網路較慢，仍在送出中…請不要重複按，恢復連線後會自動完成');
-        }, 8000);
+        }, 8000) : null;
 
         try {
-          await dbRef(`orders/${orderKey}`).set(newOrderObj);
+          await withSyncTracking(dbRef(`orders/${orderKey}`).set(newOrderObj));
           pendingOrderKeyRef.current = null; // 成功了，下一張訂單用新的編號
           logAction('order_create', 'order', orderKey, `建立訂單：${customerName}（$${calcOrderTotal(newOrderObj)}）`);
 
@@ -2772,16 +2800,16 @@
           console.error("Add order error:", err);
           showToast('❌ 新增訂單失敗，請檢查權限或網路連線（內容還在，可以再按一次送出）');
         } finally {
-          clearTimeout(slowTimer);
+          if (slowTimer) clearTimeout(slowTimer);
           setIsSubmittingOrder(false);
         }
       };
 
       const handleTogglePayment = async (orderId, currentStatus) => {
         try {
-          await dbRef(`orders/${orderId}`).update({
+          await withSyncTracking(dbRef(`orders/${orderId}`).update({
             paymentStatus: !currentStatus
-          });
+          }));
           const target = orders.find(o => o.id === orderId);
           logAction('order_payment', 'order', orderId, `付款狀態：${target?.customerName || ''}　${currentStatus ? '已付款' : '未付款'} → ${currentStatus ? '未付款' : '已付款'}`);
           showToast('更新付款狀態成功');
@@ -2792,9 +2820,9 @@
 
       const handleToggleShipment = async (orderId, currentStatus) => {
         try {
-          await dbRef(`orders/${orderId}`).update({
+          await withSyncTracking(dbRef(`orders/${orderId}`).update({
             shipmentStatus: currentStatus === 'shipped' ? 'unshipped' : 'shipped'
-          });
+          }));
           const target = orders.find(o => o.id === orderId);
           logAction('order_shipment', 'order', orderId, `出貨狀態：${target?.customerName || ''}　${currentStatus === 'shipped' ? '已出貨' : '待出貨'} → ${currentStatus === 'shipped' ? '待出貨' : '已出貨'}`);
           showToast('更新出貨狀態成功');
@@ -2809,10 +2837,10 @@
         try {
           if (target) {
             // 一次寫入：從 orders 移除 + 放進 trash/orders（要嘛都成功、要嘛都不動）
-            await dbRoot().update({
+            await withSyncTracking(dbRoot().update({
               [`orders/${target.id}`]: null,
               [`trash/orders/${target.id}`]: trashEntry(target)
-            });
+            }));
             logAction('order_delete', 'order', target.id, `刪除訂單：${target.customerName}（$${calcOrderTotal(target)}）→ 回收桶`);
             showToast('🗑️ 訂單已移到回收桶（更多 → 回收桶 可還原）');
           }
@@ -2827,7 +2855,7 @@
         const updated = { ...tallyChecked, [key]: !tallyChecked[key] };
         setTallyChecked(updated);
         try {
-          await dbRef('settings/tally').set(updated);
+          await withSyncTracking(dbRef('settings/tally').set(updated));
         } catch (err) {
           console.error("Tally sync error:", err);
         }
@@ -2853,7 +2881,7 @@
         }
 
         try {
-          await dbRef(`orders/${original.id}`).update(changes);
+          await withSyncTracking(dbRef(`orders/${original.id}`).update(changes));
 
           // 日誌保留「修改前」的值，之後可以在日誌裡一鍵還原
           const before = {};
@@ -2912,6 +2940,7 @@
           showToast('請至少勾選一筆訂單');
           return;
         }
+        if (!requireConnection('匯入訂單')) return;
 
         const importStatus = ORDER_IMPORT_STATUS[statusKey] || ORDER_IMPORT_STATUS.pending;
 
@@ -2947,7 +2976,7 @@
             };
           });
 
-          await dbRef('orders').update(updates);
+          await withSyncTracking(dbRef('orders').update(updates));
           logAction('order_import', 'order', '', `匯入 Excel 訂單 ${selectedDrafts.length} 筆（${importStatus.label}）：${summarizeNames(selectedDrafts.map(d => d.customerName))}`);
           showToast(`🎉 成功匯入 ${selectedDrafts.length} 筆訂單至雲端！`);
           setIsOrderImportModalOpen(false);
@@ -3026,6 +3055,7 @@
         // 只刪「目前畫面上看得到、且有勾選」的訂單，避免刪到被篩選隱藏的資料
         const targets = filteredOrders.filter(o => selectedOrderIds.has(o.id));
         if (targets.length === 0) return;
+        if (!requireConnection('批次刪除')) return;
 
         setIsBatchDeleting(true);
         try {
@@ -3034,7 +3064,7 @@
             updates[`orders/${o.id}`] = null;                 // null = 從訂單移除
             updates[`trash/orders/${o.id}`] = trashEntry(o);  // 同時放進回收桶（一次寫入，要嘛全成功、要嘛全不動）
           });
-          await dbRoot().update(updates);
+          await withSyncTracking(dbRoot().update(updates));
           logAction('order_batch_delete', 'order', '', `批次刪除 ${targets.length} 筆訂單 → 回收桶：${summarizeNames(targets.map(o => o.customerName))}`);
           showToast(`🗑️ 已移到回收桶：${targets.length} 筆訂單`);
           setSelectedOrderIds(new Set());
@@ -3094,6 +3124,7 @@
           .filter(p => selectedProductIds.has(p.id))
           .map(p => products.find(raw => raw.id === p.id) || p); // 回收桶存原始資料，不含即時計算的欄位
         if (targets.length === 0) return;
+        if (!requireConnection('批次刪除')) return;
 
         setIsProductBatchDeleting(true);
         try {
@@ -3103,7 +3134,7 @@
             updates[`trash/products/${p.id}`] = trashEntry(p);  // 同時放進回收桶
           });
           updates['settings/productsSeeded'] = true;            // 標記已初始化，全刪後不會自動補回範例商品
-          await dbRoot().update(updates);                       // 一次寫入：要嘛全成功、要嘛全不動
+          await withSyncTracking(dbRoot().update(updates));                       // 一次寫入：要嘛全成功、要嘛全不動
           logAction('product_batch_delete', 'product', '', `批次刪除 ${targets.length} 項商品 → 回收桶：${summarizeNames(targets.map(p => p.name))}`);
           showToast(`🗑️ 已移到回收桶：${targets.length} 項商品`);
           setSelectedProductIds(new Set());
@@ -3121,6 +3152,7 @@
       const handleRestoreTrash = async (kind, item) => {
         const { id, deletedAt, deletedBy, ...data } = item; // kind: 'orders' | 'products'
         const isOrder = kind === 'orders';
+        if (!requireConnection('還原')) return;
 
         // [V2.7.2] 還原前先比對：目前已有「相同的訂單 / 同名商品」就提醒，由使用者決定要不要還原
         const dup = isOrder ? findDuplicateOrder(item, orders) : findDuplicateProduct(item, products);
@@ -3132,10 +3164,10 @@
         }
 
         try {
-          await dbRoot().update({
+          await withSyncTracking(dbRoot().update({
             [`${kind}/${id}`]: cleanForDb(data),
             [`trash/${kind}/${id}`]: null
-          });
+          }));
           logAction(isOrder ? 'order_restore' : 'product_restore', isOrder ? 'order' : 'product', id,
             `還原${isOrder ? '訂單' : '商品'}：${isOrder ? item.customerName : item.name}`);
           showToast('♻️ 已還原');
@@ -3150,7 +3182,7 @@
         const label = isOrder ? item.customerName : item.name;
         if (!window.confirm(`確定要永久刪除「${label}」嗎？\n這個動作無法復原。`)) return;
         try {
-          await dbRoot().update({ [`trash/${kind}/${item.id}`]: null });
+          await withSyncTracking(dbRoot().update({ [`trash/${kind}/${item.id}`]: null }));
           logAction(isOrder ? 'order_purge' : 'product_purge', isOrder ? 'order' : 'product', item.id, `永久刪除${isOrder ? '訂單' : '商品'}：${label}`);
           showToast('已永久刪除');
         } catch (err) {
@@ -3162,9 +3194,10 @@
       const handlePurgeAllTrash = async () => {
         const total = trashOrders.length + trashProducts.length;
         if (total === 0) return;
+        if (!requireConnection('清空回收桶')) return;
         if (!window.confirm(`確定要清空回收桶嗎？\n共 ${total} 筆資料會被永久刪除，無法復原。`)) return;
         try {
-          await dbRoot().update({ trash: null });
+          await withSyncTracking(dbRoot().update({ trash: null }));
           logAction('trash_purge_all', 'system', '', `清空回收桶（${trashOrders.length} 筆訂單、${trashProducts.length} 項商品）`);
           showToast('🧹 回收桶已清空');
         } catch (err) {
@@ -3187,7 +3220,7 @@
         try {
           const current = {};
           Object.keys(entry.before).forEach(k => { current[k] = order[k]; }); // 還原前的值，也記進日誌，之後還能再改回來
-          await dbRef(`orders/${entry.targetId}`).update(entry.before);
+          await withSyncTracking(dbRef(`orders/${entry.targetId}`).update(entry.before));
           logAction('order_edit_revert', 'order', entry.targetId, `還原修改：${order.customerName}（${labels.join('、')}）`, { before: current, after: entry.before });
           showToast('↩︎ 已還原到修改前');
         } catch (err) {
@@ -3206,6 +3239,7 @@
 
       const handleResetTestData = async () => {
         if (!IS_TEST_MODE) return; // 安全鎖：只有測試模式才能整批清空
+        if (!requireConnection('清空測試資料')) return;
         if (!window.confirm('確定要清空「測試模式」的所有資料嗎？\n（正式資料不會受影響）')) return;
         try {
           await db.ref('test').remove();
@@ -3301,7 +3335,7 @@
 
         try {
           if (editingProduct.id) {
-            await dbRef(`products/${editingProduct.id}`).update(prodData);
+            await withSyncTracking(dbRef(`products/${editingProduct.id}`).update(prodData));
             logAction('product_edit', 'product', editingProduct.id, `編輯商品：${prodData.name}`);
             showToast('已成功更新商品資料！');
           } else {
@@ -3354,7 +3388,7 @@
       const handleToggleArchiveProduct = async (prod) => {
         const nextStatus = prod.status === 'archived' ? 'active' : 'archived';
         try {
-          await dbRef(`products/${prod.id}`).update({ status: nextStatus });
+          await withSyncTracking(dbRef(`products/${prod.id}`).update({ status: nextStatus }));
           logAction('product_archive', 'product', prod.id, `${nextStatus === 'archived' ? '下架歸檔' : '重新上架'}：${prod.name}`);
           showToast(nextStatus === 'archived' ? '商品已下架歸檔' : '商品已重新上架');
         } catch (err) {
@@ -3367,10 +3401,10 @@
         const target = products.find(p => p.id === prodId);
         try {
           if (target) {
-            await dbRoot().update({
+            await withSyncTracking(dbRoot().update({
               [`products/${target.id}`]: null,
               [`trash/products/${target.id}`]: trashEntry(target)
-            });
+            }));
             logAction('product_delete', 'product', target.id, `刪除商品：${target.name}（$${target.price}）→ 回收桶`);
             showToast('🗑️ 商品已移到回收桶（更多 → 回收桶 可還原）');
           }
@@ -3427,6 +3461,7 @@
           showToast('沒有可匯入的新商品');
           return;
         }
+        if (!requireConnection('匯入商品')) return;
 
         setIsProductImporting(true);
         try {
@@ -3438,7 +3473,7 @@
           });
 
           // 一次性寫入，要嘛全成功、要嘛全失敗
-          await dbRef('products').update(updates);
+          await withSyncTracking(dbRef('products').update(updates));
           logAction('product_import', 'product', '', `匯入 Excel 商品 ${toImport.length} 項：${summarizeNames(toImport.map(p => p.name))}`);
           showToast(`🎉 成功匯入 ${toImport.length} 項商品！`);
           setIsImportModalOpen(false);
@@ -4184,7 +4219,7 @@
                 <div>
                   <h1 className="text-base sm:text-lg lg:text-xl font-bold leading-tight flex items-center gap-2">
                     小豆苗訂單助手
-                    <span className="text-[10px] sm:text-xs bg-emerald-700 text-emerald-100 px-2 py-0.5 rounded-full font-mono">v2.8.2 RTDB</span>
+                    <span className="text-[10px] sm:text-xs bg-emerald-700 text-emerald-100 px-2 py-0.5 rounded-full font-mono">v2.10.0 RTDB</span>
                     {IS_TEST_MODE && (
                       <span className="text-[10px] sm:text-xs bg-amber-400 text-slate-900 px-2 py-0.5 rounded-full font-bold">🧪 測試模式</span>
                     )}
@@ -4227,9 +4262,9 @@
 
               {/* Cloud Sync Status Indicator */}
               <div className="flex items-center gap-1.5 text-xs bg-emerald-700/50 px-3 py-1.5 rounded-xl border border-emerald-500/30">
-                <IconCloud size={16} className={isSyncing ? "animate-bounce text-amber-300" : isConnected ? "text-emerald-200" : "text-amber-300"} />
+                <IconCloud size={16} className={pendingSyncCount > 0 ? "animate-bounce text-amber-300" : isSyncing ? "animate-bounce text-amber-300" : isConnected ? "text-emerald-200" : "text-amber-300"} />
                 <span className="font-bold text-emerald-100 hidden sm:inline">
-                  {isSyncing ? "連線中..." : isConnected ? "🟢 實時同步中" : "⚠️ 連線受阻"}
+                  {pendingSyncCount > 0 ? `⏳ ${pendingSyncCount} 筆同步中` : isSyncing ? "連線中..." : isConnected ? "🟢 實時同步中" : "⚠️ 連線受阻"}
                 </span>
               </div>
             </div>
@@ -4283,15 +4318,28 @@
                   </div>
                 </div>
               </div>
-            ) : (!isConnected && !isSyncing && (
-              <div className="mb-4 bg-amber-500/10 border border-amber-500/30 rounded-2xl p-4 text-xs sm:text-sm text-amber-900 flex items-start gap-3">
-                <IconAlertTriangle size={20} className="text-amber-600 flex-shrink-0 mt-0.5" />
+            ) : ((!isConnected && !isSyncing) || pendingSyncCount > 0) ? (
+              <div className={`mb-4 rounded-2xl p-4 text-xs sm:text-sm flex items-start gap-3 border ${
+                !isConnected ? 'bg-amber-50 border-amber-300 text-amber-900' : 'bg-sky-50 border-sky-200 text-sky-900'
+              }`}>
+                <IconAlertTriangle size={20} className={`flex-shrink-0 mt-0.5 ${!isConnected ? 'text-amber-600' : 'text-sky-600'}`} />
                 <div>
-                  <span className="font-bold block text-amber-800 mb-0.5">目前連不上雲端資料庫</span>
-                  請檢查手機的網路連線。恢復連線後資料會自動同步。
+                  {!isConnected ? (
+                    <>
+                      <span className="font-bold block mb-0.5">📵 目前沒有網路連線</span>
+                      這段期間新增或修改的資料會先<b>暫存在這支手機</b>，連上網路後會自動送出。
+                      <b className="block mt-0.5">請先不要關閉這個網頁</b>，否則尚未送出的資料會遺失。
+                      {pendingSyncCount > 0 && <span className="block mt-0.5">目前有 <b>{pendingSyncCount}</b> 筆尚未同步。</span>}
+                    </>
+                  ) : (
+                    <>
+                      <span className="font-bold block mb-0.5">⏳ 有 {pendingSyncCount} 筆資料正在同步</span>
+                      請保持網頁開著，等待同步完成再關閉。
+                    </>
+                  )}
                 </div>
               </div>
-            ))}
+            ) : null}
 
             {/* Tab 1: New Order */}
             {activeTab === 'add' && (
@@ -5082,13 +5130,13 @@
                             </div>
                           </div>
 
-                          {/* 展開後才顯示：單號 / 電話 / 物流門市 / 建立時間 / 商品明細 / 金額組成 / 備註 */}
+                          {/* 展開後才顯示（手機版：維持原本的緊湊排版） */}
                           {isExpanded && (
-                            <div className="border-t border-slate-100 bg-slate-50/60 px-3.5 py-3 sm:px-4 space-y-2 text-xs sm:text-sm">
+                            <div className="md:hidden border-t border-slate-100 bg-slate-50/60 px-3.5 py-3 space-y-2 text-xs">
                               {((order.orderNo && !isOrderNoRedundant(order)) || order.customerPhone) && (
                                 <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-slate-600">
                                   {order.orderNo && !isOrderNoRedundant(order) && (
-                                    <span className="text-[11px] sm:text-xs font-bold text-slate-700 bg-white border border-slate-200 px-2 py-0.5 rounded-lg">
+                                    <span className="text-[11px] font-bold text-slate-700 bg-white border border-slate-200 px-2 py-0.5 rounded-lg">
                                       📄 {order.orderNo}
                                     </span>
                                   )}
@@ -5105,12 +5153,12 @@
                               </div>
 
                               <div className="space-y-1.5 bg-white p-3 rounded-xl border border-slate-200/60">
-                                <div className="flex justify-between text-[11px] sm:text-xs font-semibold text-slate-400 border-b border-slate-100 pb-1">
+                                <div className="flex justify-between text-[11px] font-semibold text-slate-400 border-b border-slate-100 pb-1">
                                   <span>商品項目 ({realItemCount} 項)</span>
                                   <span>單價 × 數量</span>
                                 </div>
                                 {order.items.map((item, idx) => (
-                                  <div key={idx} className="flex items-center justify-between gap-2 text-xs sm:text-sm">
+                                  <div key={idx} className="flex items-center justify-between gap-2 text-xs">
                                     <span className="text-slate-700 min-w-0">
                                       {isAdjustmentItem(item) ? (
                                         <span className="font-semibold text-rose-600">🏷️ {item.name}</span>
@@ -5139,6 +5187,105 @@
                                   💬 備註：{order.note}
                                 </p>
                               )}
+                            </div>
+                          )}
+
+                          {/* [V2.10] 展開後：電腦版（md 以上）比照紙本「訂購單」的版面，手機不受影響 */}
+                          {isExpanded && (
+                            <div className="hidden md:block border-t border-slate-100 bg-white px-6 py-5">
+                              <div className="max-w-3xl">
+                                <h3 className="text-base font-bold text-slate-800 mb-3">訂購單</h3>
+
+                                {/* 抬頭：顧客姓名 / 手機 / 物流勾選 */}
+                                <div className="flex flex-wrap items-baseline gap-x-8 gap-y-2 text-sm text-slate-700">
+                                  <span>
+                                    <span className="text-slate-500">顧客姓名：</span>
+                                    <span className="font-semibold">{order.customerName}</span>
+                                    {order.orderNo && !isOrderNoRedundant(order) && (
+                                      <span className="ml-2 text-xs text-slate-400 font-mono">({order.orderNo})</span>
+                                    )}
+                                  </span>
+                                  <span>
+                                    <span className="text-slate-500">手機：</span>
+                                    <span className="font-mono">{order.customerPhone || '＿＿＿＿＿＿'}</span>
+                                  </span>
+                                  <span className="flex items-center gap-4">
+                                    {['7-11', '全家', '宅配'].map(m => (
+                                      <span key={m} className={(order.deliveryMethod || '').includes(m) ? 'font-bold text-slate-800' : 'text-slate-400'}>
+                                        {(order.deliveryMethod || '').includes(m) ? '☑' : '☐'} {m}
+                                      </span>
+                                    ))}
+                                  </span>
+                                </div>
+                                <div className="mt-2 text-sm text-slate-700">
+                                  <span className="text-slate-500">到貨店家：</span>
+                                  <span className="font-semibold">{order.storeName || '＿＿＿＿＿＿'}</span>
+                                  <span className="ml-8 text-slate-500">建立：</span>
+                                  <span className="font-mono text-slate-600">{dateShort}</span>
+                                </div>
+
+                                {/* 品項表格 */}
+                                <table className="mt-4 w-full text-sm border-collapse">
+                                  <thead>
+                                    <tr className="bg-slate-50 text-slate-600">
+                                      <th className="border border-slate-300 px-2 py-1.5 w-10 font-semibold"></th>
+                                      <th className="border border-slate-300 px-3 py-1.5 text-center font-semibold">品項</th>
+                                      <th className="border border-slate-300 px-3 py-1.5 w-24 text-center font-semibold">金額</th>
+                                      <th className="border border-slate-300 px-3 py-1.5 w-20 text-center font-semibold">數量</th>
+                                      <th className="border border-slate-300 px-3 py-1.5 w-28 text-center font-semibold">總金額</th>
+                                      <th className="border border-slate-300 px-3 py-1.5 w-40 text-center font-semibold">備註</th>
+                                    </tr>
+                                  </thead>
+                                  <tbody>
+                                    {order.items.map((item, idx) => {
+                                      const adj = isAdjustmentItem(item);
+                                      return (
+                                        <tr key={idx} className={adj ? 'text-rose-600' : 'text-slate-800'}>
+                                          <td className="border border-slate-300 px-2 py-1.5 text-center text-slate-500">{idx + 1}</td>
+                                          <td className="border border-slate-300 px-3 py-1.5">
+                                            {item.name}
+                                            {!adj && (item.color || item.size) && (
+                                              <span className="text-slate-500">-{item.color}{item.size}</span>
+                                            )}
+                                          </td>
+                                          <td className="border border-slate-300 px-3 py-1.5 text-right tabular-nums">{item.price}</td>
+                                          <td className="border border-slate-300 px-3 py-1.5 text-right tabular-nums">{item.qty}</td>
+                                          <td className="border border-slate-300 px-3 py-1.5 text-right tabular-nums">{item.price * item.qty}</td>
+                                          <td className="border border-slate-300 px-3 py-1.5 text-slate-500">
+                                            {adj ? '折抵/內退' : (item.sku || '')}
+                                          </td>
+                                        </tr>
+                                      );
+                                    })}
+                                  </tbody>
+                                </table>
+
+                                {/* 金額 / 運費 / 總計：靠右，對齊表格 */}
+                                <div className="mt-3 flex justify-end">
+                                  <table className="text-sm">
+                                    <tbody>
+                                      <tr>
+                                        <td className="py-0.5 pr-4 text-right text-slate-500">金額：</td>
+                                        <td className="py-0.5 text-right tabular-nums w-28">{subtotal.toLocaleString()} 元</td>
+                                      </tr>
+                                      <tr>
+                                        <td className="py-0.5 pr-4 text-right text-slate-500">運費：</td>
+                                        <td className="py-0.5 text-right tabular-nums">{Number(order.shippingFee).toLocaleString()} 元</td>
+                                      </tr>
+                                      <tr className="border-t border-slate-300">
+                                        <td className="py-1 pr-4 text-right font-semibold text-slate-700">總計：</td>
+                                        <td className="py-1 text-right font-bold text-emerald-600 tabular-nums">{totalAmount.toLocaleString()} 元</td>
+                                      </tr>
+                                    </tbody>
+                                  </table>
+                                </div>
+
+                                {order.note && (
+                                  <p className="mt-3 text-sm text-amber-800 bg-amber-50 border border-amber-200 px-3 py-2 rounded-lg">
+                                    備註：{order.note}
+                                  </p>
+                                )}
+                              </div>
                             </div>
                           )}
                         </div>
