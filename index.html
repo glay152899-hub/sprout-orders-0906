@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
   <meta name="theme-color" content="#0A7C78" />
-  <title>Sprout 📱 小豆苗訂單助手 V2.12.1 (Firebase RTDB 實時同步版)</title>
+  <title>Sprout 📱 小豆苗訂單助手 V2.11.0 (Firebase RTDB 實時同步版)</title>
   <!-- Tailwind CSS CDN -->
   <script src="https://cdn.tailwindcss.com"></script>
   <script>
@@ -59,6 +59,10 @@
     // ==========================================
     // Firebase Initialization (Realtime Database - Singapore Region)
     // ==========================================
+    // [V2.11] 版本號只寫這一個地方：標題列、登入畫面、瀏覽器分頁標題都由它產生，不會再有「其中一處忘了改」
+    const APP_VERSION = '2.11.0';
+    document.title = `Sprout 📱 小豆苗訂單助手 V${APP_VERSION} (Firebase RTDB 實時同步版)`;
+
     const firebaseConfig = {
       apiKey: "AIzaSyCr0o1O9GUOYyI-duVMJORX7Vz1fmAjTE0",
       authDomain: "sprout-order-management-system.firebaseapp.com",
@@ -661,8 +665,8 @@
       orderNo: order?.orderNo || '', // [V2.1] 選填：Excel 匯入時帶入工作表名稱 (例如 0901林 涔)
       customerName: order?.customerName || '顧客',
       customerPhone: order?.customerPhone || '',
-      customerLine: order?.customerLine || '', // [V2.11] LINE ID（沒有電話的客人可用這個聯絡）
-      customerIG: order?.customerIG || '', // [V2.11] IG 帳號
+      customerLine: order?.customerLine || '', // [V2.11] 客人的 LINE ID / 暱稱（只能用 LINE 聯絡的客人）
+      customerIg: order?.customerIg || '',     // [V2.11] 客人的 IG 帳號
       deliveryMethod: order?.deliveryMethod || '7-11 取貨付款',
       storeName: order?.storeName || '',
       shippingFee: Number(order?.shippingFee) ?? 60,
@@ -771,7 +775,7 @@
       customerName: '姓名',
       customerPhone: '電話',
       customerLine: 'LINE',
-      customerIG: 'IG',
+      customerIg: 'IG',
       deliveryMethod: '物流方式',
       storeName: '門市/地址',
       shippingFee: '運費',
@@ -1011,22 +1015,6 @@
       return /^[_＿\-－\s]*$/.test(s) ? '' : s;
     };
 
-    // [V2.12] 姓名欄常見「陳*羽(line:小羽)」「廖*芝(IG:chih913_)」的寫法，
-    // 把 LINE / IG 拆出來獨立存放，姓名欄只留乾淨的姓名。支援半形/全形括號、line/IG 不分大小寫、
-    // 中間冒號可有可無（例如「(line)」代表有留 LINE 但沒寫帳號，姓名照樣清乾淨）。
-    const extractContactFromName = (rawName) => {
-      let name = String(rawName || '');
-      let line = '';
-      let ig = '';
-      name = name.replace(/[（(]\s*(line|ig)\s*[:：]?\s*([^)）]*)[)）]/gi, (match, label, value) => {
-        const v = value.trim();
-        if (/^line$/i.test(label)) { if (v) line = v; }
-        else if (v) { ig = v; }
-        return '';
-      });
-      return { name: name.trim(), line, ig };
-    };
-
     // 這些名稱的工作表視為範本/備份頁，匯入時略過
     const ORDER_IMPORT_SKIP_SHEETS = ['原稿', '工作表37', 'Template', 'Sheet1'];
 
@@ -1067,8 +1055,6 @@
 
         let customerName = '';
         let customerPhone = '';
-        let customerLine = '';
-        let customerIG = '';
         let shippingMethod = '7-11';
         let storeAddress = '';
         let shippingFee = 38;
@@ -1103,13 +1089,6 @@
         customerName = cleanExcelPlaceholder(customerName);
         customerPhone = cleanExcelPlaceholder(customerPhone);
         storeAddress = cleanExcelPlaceholder(storeAddress);
-
-        // [V2.12] 姓名欄若夾帶 (line:xxx) / (IG:xxx)，拆出來放進獨立欄位
-        const contactInfo = extractContactFromName(customerName);
-        customerName = contactInfo.name;
-        customerLine = contactInfo.line;
-        customerIG = contactInfo.ig;
-
         if (!customerName) customerName = cleanedSheetName;
 
         // 2. 尋找商品表頭列 (品項, 金額, 數量)
@@ -1225,8 +1204,6 @@
             orderNo: cleanedSheetName,
             customerName,
             customerPhone,
-            customerLine,
-            customerIG,
             deliveryMethod: mapImportedDelivery(shippingMethod),
             storeName: storeAddress,
             shippingFee: draftShipping,
@@ -1273,7 +1250,7 @@
         customerName: order.customerName || '',
         customerPhone: order.customerPhone || '',
         customerLine: order.customerLine || '',
-        customerIG: order.customerIG || '',
+        customerIg: order.customerIg || '',
         deliveryMethod: order.deliveryMethod || '7-11 取貨付款',
         storeName: order.storeName || '',
         shippingFee: order.shippingFee,
@@ -1326,7 +1303,7 @@
           customerName: form.customerName.trim(),
           customerPhone: form.customerPhone.trim(),
           customerLine: form.customerLine.trim(),
-          customerIG: form.customerIG.trim(),
+          customerIg: form.customerIg.trim(),
           deliveryMethod: form.deliveryMethod,
           storeName: form.storeName.trim(),
           shippingFee: Number(form.shippingFee) || 0,
@@ -1370,12 +1347,12 @@
 
               <div className="grid grid-cols-2 gap-3">
                 <div>
-                  <label className="text-xs font-semibold text-slate-600 mb-1 block">LINE</label>
-                  <input type="text" placeholder="LINE ID 或暱稱" value={form.customerLine} onChange={(e) => setField('customerLine', e.target.value)} className={inputCls} />
+                  <label className="text-xs font-semibold text-slate-600 mb-1 block">LINE ID / 暱稱</label>
+                  <input type="text" placeholder="例如：mei_0912" value={form.customerLine} onChange={(e) => setField('customerLine', e.target.value)} className={inputCls} />
                 </div>
                 <div>
-                  <label className="text-xs font-semibold text-slate-600 mb-1 block">IG</label>
-                  <input type="text" placeholder="@ig帳號" value={form.customerIG} onChange={(e) => setField('customerIG', e.target.value)} className={inputCls} />
+                  <label className="text-xs font-semibold text-slate-600 mb-1 block">IG 帳號</label>
+                  <input type="text" placeholder="例如：mei.shop" value={form.customerIg} onChange={(e) => setField('customerIg', e.target.value)} className={inputCls} />
                 </div>
               </div>
 
@@ -1649,10 +1626,7 @@
                         {r.adjustLine && <span className="text-[11px] bg-amber-100 text-amber-800 px-2 py-0.5 rounded-full font-bold">含差額調整</span>}
                       </div>
                       <div className="text-[11px] sm:text-xs text-slate-500 mt-0.5">
-                        {r.d.orderTimestamp ? `📅 ${new Date(r.d.orderTimestamp).toLocaleDateString('zh-TW')}` : '📅 匯入當天'} · {r.d.customerPhone || '無電話'}
-                        {r.d.customerLine && <> · 💬 {r.d.customerLine}</>}
-                        {r.d.customerIG && <> · 📷 {r.d.customerIG}</>}
-                        {' '}· {r.d.deliveryMethod} · {r.d.storeName || '無門市資訊'}
+                        {r.d.orderTimestamp ? `📅 ${new Date(r.d.orderTimestamp).toLocaleDateString('zh-TW')}` : '📅 匯入當天'} · {r.d.customerPhone || '無電話'} · {r.d.deliveryMethod} · {r.d.storeName || '無門市資訊'}
                       </div>
 
                       <div className="mt-2 space-y-0.5 text-[11px] sm:text-xs text-slate-600">
@@ -2214,6 +2188,7 @@
             <button type="button" onClick={handleReset} className="w-full text-xs text-slate-500 hover:text-slate-700">
               忘記密碼？寄送重設信
             </button>
+            <p className="text-center text-[11px] text-slate-400">版本 v{APP_VERSION}</p>
           </div>
         </div>
       );
@@ -2461,8 +2436,8 @@
       const [lineText, setLineText] = React.useState('');
       const [customerName, setCustomerName] = React.useState('');
       const [customerPhone, setCustomerPhone] = React.useState('');
-      const [customerLine, setCustomerLine] = React.useState('');
-      const [customerIG, setCustomerIG] = React.useState('');
+      const [customerLine, setCustomerLine] = React.useState(''); // [V2.11]
+      const [customerIg, setCustomerIg] = React.useState('');     // [V2.11]
       const [deliveryMethod, setDeliveryMethod] = React.useState('7-11 取貨付款');
       const [storeName, setStoreName] = React.useState('');
       const [shippingFee, setShippingFee] = React.useState(60);
@@ -2506,7 +2481,7 @@
               setCustomerName(d.customerName || '');
               setCustomerPhone(d.customerPhone || '');
               setCustomerLine(d.customerLine || '');
-              setCustomerIG(d.customerIG || '');
+              setCustomerIg(d.customerIg || '');
               setDeliveryMethod(d.deliveryMethod || '7-11 取貨付款');
               setStoreName(d.storeName || '');
               setShippingFee(Number.isFinite(Number(d.shippingFee)) ? Number(d.shippingFee) : 60);
@@ -2527,27 +2502,27 @@
         if (!draftReady) return;
         try {
           const hasContent = lineText.trim() || customerName.trim() || customerPhone.trim() ||
-            customerLine.trim() || customerIG.trim() ||
+            customerLine.trim() || customerIg.trim() ||
             storeName.trim() || orderNote.trim() || orderItems.length > 0;
           if (!hasContent) {
             localStorage.removeItem(draftKey);
             return;
           }
           localStorage.setItem(draftKey, JSON.stringify({
-            ts: Date.now(), lineText, customerName, customerPhone, customerLine, customerIG, deliveryMethod,
+            ts: Date.now(), lineText, customerName, customerPhone, customerLine, customerIg, deliveryMethod,
             storeName, shippingFee, orderNote, orderItems
           }));
         } catch (err) {
           // 私密瀏覽模式等情況無法儲存草稿，不影響正常使用
         }
-      }, [draftReady, lineText, customerName, customerPhone, customerLine, customerIG, deliveryMethod, storeName, shippingFee, orderNote, orderItems]);
+      }, [draftReady, lineText, customerName, customerPhone, customerLine, customerIg, deliveryMethod, storeName, shippingFee, orderNote, orderItems]);
 
       const handleDiscardDraft = () => {
         setLineText('');
         setCustomerName('');
         setCustomerPhone('');
         setCustomerLine('');
-        setCustomerIG('');
+        setCustomerIg('');
         setStoreName('');
         setOrderNote('');
         setOrderItems([]);
@@ -2808,8 +2783,8 @@
         const newOrderObj = {
           customerName,
           customerPhone,
-          customerLine,
-          customerIG,
+          customerLine: customerLine.trim(),
+          customerIg: customerIg.trim(),
           deliveryMethod,
           storeName,
           shippingFee: Number(shippingFee),
@@ -2846,7 +2821,7 @@
           setCustomerName('');
           setCustomerPhone('');
           setCustomerLine('');
-          setCustomerIG('');
+          setCustomerIg('');
           setStoreName('');
           setOrderNote('');
           setOrderItems([]);
@@ -3060,8 +3035,8 @@
           '單號': o.orderNo || '',
           '顧客姓名': o.customerName,
           '電話': o.customerPhone,
-          'LINE': o.customerLine || '',
-          'IG': o.customerIG || '',
+          'LINE': o.customerLine,
+          'IG': o.customerIg,
           '配送方式': o.deliveryMethod,
           '門市/地址': o.storeName,
           '付款狀態': o.paymentStatus ? '已付款' : '未付款',
@@ -3632,8 +3607,8 @@
           const matchSearch = !q || (
             o.customerName.toLowerCase().includes(q) ||
             o.customerPhone.includes(searchTerm.trim()) ||
-            (o.customerLine || '').toLowerCase().includes(q) ||
-            (o.customerIG || '').toLowerCase().includes(q) ||
+            o.customerLine.toLowerCase().includes(q) ||
+            o.customerIg.toLowerCase().includes(q) ||
             o.storeName.toLowerCase().includes(q) ||
             o.orderNo.toLowerCase().includes(q) ||
             o.note.toLowerCase().includes(q) ||
@@ -3783,7 +3758,7 @@
             `"${o.customerName.replace(/"/g, '""')}"`,
             `"${o.customerPhone}"`,
             `"${(o.customerLine || '').replace(/"/g, '""')}"`,
-            `"${(o.customerIG || '').replace(/"/g, '""')}"`,
+            `"${(o.customerIg || '').replace(/"/g, '""')}"`,
             `"${o.deliveryMethod}"`,
             `"${o.storeName.replace(/"/g, '""')}"`,
             `"${itemsDetail.replace(/"/g, '""')}"`,
@@ -4285,7 +4260,7 @@
                 <div>
                   <h1 className="text-base sm:text-lg lg:text-xl font-bold leading-tight flex items-center gap-2">
                     小豆苗訂單助手
-                    <span className="text-[10px] sm:text-xs bg-emerald-700 text-emerald-100 px-2 py-0.5 rounded-full font-mono">v2.10.0 RTDB</span>
+                    <span className="text-[10px] sm:text-xs bg-emerald-700 text-emerald-100 px-2 py-0.5 rounded-full font-mono">v{APP_VERSION} RTDB</span>
                     {IS_TEST_MODE && (
                       <span className="text-[10px] sm:text-xs bg-amber-400 text-slate-900 px-2 py-0.5 rounded-full font-bold">🧪 測試模式</span>
                     )}
@@ -4491,28 +4466,30 @@
                       </div>
                     </div>
 
+                    {/* [V2.11] 只能用 LINE / IG 聯絡的客人：手機可以留空 */}
                     <div className="grid grid-cols-2 gap-3">
                       <div>
-                        <label className="text-xs sm:text-sm font-medium text-slate-600 mb-1 block">LINE</label>
+                        <label className="text-xs sm:text-sm font-medium text-slate-600 mb-1 block">LINE ID / 暱稱</label>
                         <input
                           type="text"
-                          placeholder="LINE ID 或暱稱"
+                          placeholder="例如：mei_0912"
                           value={customerLine}
                           onChange={(e) => setCustomerLine(e.target.value)}
                           className="w-full text-xs sm:text-sm px-3 py-2 md:py-2.5 rounded-lg border border-slate-200 focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500 focus:outline-none"
                         />
                       </div>
                       <div>
-                        <label className="text-xs sm:text-sm font-medium text-slate-600 mb-1 block">IG</label>
+                        <label className="text-xs sm:text-sm font-medium text-slate-600 mb-1 block">IG 帳號</label>
                         <input
                           type="text"
-                          placeholder="@ig帳號"
-                          value={customerIG}
-                          onChange={(e) => setCustomerIG(e.target.value)}
+                          placeholder="例如：mei.shop"
+                          value={customerIg}
+                          onChange={(e) => setCustomerIg(e.target.value)}
                           className="w-full text-xs sm:text-sm px-3 py-2 md:py-2.5 rounded-lg border border-slate-200 focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500 focus:outline-none"
                         />
                       </div>
                     </div>
+                    <p className="text-[11px] text-slate-400 -mt-1.5">客人只能用 LINE 或 IG 聯絡時，手機號碼可以留空。</p>
 
                     <div className="grid grid-cols-3 gap-2 pt-1">
                       {['7-11 取貨付款', '全家取貨付款', '宅配到府'].map((method) => (
@@ -4972,7 +4949,7 @@
                     <IconSearch size={18} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
                     <input
                       type="text"
-                      placeholder="搜尋姓名、電話、門市、單號、商品..."
+                      placeholder="搜尋姓名、電話、LINE/IG、門市、商品..."
                       value={searchTerm}
                       onChange={(e) => setSearchTerm(e.target.value)}
                       className="w-full pl-9 pr-8 py-2 text-xs sm:text-sm rounded-xl border border-slate-200 focus:outline-none focus:border-emerald-500"
@@ -5222,7 +5199,7 @@
                           {/* 展開後才顯示（手機版：維持原本的緊湊排版） */}
                           {isExpanded && (
                             <div className="md:hidden border-t border-slate-100 bg-slate-50/60 px-3.5 py-3 space-y-2 text-xs">
-                              {((order.orderNo && !isOrderNoRedundant(order)) || order.customerPhone || order.customerLine || order.customerIG) && (
+                              {((order.orderNo && !isOrderNoRedundant(order)) || order.customerPhone || order.customerLine || order.customerIg) && (
                                 <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-slate-600">
                                   {order.orderNo && !isOrderNoRedundant(order) && (
                                     <span className="text-[11px] font-bold text-slate-700 bg-white border border-slate-200 px-2 py-0.5 rounded-lg">
@@ -5230,8 +5207,8 @@
                                     </span>
                                   )}
                                   {order.customerPhone && <span className="font-mono">📞 {order.customerPhone}</span>}
-                                  {order.customerLine && <span className="font-mono">💬 {order.customerLine}</span>}
-                                  {order.customerIG && <span className="font-mono">📷 {order.customerIG}</span>}
+                                  {order.customerLine && <span>LINE：<span className="font-semibold">{order.customerLine}</span></span>}
+                                  {order.customerIg && <span>IG：<span className="font-semibold">{order.customerIg}</span></span>}
                                 </div>
                               )}
 
@@ -5303,13 +5280,13 @@
                                   {order.customerLine && (
                                     <span>
                                       <span className="text-slate-500">LINE：</span>
-                                      <span className="font-mono">{order.customerLine}</span>
+                                      <span className="font-semibold">{order.customerLine}</span>
                                     </span>
                                   )}
-                                  {order.customerIG && (
+                                  {order.customerIg && (
                                     <span>
                                       <span className="text-slate-500">IG：</span>
-                                      <span className="font-mono">{order.customerIG}</span>
+                                      <span className="font-semibold">{order.customerIg}</span>
                                     </span>
                                   )}
                                   <span className="flex items-center gap-4">
@@ -6008,7 +5985,7 @@
 
           {/* Mobile Bottom Navigation */}
           <nav className="md:hidden fixed bottom-0 left-0 right-0 bg-white border-t border-slate-200/80 z-40 backdrop-blur-md bg-white/90">
-            <div className="max-w-4xl mx-auto flex items-stretch py-2 px-1">
+            <div className="max-w-4xl mx-auto flex items-center justify-around py-2 px-1">
               {navItems.map(item => {
                 const Icon = item.icon;
                 const isActive = activeTab === item.id;
@@ -6016,17 +5993,15 @@
                   <button
                     key={item.id}
                     onClick={() => setActiveTab(item.id)}
-                    className={`flex-1 flex flex-col items-center justify-center gap-1 text-[11px] font-medium transition ${
+                    className={`flex flex-col items-center gap-1 text-[11px] font-medium transition relative ${
                       isActive ? 'text-emerald-600 font-bold' : 'text-slate-400 hover:text-slate-600'
                     }`}
                   >
-                    <span className="relative">
-                      <Icon size={20} />
-                      {item.badge > 0 && (
-                        <span className="absolute -top-1 -right-1.5 w-2 h-2 rounded-full bg-amber-500" />
-                      )}
-                    </span>
+                    <Icon size={20} />
                     {item.label}
+                    {item.badge > 0 && (
+                      <span className="absolute -top-1 right-2 w-2 h-2 rounded-full bg-amber-500" />
+                    )}
                   </button>
                 );
               })}
