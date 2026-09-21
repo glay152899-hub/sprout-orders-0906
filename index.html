@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
-  <title>Sprout 📱 小豆苗訂單助手 V2.7.2 (Firebase RTDB 實時同步版)</title>
+  <title>Sprout 📱 小豆苗訂單助手 V2.8.0 (Firebase RTDB 實時同步版)</title>
   <!-- Tailwind CSS CDN -->
   <script src="https://cdn.tailwindcss.com"></script>
   <!-- React & ReactDOM Core Libraries -->
@@ -525,7 +525,7 @@
     };
 
     // 把 Excel 的原始列 → 預覽 / 匯入用的商品清單（純函式，不碰資料庫）
-    const buildImportProducts = (rawRows, opts, existingProducts) => {
+    const buildImportProducts = (rawRows, opts, existingProducts, reservedSkus = []) => {
       const tempItems = [];
 
       rawRows.forEach((row) => {
@@ -585,9 +585,15 @@
       const existingNames = new Set(
         (existingProducts || []).map(p => String(p.name || '').trim().toLowerCase())
       );
-      // 沒有款號的商品自動編 SKU-數字，從商品庫現有最大編號往後接，避免撞號
-      let skuCounter = (existingProducts || []).reduce((max, p) => {
-        const m = /^SKU-(\d+)$/i.exec(p.sku || '');
+      // [V2.8] 款號不能撞號：現有商品 + 回收桶裡的商品（reservedSkus）的款號都算「已使用」。
+      // 沒有款號的商品自動編 SKU-數字，從已使用的最大編號往後接；匯入檔的款號若已被使用，也改成自動編號。
+      const usedSkus = new Set(
+        [...(existingProducts || []).map(p => p.sku), ...reservedSkus]
+          .map(s => String(s || '').trim().toUpperCase())
+          .filter(Boolean)
+      );
+      let skuCounter = [...usedSkus].reduce((max, s) => {
+        const m = /^SKU-(\d+)$/.exec(s);
         return m ? Math.max(max, Number(m[1])) : max;
       }, 0);
 
@@ -595,7 +601,16 @@
         const sizeList = opts.smartSort ? sortSizes(item.sizeList) : item.sizeList;
         const isExisting = existingNames.has(item.name.trim().toLowerCase());
         const willImport = !(opts.skipExisting && isExisting);
-        const sku = item.sku || (willImport ? `SKU-${++skuCounter}` : '');
+        let sku = item.sku;
+        let skuChanged = false;
+        if (willImport && sku && usedSkus.has(sku.toUpperCase())) {
+          sku = '';          // 匯入檔的款號已被別的商品使用 → 改成自動編號
+          skuChanged = true;
+        }
+        if (!sku && willImport) {
+          do { sku = `SKU-${++skuCounter}`; } while (usedSkus.has(sku.toUpperCase()));
+        }
+        if (sku && willImport) usedSkus.add(sku.toUpperCase());
 
         return {
           sku,
@@ -606,7 +621,8 @@
           category: item.category || '未分類',
           note: item.note,
           isExisting,
-          willImport
+          willImport,
+          skuChanged
         };
       });
     };
@@ -798,9 +814,17 @@
       return `${String(o.customerName || '').trim()}#${calcOrderTotal(o)}#${items}`;
     };
 
-    const findDuplicateOrder = (item, orders) => {
+    // 找「看起來重複」的訂單：簽章相同（同客人 + 同商品 + 同金額），或單號相同。
+    // withinDays：只比對最近 N 天內的訂單（建立訂單時用，避免每週回購的客人一直被提醒）。
+    const findDuplicateOrder = (item, orders, withinDays = null, nowMs = Date.now()) => {
       const sig = orderSignature(item);
-      return (orders || []).find(o => o.id !== item.id && orderSignature(o) === sig) || null;
+      const orderNo = String(item.orderNo || '').trim();
+      return (orders || []).find(o => {
+        if (o.id === item.id) return false;
+        if (withinDays !== null && nowMs - (Number(o.timestamp) || 0) > withinDays * 86400000) return false;
+        if (orderSignature(o) === sig) return true;
+        return Boolean(orderNo) && String(o.orderNo || '').trim() === orderNo;
+      }) || null;
     };
 
     const findDuplicateProduct = (item, products) => {
@@ -1428,22 +1452,43 @@
       );
     }
 
+    // [V2.8] 匯入的訂單要用什麼狀態？（Excel 裡沒有付款、出貨資訊，由使用者在預覽時指定）
+    const ORDER_IMPORT_STATUS = {
+      pending: { key: 'pending', label: '待處理', desc: '未付款、待出貨（新的訂單）', paymentStatus: false, shipmentStatus: 'unshipped' },
+      shipped: { key: 'shipped', label: '已出貨', desc: '未付款（等客人取貨）', paymentStatus: false, shipmentStatus: 'shipped' },
+      done: { key: 'done', label: '已完成', desc: '已付款、已出貨（舊訂單歸檔）', paymentStatus: true, shipmentStatus: 'shipped' }
+    };
+
     // 訂單 Excel 匯入預覽 Modal（可勾選、標示重複單號 / 已對齊 Excel 總計）
-    function OrderImportPreviewModal({ drafts, existingOrderNos, isSaving, onClose, onConfirm }) {
-      const rows = React.useMemo(() => drafts.map((d, idx) => {
-        const computed = calcOrderTotal(d);
-        return {
-          idx,
-          d,
-          computed,
-          isDuplicate: Boolean(d.orderNo) && existingOrderNos.has(d.orderNo),
-          isEmpty: d.items.length === 0,
-          adjustLine: d.items.find(i => i.sku === ADJUSTMENT_SKU) || null
-        };
-      }), [drafts, existingOrderNos]);
+    function OrderImportPreviewModal({ drafts, existingOrderNos, existingOrders, trashOrderNos, isSaving, onClose, onConfirm }) {
+      const [statusKey, setStatusKey] = React.useState('pending');
+
+      const rows = React.useMemo(() => {
+        // 現有訂單的「簽章」（同客人 + 同商品 + 同金額），用來找出疑似已存在的訂單
+        const sigMap = new Map();
+        (existingOrders || []).forEach(o => {
+          const s = orderSignature(o);
+          if (!sigMap.has(s)) sigMap.set(s, o);
+        });
+
+        return drafts.map((d, idx) => {
+          const computed = calcOrderTotal(d);
+          const isDuplicate = Boolean(d.orderNo) && existingOrderNos.has(d.orderNo);
+          return {
+            idx,
+            d,
+            computed,
+            isDuplicate,                                                          // 單號已存在
+            similar: isDuplicate ? null : (sigMap.get(orderSignature(d)) || null), // 單號不同，但客人、商品、金額都一樣
+            inTrash: Boolean(d.orderNo) && Boolean(trashOrderNos) && trashOrderNos.has(d.orderNo), // 回收桶裡有同單號
+            isEmpty: d.items.length === 0,
+            adjustLine: d.items.find(i => i.sku === ADJUSTMENT_SKU) || null
+          };
+        });
+      }, [drafts, existingOrderNos, existingOrders, trashOrderNos]);
 
       const [selected, setSelected] = React.useState(
-        () => new Set(rows.filter(r => !r.isDuplicate && !r.isEmpty).map(r => r.idx))
+        () => new Set(rows.filter(r => !r.isDuplicate && !r.similar && !r.isEmpty).map(r => r.idx))
       );
 
       const toggleOne = (idx) => {
@@ -1461,7 +1506,7 @@
         setSelected(allChecked ? new Set() : new Set(importableIdx));
       };
 
-      const duplicateCount = rows.filter(r => r.isDuplicate).length;
+      const duplicateCount = rows.filter(r => r.isDuplicate || r.similar).length;
       const adjustedCount = rows.filter(r => r.adjustLine).length;
       const selectedTotal = rows.filter(r => selected.has(r.idx)).reduce((s, r) => s + r.computed, 0);
 
@@ -1476,7 +1521,7 @@
                 </h3>
                 <p className="text-xs text-slate-300 mt-0.5">
                   解析出 {rows.length} 筆訂購單
-                  {duplicateCount > 0 && `，${duplicateCount} 筆單號已存在`}
+                  {duplicateCount > 0 && `，${duplicateCount} 筆可能重複`}
                   {adjustedCount > 0 && `，${adjustedCount} 筆已自動對齊 Excel 總計`}
                 </p>
               </div>
@@ -1485,12 +1530,31 @@
               </button>
             </div>
 
+            <div className="px-4 pt-3 space-y-1.5">
+              <div className="text-xs font-bold text-slate-600">匯入後的訂單狀態</div>
+              <div className="grid grid-cols-3 gap-1.5">
+                {Object.values(ORDER_IMPORT_STATUS).map(opt => (
+                  <button
+                    key={opt.key}
+                    type="button"
+                    onClick={() => setStatusKey(opt.key)}
+                    className={`text-left px-2.5 py-2 rounded-xl border transition ${
+                      statusKey === opt.key ? 'border-emerald-500 bg-emerald-50 text-emerald-800' : 'border-slate-200 bg-white text-slate-600'
+                    }`}
+                  >
+                    <span className="block text-xs font-bold">{opt.label}</span>
+                    <span className="block text-[10px] leading-tight opacity-70">{opt.desc}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+
             <div className="px-4 pt-3 pb-1 flex items-center justify-between text-xs">
               <label className="flex items-center gap-2 cursor-pointer font-semibold text-slate-600">
                 <input type="checkbox" checked={allChecked} onChange={toggleAll} className="w-4 h-4 accent-emerald-600" />
                 全選 / 取消全選
               </label>
-              <span className="text-slate-400">重複單號預設不勾選，避免重複匯入</span>
+              <span className="text-slate-400">可能重複的預設不勾選</span>
             </div>
 
             <div className="p-4 pt-2 max-h-[55vh] overflow-y-auto space-y-2">
@@ -1514,6 +1578,8 @@
                         <span className="font-bold text-slate-800">{r.d.customerName}</span>
                         <span className="text-[11px] bg-slate-100 text-slate-600 px-2 py-0.5 rounded-md font-mono">📄 {r.d.orderNo}</span>
                         {r.isDuplicate && <span className="text-[11px] bg-amber-100 text-amber-800 px-2 py-0.5 rounded-full font-bold">單號已存在</span>}
+                        {r.similar && <span className="text-[11px] bg-amber-100 text-amber-800 px-2 py-0.5 rounded-full font-bold">疑似已存在（{formatOrderStamp(r.similar)} 建立）</span>}
+                        {r.inTrash && <span className="text-[11px] bg-slate-200 text-slate-600 px-2 py-0.5 rounded-full font-bold">回收桶有同單號</span>}
                         {r.isEmpty && <span className="text-[11px] bg-red-100 text-red-700 px-2 py-0.5 rounded-full font-bold">無商品</span>}
                         {r.adjustLine && <span className="text-[11px] bg-amber-100 text-amber-800 px-2 py-0.5 rounded-full font-bold">含差額調整</span>}
                       </div>
@@ -1568,7 +1634,7 @@
                 <button
                   type="button"
                   disabled={selected.size === 0 || isSaving}
-                  onClick={() => onConfirm(rows.filter(r => selected.has(r.idx)).map(r => r.d))}
+                  onClick={() => onConfirm(rows.filter(r => selected.has(r.idx)).map(r => r.d), statusKey)}
                   className="px-5 py-2 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed text-white font-semibold rounded-xl text-xs sm:text-sm transition shadow flex items-center gap-1.5"
                 >
                   <IconCheck size={18} />
@@ -2350,6 +2416,77 @@
       const [isPickerPanelOpen, setIsPickerPanelOpen] = React.useState(false);
       const itemEditorRef = React.useRef(null);
 
+      // [V2.8] 送出防連點：送出中鎖住按鈕；同一張訂單重試時沿用同一個訂單編號（重送只會覆蓋、不會多一張）
+      const [isSubmittingOrder, setIsSubmittingOrder] = React.useState(false);
+      const pendingOrderKeyRef = React.useRef(null);
+
+      // [V2.8] 訂單草稿：填到一半被打斷（切換 App、網頁被系統回收）時，內容不會消失
+      const draftKey = `sprout_order_draft_${IS_TEST_MODE ? 'test' : 'prod'}_${user?.uid || 'anon'}`;
+      const [draftReady, setDraftReady] = React.useState(false);
+      const [draftRestored, setDraftRestored] = React.useState(false);
+
+      React.useEffect(() => {
+        try {
+          const raw = localStorage.getItem(draftKey);
+          if (raw) {
+            const d = JSON.parse(raw);
+            const isFresh = d && d.ts && (Date.now() - d.ts) < 7 * 86400000; // 草稿只保留 7 天
+            if (isFresh) {
+              setLineText(d.lineText || '');
+              setCustomerName(d.customerName || '');
+              setCustomerPhone(d.customerPhone || '');
+              setDeliveryMethod(d.deliveryMethod || '7-11 取貨付款');
+              setStoreName(d.storeName || '');
+              setShippingFee(Number.isFinite(Number(d.shippingFee)) ? Number(d.shippingFee) : 60);
+              setOrderNote(d.orderNote || '');
+              setOrderItems(Array.isArray(d.orderItems) ? d.orderItems.map(sanitizeItem) : []);
+              setDraftRestored(true);
+            } else {
+              localStorage.removeItem(draftKey);
+            }
+          }
+        } catch (err) {
+          console.error('Draft restore error:', err);
+        }
+        setDraftReady(true); // 還原完成後才開始自動存檔，避免一開始的空白表單把草稿蓋掉
+      }, []);
+
+      React.useEffect(() => {
+        if (!draftReady) return;
+        try {
+          const hasContent = lineText.trim() || customerName.trim() || customerPhone.trim() ||
+            storeName.trim() || orderNote.trim() || orderItems.length > 0;
+          if (!hasContent) {
+            localStorage.removeItem(draftKey);
+            return;
+          }
+          localStorage.setItem(draftKey, JSON.stringify({
+            ts: Date.now(), lineText, customerName, customerPhone, deliveryMethod,
+            storeName, shippingFee, orderNote, orderItems
+          }));
+        } catch (err) {
+          // 私密瀏覽模式等情況無法儲存草稿，不影響正常使用
+        }
+      }, [draftReady, lineText, customerName, customerPhone, deliveryMethod, storeName, shippingFee, orderNote, orderItems]);
+
+      const handleDiscardDraft = () => {
+        setLineText('');
+        setCustomerName('');
+        setCustomerPhone('');
+        setStoreName('');
+        setOrderNote('');
+        setOrderItems([]);
+        setSelectedProductRef(null);
+        setDraftRestored(false);
+        try { localStorage.removeItem(draftKey); } catch (err) { /* ignore */ }
+      };
+
+      // 登出時一併清掉這台裝置上的草稿（草稿含客人資料）
+      const handleSignOut = () => {
+        try { localStorage.removeItem(draftKey); } catch (err) { /* ignore */ }
+        if (onSignOut) onSignOut();
+      };
+
       // Search and filters for orders
       const [searchTerm, setSearchTerm] = React.useState('');
       const [filterPayment, setFilterPayment] = React.useState('all');
@@ -2554,6 +2691,8 @@
 
       const handleSubmitNewOrder = async (e) => {
         e.preventDefault();
+        if (isSubmittingOrder) return; // 送出中，忽略重複點擊
+
         if (!customerName.trim()) {
           showToast('請輸入顧客姓名！');
           return;
@@ -2562,6 +2701,10 @@
           showToast('請至少新增一項商品！');
           return;
         }
+
+        // 這張訂單的固定編號：第一次送出時產生，重試時沿用。就算前一次其實已寫入、只是沒收到回覆，
+        // 重送也只會覆蓋同一筆，不會多出一張。
+        const orderKey = pendingOrderKeyRef.current || (pendingOrderKeyRef.current = dbRef('orders').push().key);
 
         const newOrderObj = {
           customerName,
@@ -2577,10 +2720,23 @@
           timestamp: Date.now()
         };
 
+        // 最近 3 天內已經有看起來相同的訂單（同客人、同商品、同金額）→ 先提醒，由使用者決定
+        const dup = findDuplicateOrder({ ...newOrderObj, id: orderKey }, orders, 3);
+        if (dup && !window.confirm(
+          `最近 3 天內已經有一筆看起來相同的訂單：\n${dup.customerName}　$${calcOrderTotal(dup)}　${formatOrderStamp(dup)} 建立\n\n仍要建立這一筆嗎？`
+        )) {
+          return;
+        }
+
+        setIsSubmittingOrder(true);
+        const slowTimer = setTimeout(() => {
+          showToast('⏳ 網路較慢，仍在送出中…請不要重複按，恢復連線後會自動完成');
+        }, 8000);
+
         try {
-          const newRef = dbRef('orders').push();
-          await newRef.set(newOrderObj);
-          logAction('order_create', 'order', newRef.key, `建立訂單：${customerName}（$${calcOrderTotal(newOrderObj)}）`);
+          await dbRef(`orders/${orderKey}`).set(newOrderObj);
+          pendingOrderKeyRef.current = null; // 成功了，下一張訂單用新的編號
+          logAction('order_create', 'order', orderKey, `建立訂單：${customerName}（$${calcOrderTotal(newOrderObj)}）`);
 
           setCustomerName('');
           setCustomerPhone('');
@@ -2589,12 +2745,16 @@
           setOrderItems([]);
           setLineText('');
           setSelectedProductRef(null);
+          setDraftRestored(false);
 
           showToast('🎉 訂單已建立，已即時同步至雲端！');
           setActiveTab('list');
         } catch (err) {
           console.error("Add order error:", err);
-          showToast('❌ 新增訂單失敗，請檢查權限或網路連線');
+          showToast('❌ 新增訂單失敗，請檢查權限或網路連線（內容還在，可以再按一次送出）');
+        } finally {
+          clearTimeout(slowTimer);
+          setIsSubmittingOrder(false);
         }
       };
 
@@ -2728,11 +2888,13 @@
       };
 
       // 確認匯入：以「附加」方式一次寫入雲端（不會覆蓋現有訂單）
-      const handleConfirmOrderImport = async (selectedDrafts) => {
+      const handleConfirmOrderImport = async (selectedDrafts, statusKey = 'pending') => {
         if (selectedDrafts.length === 0) {
           showToast('請至少勾選一筆訂單');
           return;
         }
+
+        const importStatus = ORDER_IMPORT_STATUS[statusKey] || ORDER_IMPORT_STATUS.pending;
 
         setIsOrderImporting(true);
         try {
@@ -2758,6 +2920,8 @@
             });
             updates[newKey] = {
               ...orderData,
+              paymentStatus: importStatus.paymentStatus,     // [V2.8] 由使用者在預覽視窗指定
+              shipmentStatus: importStatus.shipmentStatus,
               items: linkedItems,
               createdAt: new Date(baseTs).toLocaleString('zh-TW', { hour12: false }),
               timestamp: baseTs - i // 同一天的訂單維持 Excel 由上到下的順序
@@ -2765,7 +2929,7 @@
           });
 
           await dbRef('orders').update(updates);
-          logAction('order_import', 'order', '', `匯入 Excel 訂單 ${selectedDrafts.length} 筆：${summarizeNames(selectedDrafts.map(d => d.customerName))}`);
+          logAction('order_import', 'order', '', `匯入 Excel 訂單 ${selectedDrafts.length} 筆（${importStatus.label}）：${summarizeNames(selectedDrafts.map(d => d.customerName))}`);
           showToast(`🎉 成功匯入 ${selectedDrafts.length} 筆訂單至雲端！`);
           setIsOrderImportModalOpen(false);
           setOrderImportDrafts([]);
@@ -3106,6 +3270,16 @@
           createdAt: editingProduct.createdAt || new Date().toISOString()
         };
 
+        // [V2.8] 款號不能跟別的商品重複（款號是訂單、熱銷統計對應商品的依據）
+        const skuKey = prodData.sku.toUpperCase();
+        if (skuKey) {
+          const clash = products.find(p => p.id !== editingProduct.id && String(p.sku || '').trim().toUpperCase() === skuKey);
+          if (clash) {
+            showToast(`款號 ${prodData.sku} 已被「${clash.name}」使用，請換一個`);
+            return;
+          }
+        }
+
         try {
           if (editingProduct.id) {
             await dbRef(`products/${editingProduct.id}`).update(prodData);
@@ -3127,8 +3301,19 @@
 
       const handleDuplicateProduct = async (prod) => {
         try {
+          // 複製商品的款號：加上 _copy，若已被使用就繼續加 _copy2、_copy3…
+          let copySku = '';
+          if (prod.sku) {
+            const used = new Set(products.map(p => String(p.sku || '').trim().toUpperCase()));
+            let n = 1;
+            copySku = `${prod.sku}_copy`;
+            while (used.has(copySku.toUpperCase())) {
+              n += 1;
+              copySku = `${prod.sku}_copy${n}`;
+            }
+          }
           const dupData = {
-            sku: prod.sku ? `${prod.sku}_copy` : '',
+            sku: copySku,
             name: `${prod.name} (副本)`,
             price: prod.price,
             sizes: prod.sizes,
@@ -3317,8 +3502,8 @@
       // [V2.1.1] 商品匯入預覽：原始列 + 勾選選項 → 商品清單
       const parsedImportProducts = React.useMemo(() => {
         if (importRawRows.length === 0) return [];
-        return buildImportProducts(importRawRows, importOptions, products);
-      }, [importRawRows, importOptions, products]);
+        return buildImportProducts(importRawRows, importOptions, products, trashProducts.map(p => p.sku));
+      }, [importRawRows, importOptions, products, trashProducts]);
 
       const importHeaders = React.useMemo(() => {
         return importRawRows.length > 0 ? Object.keys(importRawRows[0]) : [];
@@ -3419,6 +3604,11 @@
       const existingOrderNos = React.useMemo(() => {
         return new Set(orders.map(o => o.orderNo).filter(Boolean));
       }, [orders]);
+
+      // [V2.8] 回收桶裡的訂單單號（匯入預覽會提醒「回收桶有同單號」）
+      const trashOrderNos = React.useMemo(() => {
+        return new Set(trashOrders.map(o => o.orderNo).filter(Boolean));
+      }, [trashOrders]);
 
       // Picking List Matrix
       const tallyMatrix = React.useMemo(() => {
@@ -3685,6 +3875,8 @@
             <OrderImportPreviewModal
               drafts={orderImportDrafts}
               existingOrderNos={existingOrderNos}
+              existingOrders={orders}
+              trashOrderNos={trashOrderNos}
               isSaving={isOrderImporting}
               onClose={() => { if (!isOrderImporting) { setIsOrderImportModalOpen(false); setOrderImportDrafts([]); } }}
               onConfirm={handleConfirmOrderImport}
@@ -3924,6 +4116,9 @@
                                 ) : (
                                   <span className="text-[11px] bg-emerald-100 text-emerald-700 px-2 py-0.5 rounded-full font-bold">新增</span>
                                 )}
+                                {p.skuChanged && (
+                                  <span className="ml-1 text-[11px] bg-amber-100 text-amber-800 px-2 py-0.5 rounded-full font-bold whitespace-nowrap">款號已被使用，改編</span>
+                                )}
                               </td>
                             </tr>
                           ))}
@@ -3970,7 +4165,7 @@
                 <div>
                   <h1 className="text-base sm:text-lg lg:text-xl font-bold leading-tight flex items-center gap-2">
                     小豆苗訂單助手
-                    <span className="text-[10px] sm:text-xs bg-emerald-700 text-emerald-100 px-2 py-0.5 rounded-full font-mono">v2.7.2 RTDB</span>
+                    <span className="text-[10px] sm:text-xs bg-emerald-700 text-emerald-100 px-2 py-0.5 rounded-full font-mono">v2.8.0 RTDB</span>
                     {IS_TEST_MODE && (
                       <span className="text-[10px] sm:text-xs bg-amber-400 text-slate-900 px-2 py-0.5 rounded-full font-bold">🧪 測試模式</span>
                     )}
@@ -4061,7 +4256,7 @@
                   <div className="mt-2">
                     <button
                       type="button"
-                      onClick={onSignOut}
+                      onClick={handleSignOut}
                       className="px-3 py-1.5 bg-white hover:bg-red-100 border border-red-200 text-red-700 font-bold rounded-lg text-xs transition"
                     >
                       登出
@@ -4082,7 +4277,29 @@
             {/* Tab 1: New Order */}
             {activeTab === 'add' && (
               <form onSubmit={handleSubmitNewOrder} className="space-y-4 md:space-y-0 md:grid md:grid-cols-12 md:gap-6 items-start">
-                
+                {/* [V2.8] 草稿已還原提示 */}
+                {draftRestored && (
+                  <div className="md:col-span-12 bg-amber-50 border border-amber-200 rounded-2xl px-4 py-3 flex flex-wrap items-center justify-between gap-2 text-xs sm:text-sm text-amber-900">
+                    <span>📝 已恢復上次<b>還沒送出</b>的訂單內容，確認無誤後再送出。</span>
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={handleDiscardDraft}
+                        className="px-3 py-1.5 bg-white hover:bg-amber-100 border border-amber-200 text-amber-800 font-bold rounded-lg text-xs whitespace-nowrap"
+                      >
+                        清除草稿
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setDraftRestored(false)}
+                        className="px-3 py-1.5 text-amber-700 hover:text-amber-900 font-semibold text-xs whitespace-nowrap"
+                      >
+                        知道了
+                      </button>
+                    </div>
+                  </div>
+                )}
+
                 {/* Left Column: Smart Parser & Customer Info */}
                 <div className="md:col-span-5 space-y-4">
                   {/* Smart Text Parser */}
@@ -4503,10 +4720,11 @@
 
                     <button
                       type="submit"
-                      className="w-full py-3.5 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-sm sm:text-base rounded-xl shadow-md transition flex items-center justify-center gap-2"
+                      disabled={isSubmittingOrder}
+                      className="w-full py-3.5 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60 disabled:cursor-not-allowed text-white font-bold text-sm sm:text-base rounded-xl shadow-md transition flex items-center justify-center gap-2"
                     >
                       <IconCheck size={20} />
-                      儲存並即時同步建立訂單
+                      {isSubmittingOrder ? '送出中…請稍候（請勿重複按）' : '儲存並即時同步建立訂單'}
                     </button>
                   </div>
                 </div>
@@ -5489,7 +5707,7 @@
                   </p>
                   <button
                     type="button"
-                    onClick={onSignOut}
+                    onClick={handleSignOut}
                     className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs sm:text-sm rounded-xl border border-slate-200 transition"
                   >
                     登出
