@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
   <meta name="theme-color" content="#0A7C78" />
-  <title>Sprout 📱 小豆苗訂單助手 V2.11.0 (Firebase RTDB 實時同步版)</title>
+  <title>Sprout 📱 小豆苗訂單助手 (Firebase RTDB 實時同步版)</title>
   <!-- Tailwind CSS CDN -->
   <script src="https://cdn.tailwindcss.com"></script>
   <script>
@@ -60,7 +60,7 @@
     // Firebase Initialization (Realtime Database - Singapore Region)
     // ==========================================
     // [V2.11] 版本號只寫這一個地方：標題列、登入畫面、瀏覽器分頁標題都由它產生，不會再有「其中一處忘了改」
-    const APP_VERSION = '2.12.0';
+    const APP_VERSION = '2.12.1';
     document.title = `Sprout 📱 小豆苗訂單助手 V${APP_VERSION} (Firebase RTDB 實時同步版)`;
 
     const firebaseConfig = {
@@ -6234,7 +6234,7 @@
 
           {/* Mobile Bottom Navigation */}
           <nav className="md:hidden fixed bottom-0 left-0 right-0 bg-white border-t border-slate-200/80 z-40 backdrop-blur-md bg-white/90">
-            <div className="max-w-4xl mx-auto flex items-center justify-around py-2 px-1">
+            <div className="max-w-4xl mx-auto flex items-center py-2 px-1">
               {navItems.map(item => {
                 const Icon = item.icon;
                 const isActive = activeTab === item.id;
@@ -6242,7 +6242,7 @@
                   <button
                     key={item.id}
                     onClick={() => setActiveTab(item.id)}
-                    className={`flex flex-col items-center gap-1 text-[11px] font-medium transition relative ${
+                    className={`flex-1 flex flex-col items-center gap-1 text-[11px] font-medium transition relative ${
                       isActive ? 'text-emerald-600 font-bold' : 'text-slate-400 hover:text-slate-600'
                     }`}
                   >
