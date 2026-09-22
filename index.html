@@ -60,7 +60,7 @@
     // Firebase Initialization (Realtime Database - Singapore Region)
     // ==========================================
     // [V2.11] 版本號只寫這一個地方：標題列、登入畫面、瀏覽器分頁標題都由它產生，不會再有「其中一處忘了改」
-    const APP_VERSION = '2.11.0';
+    const APP_VERSION = '2.12.0';
     document.title = `Sprout 📱 小豆苗訂單助手 V${APP_VERSION} (Firebase RTDB 實時同步版)`;
 
     const firebaseConfig = {
@@ -757,6 +757,41 @@
     // ==========================================
     // 「Excel 總計差額調整」這種自動產生的調整行用固定款號標記，
     // 這樣即使差額是正數，也不會被當成實體商品算進理貨清單。
+    // [V2.12] 運費與折扣設定：物流方式清單只在這裡定義一次，其他地方都引用它，
+    // 避免像運費 60/38 那樣「同一件事、兩個地方各寫一次、忘了同步」。
+    const DELIVERY_METHODS = [
+      { key: '7-11 取貨付款', short: '7-11' },
+      { key: '全家取貨付款', short: '全家' },
+      { key: '宅配到府', short: '宅配' }
+    ];
+
+    // 預設值只在資料庫還沒存過設定時使用（不會自動寫入資料庫，存了才算數）
+    const DEFAULT_SHIPPING_CONFIG = {
+      fees: { '7-11 取貨付款': 38, '全家取貨付款': 38, '宅配到府': 38 },
+      freeShippingEnabled: true,
+      freeShippingThreshold: 1800
+    };
+
+    // 讀進來的設定可能缺欄位（例如剛升級、資料庫還是舊格式），一律補上預設值
+    const sanitizeShippingConfig = (raw) => {
+      const fees = { ...DEFAULT_SHIPPING_CONFIG.fees };
+      DELIVERY_METHODS.forEach(({ key }) => {
+        const v = raw?.fees?.[key];
+        if (Number.isFinite(Number(v)) && Number(v) >= 0) fees[key] = Number(v);
+      });
+      return {
+        fees,
+        freeShippingEnabled: raw?.freeShippingEnabled !== undefined ? Boolean(raw.freeShippingEnabled) : DEFAULT_SHIPPING_CONFIG.freeShippingEnabled,
+        freeShippingThreshold: Number.isFinite(Number(raw?.freeShippingThreshold)) ? Number(raw.freeShippingThreshold) : DEFAULT_SHIPPING_CONFIG.freeShippingThreshold
+      };
+    };
+
+    // 依物流方式與目前小計，算出建議運費（滿額免運時回傳 0）
+    const suggestShippingFee = (deliveryMethod, subtotal, config) => {
+      if (config.freeShippingEnabled && subtotal >= config.freeShippingThreshold) return 0;
+      return config.fees[deliveryMethod] ?? 0;
+    };
+
     const ADJUSTMENT_SKU = 'ADJ';
     const isAdjustmentItem = (item) => Number(item?.price) < 0 || item?.sku === ADJUSTMENT_SKU;
 
@@ -1041,7 +1076,7 @@
       return d.getTime();
     };
 
-    const parseOrderExcelWorkbook = (workbook) => {
+    const parseOrderExcelWorkbook = (workbook, defaultShippingFee = 38) => {
       const drafts = [];
 
       workbook.SheetNames.forEach(sheetName => {
@@ -1057,7 +1092,7 @@
         let customerPhone = '';
         let shippingMethod = '7-11';
         let storeAddress = '';
-        let shippingFee = 38;
+        let shippingFee = defaultShippingFee;
         let excelTotalAmount = null;
 
         // 1. 解析買家基本資訊 (買家姓名、電話、門市)
@@ -1364,9 +1399,7 @@
                 <div>
                   <label className="text-xs font-semibold text-slate-600 mb-1 block">配送方式</label>
                   <select value={form.deliveryMethod} onChange={(e) => setField('deliveryMethod', e.target.value)} className={inputCls}>
-                    <option value="7-11 取貨付款">7-11 取貨付款</option>
-                    <option value="全家取貨付款">全家取貨付款</option>
-                    <option value="宅配到府">宅配到府</option>
+                    {DELIVERY_METHODS.map(({ key }) => <option key={key} value={key}>{key}</option>)}
                   </select>
                 </div>
               </div>
@@ -1692,6 +1725,128 @@
     // ==========================================
     // [V2.4] 快速帶入：商品晶片（可選取 / 單一規格可一鍵＋）
     // ==========================================
+    // ==========================================
+    // [V2.12] 運費與折扣設定視窗（老婆可以自己改，不用透過開發者）
+    // ==========================================
+    function ShippingSettingsModal({ config, isSaving, onSave, onClose }) {
+      const [form, setForm] = React.useState(() => ({ ...config, fees: { ...config.fees } }));
+      const [error, setError] = React.useState('');
+
+      const setFee = (key, val) => setForm(prev => ({ ...prev, fees: { ...prev.fees, [key]: val } }));
+
+      const handleSubmit = (e) => {
+        e.preventDefault();
+        setError('');
+        for (const { key, short } of DELIVERY_METHODS) {
+          const v = Number(form.fees[key]);
+          if (!Number.isFinite(v) || v < 0) { setError(`「${short}」的運費請輸入 0 以上的數字`); return; }
+        }
+        if (form.freeShippingEnabled) {
+          const t = Number(form.freeShippingThreshold);
+          if (!Number.isFinite(t) || t < 0) { setError('免運門檻請輸入 0 以上的數字'); return; }
+        }
+        onSave({
+          fees: Object.fromEntries(DELIVERY_METHODS.map(({ key }) => [key, Math.round(Number(form.fees[key]))])),
+          freeShippingEnabled: Boolean(form.freeShippingEnabled),
+          freeShippingThreshold: Math.round(Number(form.freeShippingThreshold) || 0)
+        });
+      };
+
+      const inputCls = "w-full text-sm px-3 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:border-emerald-500 bg-white";
+
+      return (
+        <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-sm flex items-end sm:items-center justify-center" onClick={onClose}>
+          <div
+            className="bg-white w-full sm:max-w-md rounded-t-3xl sm:rounded-2xl shadow-2xl flex flex-col max-h-[88vh]"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="px-5 pt-4 pb-3 flex items-center justify-between border-b border-slate-100">
+              <div>
+                <h3 className="font-bold text-base text-slate-800">⚙️ 運費與折扣設定</h3>
+                <p className="text-[11px] text-slate-400">新增訂單時會依物流方式自動帶入，之後仍可手動修改</p>
+              </div>
+              <button type="button" onClick={onClose} className="p-1.5 text-slate-400 hover:text-slate-700 rounded-lg hover:bg-slate-100">
+                <IconX size={22} />
+              </button>
+            </div>
+
+            <form onSubmit={handleSubmit} className="p-5 space-y-4 overflow-y-auto">
+              <div className="space-y-2.5">
+                <label className="text-xs font-bold text-slate-600 block">各物流方式的運費</label>
+                {DELIVERY_METHODS.map(({ key, short }) => (
+                  <div key={key} className="flex items-center gap-3">
+                    <span className="w-14 flex-shrink-0 text-sm font-semibold text-slate-700">{short}</span>
+                    <div className="relative flex-1">
+                      <span className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 text-sm">$</span>
+                      <input
+                        type="number"
+                        min="0"
+                        value={form.fees[key]}
+                        onChange={(e) => setFee(key, e.target.value)}
+                        className={inputCls + ' pl-7'}
+                      />
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              <div className="border-t border-slate-100 pt-3.5 space-y-2.5">
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={form.freeShippingEnabled}
+                    onChange={(e) => setForm(prev => ({ ...prev, freeShippingEnabled: e.target.checked }))}
+                    className="w-4 h-4 accent-emerald-600"
+                  />
+                  <span className="text-xs font-bold text-slate-600">滿額免運</span>
+                </label>
+                {form.freeShippingEnabled && (
+                  <div className="flex items-center gap-3">
+                    <span className="text-sm text-slate-600 flex-shrink-0">訂單小計滿</span>
+                    <div className="relative flex-1">
+                      <span className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 text-sm">$</span>
+                      <input
+                        type="number"
+                        min="0"
+                        value={form.freeShippingThreshold}
+                        onChange={(e) => setForm(prev => ({ ...prev, freeShippingThreshold: e.target.value }))}
+                        className={inputCls + ' pl-7'}
+                      />
+                    </div>
+                    <span className="text-sm text-slate-600 flex-shrink-0">免運費</span>
+                  </div>
+                )}
+                <p className="text-[11px] text-slate-400">
+                  免運不含商品折抵金額；以商品小計（不含運費）判斷。
+                </p>
+              </div>
+
+              {error && (
+                <div className="text-xs text-red-600 bg-red-50 border border-red-200 rounded-lg px-3 py-2 flex items-center gap-2">
+                  <IconAlertTriangle size={16} />
+                  {error}
+                </div>
+              )}
+
+              <div className="flex gap-2 pt-1">
+                <button type="button" onClick={onClose} className="flex-1 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold rounded-xl text-sm transition">
+                  取消
+                </button>
+                <button
+                  type="submit"
+                  disabled={isSaving}
+                  className="flex-1 py-2.5 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white font-semibold rounded-xl text-sm transition shadow-md flex items-center justify-center gap-1"
+                >
+                  <IconCheck size={18} />
+                  {isSaving ? '儲存中...' : '儲存設定'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      );
+    }
+
     function QuickPickChip({ product, selected, badge, note, mobileHidden, onSelect, onQuickAdd }) {
       const canQuickAdd = isSingleVariantProduct(product);
       // 手機：一行一個的緊湊列表（品名在左、價格在右）；桌機：兩欄卡片（品名、價格 | 款號 | 備註）
@@ -2233,7 +2388,12 @@
       const [tallyChecked, setTallyChecked] = React.useState({});
       const [isConnected, setIsConnected] = React.useState(false);
       const [isSyncing, setIsSyncing] = React.useState(true);
-      const [permissionDenied, setPermissionDenied] = React.useState(false); // [V2.5] 已登入但帳號不在規則白名單內
+      const [permissionDenied, setPermissionDenied] = React.useState(false);
+
+      // [V2.12] 運費與折扣設定
+      const [shippingConfig, setShippingConfig] = React.useState(DEFAULT_SHIPPING_CONFIG);
+      const [isShippingSettingsOpen, setIsShippingSettingsOpen] = React.useState(false);
+      const [isSavingShippingConfig, setIsSavingShippingConfig] = React.useState(false); // [V2.5] 已登入但帳號不在規則白名單內
 
       const [toastMessage, setToastMessage] = React.useState('');
       const [confirmDeleteId, setConfirmDeleteId] = React.useState(null);
@@ -2353,7 +2513,15 @@
           console.error("RTDB Products Error:", error);
         });
 
-        // 4. Listen to Tally States
+        // 4. [V2.12] Listen to Shipping Settings（資料庫沒有時用預設值，不會自動寫入）
+        const shippingRef = dbRef('settings/shipping');
+        shippingRef.on('value', (snapshot) => {
+          setShippingConfig(sanitizeShippingConfig(snapshot.val()));
+        }, (error) => {
+          console.error("RTDB Shipping Config Error:", error);
+        });
+
+        // 5. Listen to Tally States
         const tallyRef = dbRef('settings/tally');
         tallyRef.on('value', (snapshot) => {
           setTallyChecked(snapshot.val() || {});
@@ -2376,6 +2544,7 @@
           ordersRef.off();
           productsRef.off();
           tallyRef.off();
+          shippingRef.off();
           trashRef.off();
           connectedRef.off();
         };
@@ -2440,7 +2609,8 @@
       const [customerIg, setCustomerIg] = React.useState('');     // [V2.11]
       const [deliveryMethod, setDeliveryMethod] = React.useState('7-11 取貨付款');
       const [storeName, setStoreName] = React.useState('');
-      const [shippingFee, setShippingFee] = React.useState(60);
+      const [shippingFee, setShippingFee] = React.useState(DEFAULT_SHIPPING_CONFIG.fees['7-11 取貨付款']);
+      const [shippingFeeAuto, setShippingFeeAuto] = React.useState(true); // 運費是否跟著物流方式/滿額自動帶入
       const [orderNote, setOrderNote] = React.useState('');
       
       const [orderItems, setOrderItems] = React.useState([]);
@@ -2484,7 +2654,8 @@
               setCustomerIg(d.customerIg || '');
               setDeliveryMethod(d.deliveryMethod || '7-11 取貨付款');
               setStoreName(d.storeName || '');
-              setShippingFee(Number.isFinite(Number(d.shippingFee)) ? Number(d.shippingFee) : 60);
+              setShippingFee(Number.isFinite(Number(d.shippingFee)) ? Number(d.shippingFee) : DEFAULT_SHIPPING_CONFIG.fees['7-11 取貨付款']);
+              setShippingFeeAuto(false); // 還原草稿代表她可能已經自己調過運費，先不要再自動覆蓋
               setOrderNote(d.orderNote || '');
               setOrderItems(Array.isArray(d.orderItems) ? d.orderItems.map(sanitizeItem) : []);
               setDraftRestored(true);
@@ -2528,6 +2699,8 @@
         setOrderItems([]);
         setSelectedProductRef(null);
         setDraftRestored(false);
+        setShippingFeeAuto(true);
+        setShippingFee(suggestShippingFee(deliveryMethod, 0, shippingConfig));
         try { localStorage.removeItem(draftKey); } catch (err) { /* ignore */ }
       };
 
@@ -2592,6 +2765,19 @@
         setDeliveryMethod(delivery);
 
         showToast('✨ 智慧解析對話成功！');
+      };
+
+      // [V2.12] 選物流方式：運費若仍是「自動帶入」狀態，依新方式與目前小計重新建議
+      const handleSelectDeliveryMethod = (method) => {
+        setDeliveryMethod(method);
+        if (shippingFeeAuto) {
+          setShippingFee(suggestShippingFee(method, currentOrderSubtotal, shippingConfig));
+        }
+      };
+
+      const handleShippingFeeInput = (val) => {
+        setShippingFee(val);
+        setShippingFeeAuto(false); // 使用者手動改過，這張訂單之後不再自動覆蓋
       };
 
       const handleSelectProductFromLibrary = (prod) => {
@@ -2703,6 +2889,12 @@
       }, [orderItems]);
 
       const currentOrderTotal = currentOrderSubtotal + Number(shippingFee || 0);
+
+      // 商品增減可能讓小計跨過「滿額免運」門檻；只在使用者還沒手動改過運費時才自動更新
+      React.useEffect(() => {
+        if (!shippingFeeAuto) return;
+        setShippingFee(suggestShippingFee(deliveryMethod, currentOrderSubtotal, shippingConfig));
+      }, [currentOrderSubtotal, deliveryMethod, shippingConfig, shippingFeeAuto]);
 
       // Create New Order in RTDB
       // ==========================================
@@ -2828,6 +3020,8 @@
           setLineText('');
           setSelectedProductRef(null);
           setDraftRestored(false);
+          setShippingFeeAuto(true);
+          setShippingFee(suggestShippingFee(deliveryMethod, 0, shippingConfig));
 
           showToast('🎉 訂單已建立，已即時同步至雲端！');
           setActiveTab('list');
@@ -2944,7 +3138,7 @@
           try {
             const data = new Uint8Array(evt.target.result);
             const workbook = XLSX.read(data, { type: 'array' });
-            const drafts = parseOrderExcelWorkbook(workbook);
+            const drafts = parseOrderExcelWorkbook(workbook, shippingConfig.fees['7-11 取貨付款']);
 
             if (drafts.length === 0) {
               showToast('⚠️ 未能解析出有效訂單，請確認 Excel 格式');
@@ -3263,6 +3457,22 @@
         } catch (err) {
           console.error("Revert error:", err);
           showToast('❌ 還原失敗，請檢查網路連線');
+        }
+      };
+
+      // ---------- [V2.12] 運費與折扣設定：儲存 ----------
+      const handleSaveShippingConfig = async (newConfig) => {
+        setIsSavingShippingConfig(true);
+        try {
+          await withSyncTracking(dbRef('settings/shipping').set(newConfig));
+          logAction('settings_edit', 'system', '', `更新運費與折扣設定：${DELIVERY_METHODS.map(({ key, short }) => `${short}=$${newConfig.fees[key]}`).join('、')}；滿$${newConfig.freeShippingThreshold}${newConfig.freeShippingEnabled ? '免運' : '（未啟用）'}`);
+          showToast('✅ 運費與折扣設定已更新');
+          setIsShippingSettingsOpen(false);
+        } catch (err) {
+          console.error("Save shipping config error:", err);
+          showToast('❌ 儲存失敗，請檢查網路連線');
+        } finally {
+          setIsSavingShippingConfig(false);
         }
       };
 
@@ -3868,6 +4078,16 @@
               orders={orders}
               onRevert={handleRevertOrderEdit}
               onClose={() => setIsLogOpen(false)}
+            />
+          )}
+
+          {/* [V2.12] Shipping Settings Modal */}
+          {isShippingSettingsOpen && (
+            <ShippingSettingsModal
+              config={shippingConfig}
+              isSaving={isSavingShippingConfig}
+              onSave={handleSaveShippingConfig}
+              onClose={() => setIsShippingSettingsOpen(false)}
             />
           )}
 
@@ -4492,11 +4712,11 @@
                     <p className="text-[11px] text-slate-400 -mt-1.5">客人只能用 LINE 或 IG 聯絡時，手機號碼可以留空。</p>
 
                     <div className="grid grid-cols-3 gap-2 pt-1">
-                      {['7-11 取貨付款', '全家取貨付款', '宅配到府'].map((method) => (
+                      {DELIVERY_METHODS.map(({ key: method }) => (
                         <button
                           key={method}
                           type="button"
-                          onClick={() => setDeliveryMethod(method)}
+                          onClick={() => handleSelectDeliveryMethod(method)}
                           className={`py-2 text-xs sm:text-sm font-semibold rounded-lg border transition ${
                             deliveryMethod === method
                               ? 'bg-emerald-50 border-emerald-600 text-emerald-700'
@@ -4520,11 +4740,14 @@
                         />
                       </div>
                       <div>
-                        <label className="text-xs sm:text-sm font-medium text-slate-600 mb-1 block">運費 ($)</label>
+                        <label className="text-xs sm:text-sm font-medium text-slate-600 mb-1 flex items-center gap-1.5">
+                          運費 ($)
+                          {shippingFeeAuto && <span className="text-[10px] font-normal text-emerald-600 bg-emerald-50 px-1.5 py-0.5 rounded">自動</span>}
+                        </label>
                         <input
                           type="number"
                           value={shippingFee}
-                          onChange={(e) => setShippingFee(Number(e.target.value))}
+                          onChange={(e) => handleShippingFeeInput(Number(e.target.value))}
                           className="w-full text-xs sm:text-sm px-3 py-2 md:py-2.5 rounded-lg border border-slate-200 focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500 focus:outline-none"
                         />
                       </div>
@@ -5943,6 +6166,32 @@
                       📒 操作日誌
                     </button>
                   </div>
+                </div>
+
+                {/* [V2.12] Shipping & Discount Settings entry */}
+                <div className="bg-white rounded-2xl border border-slate-200/80 p-4 sm:p-5 shadow-sm space-y-2.5">
+                  <h3 className="font-bold text-sm sm:text-base text-slate-800">⚙️ 運費與折扣設定</h3>
+                  <p className="text-xs sm:text-sm text-slate-500">
+                    新增訂單時會依物流方式自動帶入運費；滿額可自動免運。這裡的設定隨時可以自己調整。
+                  </p>
+                  <div className="grid grid-cols-3 gap-2 text-xs">
+                    {DELIVERY_METHODS.map(({ key, short }) => (
+                      <div key={key} className="bg-slate-50 rounded-lg px-2.5 py-2 text-center">
+                        <div className="text-slate-500">{short}</div>
+                        <div className="font-bold text-slate-800">${shippingConfig.fees[key]}</div>
+                      </div>
+                    ))}
+                  </div>
+                  <p className="text-[11px] text-slate-400">
+                    {shippingConfig.freeShippingEnabled ? `滿 $${shippingConfig.freeShippingThreshold.toLocaleString()} 免運` : '目前未啟用滿額免運'}
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => setIsShippingSettingsOpen(true)}
+                    className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs sm:text-sm rounded-xl border border-slate-200 transition whitespace-nowrap"
+                  >
+                    修改設定
+                  </button>
                 </div>
 
                 {/* [V2.5] Account */}
