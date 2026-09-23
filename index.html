@@ -57,9 +57,8 @@
 
   <script type="text/babel">
     // ==========================================
-    // Firebase Initialization (Realtime Database - Singapore Region)
+    // config.js — 版本號 / Firebase設定 / 常數設定值
     // ==========================================
-    // [V2.11] 版本號只寫這一個地方：標題列、登入畫面、瀏覽器分頁標題都由它產生，不會再有「其中一處忘了改」
     const APP_VERSION = '2.12.1';
     document.title = `Sprout 📱 小豆苗訂單助手 V${APP_VERSION} (Firebase RTDB 實時同步版)`;
 
@@ -86,6 +85,99 @@
     const dbRef = (path) => db.ref(IS_TEST_MODE ? `test/${path}` : path);
     const dbRoot = () => (IS_TEST_MODE ? db.ref('test') : db.ref()); // 目前模式的根節點（用於一次更新多個路徑）
 
+    // ---- 下列常數原本散落在 utils.js 各處，統一搬到這裡管理 ----
+    const DEFAULT_IMPORT_OPTIONS = {
+      autoExtract: true,   // 智慧拆解名稱（-藏青90 → 顏色藏青 / 尺寸90）
+      smartSort: true,     // 尺寸智慧排序
+      autoCategory: true,  // 關鍵字分類推斷
+      groupBySeries: true, // 歸納同系列規格（同品名合併成一個商品）
+      skipExisting: true,  // 略過商品庫已有的同名商品，避免重複匯入
+      importNote: false    // 匯入備註欄（訂購單格式的備註是「訂單備註」，預設不匯入）
+    };
+
+    const DEFAULT_PRODUCTS = [
+      {
+        sku: 'A01',
+        name: '韓系重磅純棉T恤',
+        price: 390,
+        sizes: 'S, M, L, XL',
+        colors: '奶茶色, 燕麥白, 純黑色',
+        category: '服飾',
+        note: '熱銷爆款，版型偏大舒適',
+        createdAt: '2025-01-10T08:00:00.000Z',
+        status: 'active'
+      },
+      {
+        sku: 'B02',
+        name: '高腰顯瘦直筒牛仔褲',
+        price: 590,
+        sizes: 'S, M, L',
+        colors: '淺藍, 深藍',
+        category: '服飾',
+        note: '彈性極佳，高腰收腹設計',
+        createdAt: '2024-08-15T08:00:00.000Z',
+        status: 'active'
+      },
+      {
+        sku: 'C03',
+        name: '法式碎花長洋裝',
+        price: 780,
+        sizes: 'F',
+        colors: '杏色, 霧藍',
+        category: '服飾',
+        note: '附同色系腰帶，長度115cm',
+        createdAt: '2024-01-05T08:00:00.000Z',
+        status: 'active'
+      },
+      {
+        sku: 'D04',
+        name: '復古寬鬆落肩外套',
+        price: 980,
+        sizes: 'M, L',
+        colors: '軍綠, 水洗黑',
+        category: '服飾',
+        note: '秋冬新品，挺版防風布料',
+        createdAt: new Date(Date.now() - 45 * 86400000).toISOString(),
+        status: 'active'
+      },
+      {
+        sku: 'E05',
+        name: '極簡皮革小方包',
+        price: 450,
+        sizes: 'F',
+        colors: '焦糖, 墨黑, 象牙白',
+        category: '鞋包配飾',
+        note: '頭層牛皮質感，附長短背帶',
+        createdAt: '2024-03-20T08:00:00.000Z',
+        status: 'active'
+      }
+    ];
+
+    const DELIVERY_METHODS = [
+      { key: '7-11 取貨付款', short: '7-11' },
+      { key: '全家取貨付款', short: '全家' },
+      { key: '宅配到府', short: '宅配' }
+    ];
+
+    const DEFAULT_SHIPPING_CONFIG = {
+      fees: { '7-11 取貨付款': 38, '全家取貨付款': 38, '宅配到府': 38 },
+      freeShippingEnabled: true,
+      freeShippingThreshold: 1800
+    };
+
+    const ADJUSTMENT_SKU = 'ADJ';
+
+    const QUICK_PICK_HALF_LIFE_DAYS = 7;   // 權重減半所需天數
+    const QUICK_PICK_RECENT_DAYS = 14;     // 畫面上顯示「近 N 天賣出幾件」
+    const QUICK_PICK_SLOTS = 8;            // 常用區最多幾個（釘選 + 熱銷）
+    const QUICK_PICK_MIN_SCORE = 0.25;     // 約等於「兩週內賣過 1 件」，低於此不算熱銷
+    const QUICK_PICK_NEW_DAYS = 30;        // 建檔 30 天內算新品
+
+    const MOBILE_QUICK_MAX_ITEMS = 4;
+    const MOBILE_QUICK_MAX_LINES = 6;
+    const MOBILE_CHARS_PER_LINE = 15; // 手機一行大約能放的字數（含徽章）
+  </script>
+  <script type="text/babel">
     // ==========================================
     // SVG Icon Components
     // ==========================================
@@ -310,7 +402,8 @@
         <line x1="7" y1="7" x2="7.01" y2="7"></line>
       </svg>
     );
-
+  </script>
+  <script type="text/babel">
     // ==========================================
     // Error Boundary Component
     // ==========================================
@@ -361,6 +454,8 @@
         return this.props.children;
       }
     }
+  </script>
+  <script type="text/babel">
 
     // ==========================================
     // Helper Functions & Data Sanitizers
@@ -538,14 +633,7 @@
       });
     };
 
-    const DEFAULT_IMPORT_OPTIONS = {
-      autoExtract: true,   // 智慧拆解名稱（-藏青90 → 顏色藏青 / 尺寸90）
-      smartSort: true,     // 尺寸智慧排序
-      autoCategory: true,  // 關鍵字分類推斷
-      groupBySeries: true, // 歸納同系列規格（同品名合併成一個商品）
-      skipExisting: true,  // 略過商品庫已有的同名商品，避免重複匯入
-      importNote: false    // 匯入備註欄（訂購單格式的備註是「訂單備註」，預設不匯入）
-    };
+    // （DEFAULT_IMPORT_OPTIONS 已搬到 config.js）
 
     // 把 Excel 的原始列 → 預覽 / 匯入用的商品清單（純函式，不碰資料庫）
     const buildImportProducts = (rawRows, opts, existingProducts, reservedSkus = []) => {
@@ -693,63 +781,7 @@
       pinned: Boolean(prod?.pinned) // [V2.4] 釘選為常用商品
     });
 
-    const DEFAULT_PRODUCTS = [
-      {
-        sku: 'A01',
-        name: '韓系重磅純棉T恤',
-        price: 390,
-        sizes: 'S, M, L, XL',
-        colors: '奶茶色, 燕麥白, 純黑色',
-        category: '服飾',
-        note: '熱銷爆款，版型偏大舒適',
-        createdAt: '2025-01-10T08:00:00.000Z',
-        status: 'active'
-      },
-      {
-        sku: 'B02',
-        name: '高腰顯瘦直筒牛仔褲',
-        price: 590,
-        sizes: 'S, M, L',
-        colors: '淺藍, 深藍',
-        category: '服飾',
-        note: '彈性極佳，高腰收腹設計',
-        createdAt: '2024-08-15T08:00:00.000Z',
-        status: 'active'
-      },
-      {
-        sku: 'C03',
-        name: '法式碎花長洋裝',
-        price: 780,
-        sizes: 'F',
-        colors: '杏色, 霧藍',
-        category: '服飾',
-        note: '附同色系腰帶，長度115cm',
-        createdAt: '2024-01-05T08:00:00.000Z',
-        status: 'active'
-      },
-      {
-        sku: 'D04',
-        name: '復古寬鬆落肩外套',
-        price: 980,
-        sizes: 'M, L',
-        colors: '軍綠, 水洗黑',
-        category: '服飾',
-        note: '秋冬新品，挺版防風布料',
-        createdAt: new Date(Date.now() - 45 * 86400000).toISOString(),
-        status: 'active'
-      },
-      {
-        sku: 'E05',
-        name: '極簡皮革小方包',
-        price: 450,
-        sizes: 'F',
-        colors: '焦糖, 墨黑, 象牙白',
-        category: '鞋包配飾',
-        note: '頭層牛皮質感，附長短背帶',
-        createdAt: '2024-03-20T08:00:00.000Z',
-        status: 'active'
-      }
-    ];
+    // （DEFAULT_PRODUCTS 已搬到 config.js）
 
     // ==========================================
     // [V2.1] 訂單列表升級：金額計算工具
@@ -759,18 +791,10 @@
     // 這樣即使差額是正數，也不會被當成實體商品算進理貨清單。
     // [V2.12] 運費與折扣設定：物流方式清單只在這裡定義一次，其他地方都引用它，
     // 避免像運費 60/38 那樣「同一件事、兩個地方各寫一次、忘了同步」。
-    const DELIVERY_METHODS = [
-      { key: '7-11 取貨付款', short: '7-11' },
-      { key: '全家取貨付款', short: '全家' },
-      { key: '宅配到府', short: '宅配' }
-    ];
+    // （DELIVERY_METHODS 已搬到 config.js）
 
     // 預設值只在資料庫還沒存過設定時使用（不會自動寫入資料庫，存了才算數）
-    const DEFAULT_SHIPPING_CONFIG = {
-      fees: { '7-11 取貨付款': 38, '全家取貨付款': 38, '宅配到府': 38 },
-      freeShippingEnabled: true,
-      freeShippingThreshold: 1800
-    };
+    // （DEFAULT_SHIPPING_CONFIG 已搬到 config.js）
 
     // 讀進來的設定可能缺欄位（例如剛升級、資料庫還是舊格式），一律補上預設值
     const sanitizeShippingConfig = (raw) => {
@@ -792,7 +816,7 @@
       return config.fees[deliveryMethod] ?? 0;
     };
 
-    const ADJUSTMENT_SKU = 'ADJ';
+    // （ADJUSTMENT_SKU 已搬到 config.js）
     const isAdjustmentItem = (item) => Number(item?.price) < 0 || item?.sku === ADJUSTMENT_SKU;
 
     const calcOrderSubtotal = (order) =>
@@ -932,11 +956,7 @@
     // 不去猜「檔期」，改用時間衰減：越近的訂單權重越高（每過 N 天減半），
     // 所以這一檔的明星商品會自動浮上來、上一檔的舊明星商品自然沉下去。
     // ==========================================
-    const QUICK_PICK_HALF_LIFE_DAYS = 7;   // 權重減半所需天數
-    const QUICK_PICK_RECENT_DAYS = 14;     // 畫面上顯示「近 N 天賣出幾件」
-    const QUICK_PICK_SLOTS = 8;            // 常用區最多幾個（釘選 + 熱銷）
-    const QUICK_PICK_MIN_SCORE = 0.25;     // 約等於「兩週內賣過 1 件」，低於此不算熱銷
-    const QUICK_PICK_NEW_DAYS = 30;        // 建檔 30 天內算新品
+    // （QUICK_PICK_* 常數 已搬到 config.js）
 
     // 尺寸 / 顏色欄位的拆分（逗號、頓號、斜線、空白）
     const splitProductOptions = (s) =>
@@ -993,9 +1013,7 @@
 
     // [V2.4.1] 手機版只顯示 3～4 個：品名短最多 4 個；品名長（會折成兩行）約 3 個。
     // 依排序順序累加，遇到放不下的就停止，確保顯示的一定是排名最前面的。
-    const MOBILE_QUICK_MAX_ITEMS = 4;
-    const MOBILE_QUICK_MAX_LINES = 6;
-    const MOBILE_CHARS_PER_LINE = 15; // 手機一行大約能放的字數（含徽章）
+    // （MOBILE_QUICK_* / MOBILE_CHARS_PER_LINE 常數 已搬到 config.js）
     const estimateNameLines = (name) => Math.max(1, Math.ceil((String(name || '').length + 2) / MOBILE_CHARS_PER_LINE));
 
     const pickMobileVisibleIds = (orderedProducts) => {
@@ -1255,7 +1273,8 @@
 
       return drafts;
     };
-
+  </script>
+  <script type="text/babel">
     // ==========================================
     // [V2.1] 訂單列表升級：小元件
     // ==========================================
@@ -2218,7 +2237,8 @@
         </div>
       );
     }
-
+  </script>
+  <script type="text/babel">
     // ==========================================
     // [V2.5] 登入：只有 Firebase 裡建立的帳號能進來
     // 帳號由管理者在 Firebase Console 建立（畫面上沒有「註冊」）。
@@ -2375,7 +2395,8 @@
       if (!user) return <LoginScreen />;
       return <SproutOrderAssistant user={user} onSignOut={() => auth.signOut()} />;
     }
-
+  </script>
+  <script type="text/babel">
     // ==========================================
     // Main Component: SproutOrderAssistant
     // ==========================================
@@ -6259,7 +6280,8 @@
         </div>
       );
     }
-
+  </script>
+  <script type="text/babel">
     // Mount Application
     const root = ReactDOM.createRoot(document.getElementById('root'));
     root.render(
