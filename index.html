@@ -37,7 +37,6 @@
   <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-app-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-database-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-auth-compat.js"></script>
-  <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-storage-compat.js"></script>
 
   <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
@@ -60,7 +59,7 @@
     // ==========================================
     // config.js — 版本號 / Firebase設定 / 常數設定值
     // ==========================================
-    const APP_VERSION = '2.13.0';
+    const APP_VERSION = '2.14.0';
     document.title = `Sprout 📱 小豆苗訂單助手 V${APP_VERSION} (Firebase RTDB 實時同步版)`;
 
     const firebaseConfig = {
@@ -79,22 +78,26 @@
     }
     const db = firebase.database();
     const auth = firebase.auth(); // [V2.5] 登入驗證（電子郵件 / 密碼）
-    const storage = firebase.storage(); // [V2.13] 商品圖片存放處，RTDB 只存 imageUrl 參照，不存圖片內容本身
 
     // [V2.2] 測試模式：網址加上 ?mode=test，所有資料改存到 /test 底下，
     // 與正式訂單完全分開；測試完可一鍵清空，不會弄髒正式資料。
     const IS_TEST_MODE = new URLSearchParams(window.location.search).get('mode') === 'test';
     const dbRef = (path) => db.ref(IS_TEST_MODE ? `test/${path}` : path);
     const dbRoot = () => (IS_TEST_MODE ? db.ref('test') : db.ref()); // 目前模式的根節點（用於一次更新多個路徑）
-    // [V2.13] 比照 dbRef()：測試模式上傳的圖片自動存到 test/ 底下，不會混進正式的圖片空間，
-    // 也才能跟 RTDB 一樣靠「測試模式」跟正式資料完全隔離。
-    const storageRef = (path) => storage.ref(IS_TEST_MODE ? `test/${path}` : path);
+
+    // [V2.14] 商品圖片改存 Cloudinary（免費方案不需要信用卡），RTDB 只存圖片網址（imageUrl）參照，
+    // 不存圖片內容本身。上傳走「Unsigned Upload Preset」機制，前端不需要放任何機密金鑰，
+    // 就算 Preset 名稱被看到，最多只能被拿去上傳圖片，不會有帳號被亂改的風險。
+    const CLOUDINARY_CLOUD_NAME = 'wjppv7h9';
+    const CLOUDINARY_UPLOAD_PRESET = 'legolas977';
+    const CLOUDINARY_UPLOAD_URL = `https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/image/upload`;
 
     // [V2.13] 商品圖片：上傳前先在瀏覽器端壓縮，避免手機拍照的原圖（常見 3~5MB）直接整張上傳，
-    // 拖慢上傳速度、也浪費 Firebase Storage 的流量配額。
+    // 拖慢上傳速度、也浪費 Cloudinary 免費方案的 credits 額度。
     const PRODUCT_IMAGE_MAX_DIMENSION = 800; // 壓縮後最長邊像素
     const PRODUCT_IMAGE_JPEG_QUALITY = 0.8;  // JPEG 壓縮品質（0~1）
     const PRODUCT_IMAGE_MAX_RAW_MB = 20;     // 原始檔案超過這個大小直接拒絕，避免壓縮卡住
+
 
     // ---- 下列常數原本散落在 utils.js 各處，統一搬到這裡管理 ----
     const DEFAULT_IMPORT_OPTIONS = {
@@ -4351,7 +4354,7 @@
         setIsProductModalOpen(true);
       };
 
-      // [V2.13] 商品圖片：選檔 → 壓縮 → 上傳到 Firebase Storage → 把下載網址存回 editingProduct.imageUrl
+      // [V2.14] 商品圖片：選檔 → 壓縮 → 上傳到 Cloudinary（Unsigned Upload） → 把回傳網址存回 editingProduct.imageUrl
       // （真正寫進 RTDB 是在按下「儲存商品」的 handleSaveProductModal，這裡只負責把圖片準備好）
       const handleProductImageUpload = async (e) => {
         const file = e.target.files && e.target.files[0];
@@ -4372,10 +4375,21 @@
         try {
           const blob = await compressImageFile(file);
           const groupKey = editingProduct.id || productImageSessionKeyRef.current;
-          const imgRef = storageRef(`products/${groupKey}/${Date.now()}.jpg`);
-          await imgRef.put(blob, { contentType: 'image/jpeg' });
-          const url = await imgRef.getDownloadURL();
-          setEditingProduct(prev => ({ ...prev, imageUrl: url }));
+          // 用「測試模式/正式」+ 商品代號分資料夾，比照 dbRef() 的測試資料隔離邏輯，
+          // 測試上傳的圖片不會跟正式圖片混在一起。
+          const folder = `${IS_TEST_MODE ? 'test/' : ''}products/${groupKey}`;
+
+          const formData = new FormData();
+          formData.append('file', blob, 'product.jpg');
+          formData.append('upload_preset', CLOUDINARY_UPLOAD_PRESET);
+          formData.append('folder', folder);
+
+          const res = await fetch(CLOUDINARY_UPLOAD_URL, { method: 'POST', body: formData });
+          const data = await res.json();
+          if (!res.ok || !data.secure_url) {
+            throw new Error(data?.error?.message || '上傳失敗');
+          }
+          setEditingProduct(prev => ({ ...prev, imageUrl: data.secure_url }));
           showToast('🖼️ 圖片已上傳');
         } catch (err) {
           console.error('Product image upload error:', err);
@@ -4384,6 +4398,7 @@
           setIsUploadingProductImage(false);
         }
       };
+
 
       const handleRemoveProductImage = () => {
         setEditingProduct(prev => ({ ...prev, imageUrl: '' }));
