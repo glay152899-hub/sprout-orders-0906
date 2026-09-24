@@ -37,6 +37,7 @@
   <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-app-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-database-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-auth-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-storage-compat.js"></script>
 
   <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
@@ -59,7 +60,7 @@
     // ==========================================
     // config.js — 版本號 / Firebase設定 / 常數設定值
     // ==========================================
-    const APP_VERSION = '2.12.4';
+    const APP_VERSION = '2.13.0';
     document.title = `Sprout 📱 小豆苗訂單助手 V${APP_VERSION} (Firebase RTDB 實時同步版)`;
 
     const firebaseConfig = {
@@ -78,12 +79,22 @@
     }
     const db = firebase.database();
     const auth = firebase.auth(); // [V2.5] 登入驗證（電子郵件 / 密碼）
+    const storage = firebase.storage(); // [V2.13] 商品圖片存放處，RTDB 只存 imageUrl 參照，不存圖片內容本身
 
     // [V2.2] 測試模式：網址加上 ?mode=test，所有資料改存到 /test 底下，
     // 與正式訂單完全分開；測試完可一鍵清空，不會弄髒正式資料。
     const IS_TEST_MODE = new URLSearchParams(window.location.search).get('mode') === 'test';
     const dbRef = (path) => db.ref(IS_TEST_MODE ? `test/${path}` : path);
     const dbRoot = () => (IS_TEST_MODE ? db.ref('test') : db.ref()); // 目前模式的根節點（用於一次更新多個路徑）
+    // [V2.13] 比照 dbRef()：測試模式上傳的圖片自動存到 test/ 底下，不會混進正式的圖片空間，
+    // 也才能跟 RTDB 一樣靠「測試模式」跟正式資料完全隔離。
+    const storageRef = (path) => storage.ref(IS_TEST_MODE ? `test/${path}` : path);
+
+    // [V2.13] 商品圖片：上傳前先在瀏覽器端壓縮，避免手機拍照的原圖（常見 3~5MB）直接整張上傳，
+    // 拖慢上傳速度、也浪費 Firebase Storage 的流量配額。
+    const PRODUCT_IMAGE_MAX_DIMENSION = 800; // 壓縮後最長邊像素
+    const PRODUCT_IMAGE_JPEG_QUALITY = 0.8;  // JPEG 壓縮品質（0~1）
+    const PRODUCT_IMAGE_MAX_RAW_MB = 20;     // 原始檔案超過這個大小直接拒絕，避免壓縮卡住
 
     // ---- 下列常數原本散落在 utils.js 各處，統一搬到這裡管理 ----
     const DEFAULT_IMPORT_OPTIONS = {
@@ -267,6 +278,14 @@
       <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}>
         <rect x="9" y="9" width="13" height="13" rx="2"></rect>
         <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+      </svg>
+    );
+
+    const IconImage = ({ size = 20, className = "" }) => (
+      <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}>
+        <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+        <circle cx="8.5" cy="8.5" r="1.5"></circle>
+        <polyline points="21 15 16 10 5 21"></polyline>
       </svg>
     );
 
@@ -778,10 +797,51 @@
       createdAt: prod?.createdAt || new Date().toISOString(),
       lastOrderedAt: prod?.lastOrderedAt || null,
       status: prod?.status || 'active',
-      pinned: Boolean(prod?.pinned) // [V2.4] 釘選為常用商品
+      pinned: Boolean(prod?.pinned), // [V2.4] 釘選為常用商品
+      imageUrl: prod?.imageUrl || '' // [V2.13] 商品圖片網址（實際檔案存在 Firebase Storage，這裡只存參照）
     });
 
     // （DEFAULT_PRODUCTS 已搬到 config.js）
+
+    // ==========================================
+    // [V2.13] 商品圖片：上傳前壓縮
+    // 用 Canvas 把圖片等比例縮小到指定的最長邊，並轉成 JPEG 輸出，
+    // 避免手機拍照的原圖（常見 3~5MB）整張直接上傳，拖慢上傳速度、浪費流量。
+    // 純函式，之後如果要開放手機拍照上傳，也能直接重用。
+    // ==========================================
+    const compressImageFile = (file, maxDimension = PRODUCT_IMAGE_MAX_DIMENSION, quality = PRODUCT_IMAGE_JPEG_QUALITY) => {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = (e) => {
+          const img = new Image();
+          img.onload = () => {
+            let { width, height } = img;
+            if (width > maxDimension || height > maxDimension) {
+              if (width > height) {
+                height = Math.round(height * (maxDimension / width));
+                width = maxDimension;
+              } else {
+                width = Math.round(width * (maxDimension / height));
+                height = maxDimension;
+              }
+            }
+            const canvas = document.createElement('canvas');
+            canvas.width = width;
+            canvas.height = height;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(img, 0, 0, width, height);
+            canvas.toBlob((blob) => {
+              if (blob) resolve(blob);
+              else reject(new Error('圖片壓縮失敗，請換一張圖片再試一次'));
+            }, 'image/jpeg', quality);
+          };
+          img.onerror = () => reject(new Error('圖片讀取失敗，請確認檔案格式是否正確'));
+          img.src = e.target.result;
+        };
+        reader.onerror = () => reject(new Error('檔案讀取失敗'));
+        reader.readAsDataURL(file);
+      });
+    };
 
     // ==========================================
     // [V2.1] 訂單列表升級：金額計算工具
@@ -3139,6 +3199,7 @@
       const [productViewMode, setProductViewMode] = React.useState('grid'); // 'grid' | 'list'
       const [editingProduct, setEditingProduct] = React.useState(null); // Product object or null
       const [isProductModalOpen, setIsProductModalOpen] = React.useState(false);
+      const [isUploadingProductImage, setIsUploadingProductImage] = React.useState(false); // [V2.13]
       
       // Import Preview Modal State
       const [importRawRows, setImportRawRows] = React.useState([]);          // Excel 讀進來的原始列
@@ -3368,6 +3429,9 @@
       // [V2.8] 送出防連點：送出中鎖住按鈕；同一張訂單重試時沿用同一個訂單編號（重送只會覆蓋、不會多一張）
       const [isSubmittingOrder, setIsSubmittingOrder] = React.useState(false);
       const pendingOrderKeyRef = React.useRef(null);
+      // [V2.13] 新增商品時還沒有商品 ID，圖片要先有地方放，
+      // 所以開啟「新增商品」Modal 時先產生一個暫時代號，圖片路徑用這個代號分組。
+      const productImageSessionKeyRef = React.useRef(null);
 
       // [V2.8] 訂單草稿：填到一半被打斷（切換 App、網頁被系統回收）時，內容不會消失
       const draftKey = `sprout_order_draft_${IS_TEST_MODE ? 'test' : 'prod'}_${user?.uid || 'anon'}`;
@@ -4263,6 +4327,8 @@
       // Product Library V5.1 Actions
       // ==========================================
       const handleOpenAddProductModal = () => {
+        // [V2.13] 新增商品的圖片上傳路徑代號（此商品存檔前，圖片先暫放在這個代號底下）
+        productImageSessionKeyRef.current = `new_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
         setEditingProduct({
           id: null,
           sku: '',
@@ -4273,14 +4339,54 @@
           category: '服飾',
           note: '',
           status: 'active',
-          pinned: false
+          pinned: false,
+          imageUrl: ''
         });
         setIsProductModalOpen(true);
       };
 
       const handleOpenEditProductModal = (prod) => {
+        productImageSessionKeyRef.current = null; // 編輯既有商品：圖片路徑直接用商品 ID，不需要暫時代號
         setEditingProduct({ ...prod });
         setIsProductModalOpen(true);
+      };
+
+      // [V2.13] 商品圖片：選檔 → 壓縮 → 上傳到 Firebase Storage → 把下載網址存回 editingProduct.imageUrl
+      // （真正寫進 RTDB 是在按下「儲存商品」的 handleSaveProductModal，這裡只負責把圖片準備好）
+      const handleProductImageUpload = async (e) => {
+        const file = e.target.files && e.target.files[0];
+        e.target.value = ''; // 清空 input，允許重複選同一個檔案
+        if (!file || !editingProduct) return;
+
+        if (!file.type.startsWith('image/')) {
+          showToast('❌ 請選擇圖片檔案');
+          return;
+        }
+        if (file.size > PRODUCT_IMAGE_MAX_RAW_MB * 1024 * 1024) {
+          showToast(`❌ 圖片檔案過大，請選擇小於 ${PRODUCT_IMAGE_MAX_RAW_MB}MB 的圖片`);
+          return;
+        }
+        if (!requireConnection('上傳商品圖片')) return;
+
+        setIsUploadingProductImage(true);
+        try {
+          const blob = await compressImageFile(file);
+          const groupKey = editingProduct.id || productImageSessionKeyRef.current;
+          const imgRef = storageRef(`products/${groupKey}/${Date.now()}.jpg`);
+          await imgRef.put(blob, { contentType: 'image/jpeg' });
+          const url = await imgRef.getDownloadURL();
+          setEditingProduct(prev => ({ ...prev, imageUrl: url }));
+          showToast('🖼️ 圖片已上傳');
+        } catch (err) {
+          console.error('Product image upload error:', err);
+          showToast('❌ 圖片上傳失敗，請檢查網路連線後再試一次');
+        } finally {
+          setIsUploadingProductImage(false);
+        }
+      };
+
+      const handleRemoveProductImage = () => {
+        setEditingProduct(prev => ({ ...prev, imageUrl: '' }));
       };
 
       const handleSaveProductModal = async (e) => {
@@ -4301,6 +4407,7 @@
           note: editingProduct.note.trim(),
           status: editingProduct.status || 'active',
           pinned: Boolean(editingProduct.pinned),
+          imageUrl: editingProduct.imageUrl || '', // [V2.13]
           createdAt: editingProduct.createdAt || new Date().toISOString()
         };
 
@@ -4355,6 +4462,7 @@
             category: prod.category,
             note: prod.note,
             status: 'active',
+            imageUrl: prod.imageUrl || '', // [V2.13] 複製商品沿用同一張圖片，不重新上傳
             createdAt: new Date().toISOString()
           };
           const newRef = dbRef('products').push();
@@ -4947,6 +5055,42 @@
                 </div>
 
                 <form onSubmit={handleSaveProductModal} className="p-6 space-y-4">
+                  {/* [V2.13] 商品圖片：先只開放電腦版上傳/預覽，手機版之後再開放 */}
+                  <div className="hidden md:block">
+                    <label className="text-xs font-semibold text-slate-600 mb-1 block">商品圖片</label>
+                    <div className="flex items-center gap-3">
+                      <div className="w-20 h-20 rounded-xl border border-slate-200 bg-slate-50 flex items-center justify-center overflow-hidden flex-shrink-0">
+                        {editingProduct.imageUrl ? (
+                          <img src={editingProduct.imageUrl} alt={editingProduct.name || '商品圖片'} className="w-full h-full object-cover" />
+                        ) : (
+                          <IconImage size={24} className="text-slate-300" />
+                        )}
+                      </div>
+                      <div className="flex flex-col items-start gap-1.5">
+                        <label className={`cursor-pointer px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold rounded-lg text-xs transition ${isUploadingProductImage ? 'opacity-50 pointer-events-none' : ''}`}>
+                          {isUploadingProductImage ? '上傳中...' : (editingProduct.imageUrl ? '更換圖片' : '上傳圖片')}
+                          <input
+                            type="file"
+                            accept="image/*"
+                            onChange={handleProductImageUpload}
+                            disabled={isUploadingProductImage}
+                            className="hidden"
+                          />
+                        </label>
+                        {editingProduct.imageUrl && (
+                          <button
+                            type="button"
+                            onClick={handleRemoveProductImage}
+                            className="px-1 text-red-500 hover:text-red-600 font-semibold text-xs transition"
+                          >
+                            移除圖片
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                    <p className="text-[11px] text-slate-400 mt-1.5">上傳後會自動壓縮；手機版商品庫目前還不會顯示圖片。</p>
+                  </div>
+
                   <div className="grid grid-cols-3 gap-3">
                     <div>
                       <label className="text-xs font-semibold text-slate-600 mb-1 block">商品款號 (SKU)</label>
@@ -6129,6 +6273,22 @@
                           }`}
                         >
                           <div className="space-y-2">
+                            {/* [V2.13] 商品縮圖：僅電腦版顯示 */}
+                            <div className="hidden md:block">
+                              {p.imageUrl ? (
+                                <img
+                                  src={p.imageUrl}
+                                  alt={p.name}
+                                  loading="lazy"
+                                  className="w-full h-28 object-cover rounded-xl border border-slate-200"
+                                />
+                              ) : (
+                                <div className="w-full h-28 rounded-xl border border-dashed border-slate-200 bg-slate-50 flex items-center justify-center">
+                                  <IconImage size={22} className="text-slate-300" />
+                                </div>
+                              )}
+                            </div>
+
                             {/* Header SKU & Category & Stagnant Badge */}
                             <div className="flex items-start justify-between gap-2">
                               <div className="flex flex-wrap items-center gap-1.5">
@@ -6235,6 +6395,7 @@
                       <thead className="bg-slate-50 border-b border-slate-200 text-slate-500">
                         <tr>
                           {productSelectMode && <th className="p-3 w-8"></th>}
+                          <th className="p-3 w-14">圖片</th>
                           <th className="p-3">款號</th>
                           <th className="p-3">商品名稱</th>
                           <th className="p-3">分類</th>
@@ -6265,6 +6426,20 @@
                                   />
                                 </td>
                               )}
+                              <td className="p-3">
+                                {p.imageUrl ? (
+                                  <img
+                                    src={p.imageUrl}
+                                    alt={p.name}
+                                    loading="lazy"
+                                    className="w-10 h-10 rounded-lg object-cover border border-slate-200"
+                                  />
+                                ) : (
+                                  <div className="w-10 h-10 rounded-lg border border-dashed border-slate-200 bg-slate-50 flex items-center justify-center">
+                                    <IconImage size={16} className="text-slate-300" />
+                                  </div>
+                                )}
+                              </td>
                               <td className="p-3 font-mono font-bold text-emerald-600">{p.sku || '-'}</td>
                               <td className="p-3 font-bold text-slate-800">{p.pinned ? '📌 ' : ''}{p.name}</td>
                               <td className="p-3 text-slate-500">{p.category || '未分類'}</td>
