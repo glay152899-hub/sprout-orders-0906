@@ -59,7 +59,7 @@
     // ==========================================
     // config.js — 版本號 / Firebase設定 / 常數設定值
     // ==========================================
-    const APP_VERSION = '2.12.6';
+    const APP_VERSION = '2.12.7';
     document.title = `Sprout 📱 小豆苗訂單助手 V${APP_VERSION} (Firebase RTDB 實時同步版)`;
 
     const firebaseConfig = {
@@ -4022,6 +4022,25 @@
           `最近 3 天內已經有一筆看起來相同的訂單：\n${dup.customerName}　$${calcOrderTotal(dup)}　${formatOrderStamp(dup)} 建立\n\n仍要建立這一筆嗎？`
         )) {
           return;
+        }
+
+        // [黑名單 v2.12.7] 比對顧客資料是否命中黑名單，命中僅提醒、不強制攔截，由使用者自行判斷是否仍要送出
+        const blacklistMatch = findBlacklistMatches(
+          { name: customerName, phone: customerPhone, line: customerLine, ig: customerIg },
+          blacklist
+        );
+        if (blacklistMatch.level !== 'none') {
+          const hitLabels = blacklistMatch.hits.map((h) => {
+            const e = h.entry;
+            const fieldNames = h.fields.map((f) => ({ phone: '電話', ig: 'IG', line: 'LINE', name: '姓名' }[f])).join('/');
+            return `${e.name || e.phone || e.ig || e.line || '（未填資料）'}（${fieldNames}相符${e.reason ? '，原因：' + e.reason : ''}）`;
+          }).join('\n');
+          const warnTitle = blacklistMatch.level === 'strong'
+            ? '⚠️ 這位顧客的電話/IG/LINE 符合黑名單紀錄：'
+            : '⚠️ 這位顧客的姓名跟黑名單紀錄相同（僅姓名相符，請自行確認是否為同一人）：';
+          if (!window.confirm(`${warnTitle}\n${hitLabels}\n\n仍要建立這筆訂單嗎？`)) {
+            return;
+          }
         }
 
         setIsSubmittingOrder(true);
