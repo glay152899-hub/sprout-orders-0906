@@ -59,7 +59,7 @@
     // ==========================================
     // config.js — 版本號 / Firebase設定 / 常數設定值
     // ==========================================
-    const APP_VERSION = '2.14.0';
+    const APP_VERSION = '2.14.1';
     document.title = `Sprout 📱 小豆苗訂單助手 V${APP_VERSION} (Firebase RTDB 實時同步版)`;
 
     const firebaseConfig = {
@@ -94,8 +94,10 @@
 
     // [V2.13] 商品圖片：上傳前先在瀏覽器端壓縮，避免手機拍照的原圖（常見 3~5MB）直接整張上傳，
     // 拖慢上傳速度、也浪費 Cloudinary 免費方案的 credits 額度。
-    const PRODUCT_IMAGE_MAX_DIMENSION = 800; // 壓縮後最長邊像素
-    const PRODUCT_IMAGE_JPEG_QUALITY = 0.8;  // JPEG 壓縮品質（0~1）
+    // [V2.14.1] 最長邊從 800 提高到 1400px：因為圖片庫瀏覽時的「看大圖」用的就是同一張上傳圖，
+    // 800px 放大看細節會不夠清楚，1400px 在放大檢視跟壓縮後檔案大小之間是比較平衡的取捨。
+    const PRODUCT_IMAGE_MAX_DIMENSION = 1400; // 壓縮後最長邊像素
+    const PRODUCT_IMAGE_JPEG_QUALITY = 0.82;  // JPEG 壓縮品質（0~1）
     const PRODUCT_IMAGE_MAX_RAW_MB = 20;     // 原始檔案超過這個大小直接拒絕，避免壓縮卡住
 
 
@@ -3203,6 +3205,7 @@
       const [editingProduct, setEditingProduct] = React.useState(null); // Product object or null
       const [isProductModalOpen, setIsProductModalOpen] = React.useState(false);
       const [isUploadingProductImage, setIsUploadingProductImage] = React.useState(false); // [V2.13]
+      const [imageLightboxUrl, setImageLightboxUrl] = React.useState(null); // [V2.14.1] 點縮圖看大圖用
       
       // Import Preview Modal State
       const [importRawRows, setImportRawRows] = React.useState([]);          // Excel 讀進來的原始列
@@ -5076,7 +5079,12 @@
                     <div className="flex items-center gap-3">
                       <div className="w-20 h-20 rounded-xl border border-slate-200 bg-slate-50 flex items-center justify-center overflow-hidden flex-shrink-0">
                         {editingProduct.imageUrl ? (
-                          <img src={editingProduct.imageUrl} alt={editingProduct.name || '商品圖片'} className="w-full h-full object-cover" />
+                          <img
+                            src={editingProduct.imageUrl}
+                            alt={editingProduct.name || '商品圖片'}
+                            className="w-full h-full object-cover cursor-zoom-in"
+                            onClick={() => setImageLightboxUrl(editingProduct.imageUrl)}
+                          />
                         ) : (
                           <IconImage size={24} className="text-slate-300" />
                         )}
@@ -5220,6 +5228,28 @@
                   </div>
                 </form>
               </div>
+            </div>
+          )}
+
+          {/* [V2.14.1] 商品圖片燈箱：點任何縮圖看原尺寸大圖，點背景或右上角 X 關閉 */}
+          {imageLightboxUrl && (
+            <div
+              className="fixed inset-0 z-[60] bg-slate-900/80 backdrop-blur-sm flex items-center justify-center p-4"
+              onClick={() => setImageLightboxUrl(null)}
+            >
+              <button
+                type="button"
+                onClick={() => setImageLightboxUrl(null)}
+                className="absolute top-4 right-4 text-white/80 hover:text-white bg-white/10 hover:bg-white/20 rounded-full p-2 transition"
+              >
+                <IconX size={22} />
+              </button>
+              <img
+                src={imageLightboxUrl}
+                alt="商品大圖"
+                className="max-w-full max-h-full object-contain rounded-lg shadow-2xl"
+                onClick={(e) => e.stopPropagation()}
+              />
             </div>
           )}
 
@@ -6295,7 +6325,8 @@
                                   src={p.imageUrl}
                                   alt={p.name}
                                   loading="lazy"
-                                  className="w-full h-28 object-cover rounded-xl border border-slate-200"
+                                  className={`w-full h-28 object-cover rounded-xl border border-slate-200 ${productSelectMode ? '' : 'cursor-zoom-in'}`}
+                                  onClick={productSelectMode ? undefined : (e) => { e.stopPropagation(); setImageLightboxUrl(p.imageUrl); }}
                                 />
                               ) : (
                                 <div className="w-full h-28 rounded-xl border border-dashed border-slate-200 bg-slate-50 flex items-center justify-center">
@@ -6447,7 +6478,8 @@
                                     src={p.imageUrl}
                                     alt={p.name}
                                     loading="lazy"
-                                    className="w-10 h-10 rounded-lg object-cover border border-slate-200"
+                                    className={`w-10 h-10 rounded-lg object-cover border border-slate-200 ${productSelectMode ? '' : 'cursor-zoom-in'}`}
+                                    onClick={productSelectMode ? undefined : (e) => { e.stopPropagation(); setImageLightboxUrl(p.imageUrl); }}
                                   />
                                 ) : (
                                   <div className="w-10 h-10 rounded-lg border border-dashed border-slate-200 bg-slate-50 flex items-center justify-center">
