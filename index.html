@@ -59,7 +59,7 @@
     // ==========================================
     // config.js — 版本號 / Firebase設定 / 常數設定值
     // ==========================================
-    const APP_VERSION = '2.14.1';
+    const APP_VERSION = '2.12.6';
     document.title = `Sprout 📱 小豆苗訂單助手 V${APP_VERSION} (Firebase RTDB 實時同步版)`;
 
     const firebaseConfig = {
@@ -84,22 +84,6 @@
     const IS_TEST_MODE = new URLSearchParams(window.location.search).get('mode') === 'test';
     const dbRef = (path) => db.ref(IS_TEST_MODE ? `test/${path}` : path);
     const dbRoot = () => (IS_TEST_MODE ? db.ref('test') : db.ref()); // 目前模式的根節點（用於一次更新多個路徑）
-
-    // [V2.14] 商品圖片改存 Cloudinary（免費方案不需要信用卡），RTDB 只存圖片網址（imageUrl）參照，
-    // 不存圖片內容本身。上傳走「Unsigned Upload Preset」機制，前端不需要放任何機密金鑰，
-    // 就算 Preset 名稱被看到，最多只能被拿去上傳圖片，不會有帳號被亂改的風險。
-    const CLOUDINARY_CLOUD_NAME = 'wjppv7h9';
-    const CLOUDINARY_UPLOAD_PRESET = 'legolas977';
-    const CLOUDINARY_UPLOAD_URL = `https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/image/upload`;
-
-    // [V2.13] 商品圖片：上傳前先在瀏覽器端壓縮，避免手機拍照的原圖（常見 3~5MB）直接整張上傳，
-    // 拖慢上傳速度、也浪費 Cloudinary 免費方案的 credits 額度。
-    // [V2.14.1] 最長邊從 800 提高到 1400px：因為圖片庫瀏覽時的「看大圖」用的就是同一張上傳圖，
-    // 800px 放大看細節會不夠清楚，1400px 在放大檢視跟壓縮後檔案大小之間是比較平衡的取捨。
-    const PRODUCT_IMAGE_MAX_DIMENSION = 1400; // 壓縮後最長邊像素
-    const PRODUCT_IMAGE_JPEG_QUALITY = 0.82;  // JPEG 壓縮品質（0~1）
-    const PRODUCT_IMAGE_MAX_RAW_MB = 20;     // 原始檔案超過這個大小直接拒絕，避免壓縮卡住
-
 
     // ---- 下列常數原本散落在 utils.js 各處，統一搬到這裡管理 ----
     const DEFAULT_IMPORT_OPTIONS = {
@@ -283,14 +267,6 @@
       <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}>
         <rect x="9" y="9" width="13" height="13" rx="2"></rect>
         <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
-      </svg>
-    );
-
-    const IconImage = ({ size = 20, className = "" }) => (
-      <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}>
-        <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
-        <circle cx="8.5" cy="8.5" r="1.5"></circle>
-        <polyline points="21 15 16 10 5 21"></polyline>
       </svg>
     );
 
@@ -802,51 +778,10 @@
       createdAt: prod?.createdAt || new Date().toISOString(),
       lastOrderedAt: prod?.lastOrderedAt || null,
       status: prod?.status || 'active',
-      pinned: Boolean(prod?.pinned), // [V2.4] 釘選為常用商品
-      imageUrl: prod?.imageUrl || '' // [V2.13] 商品圖片網址（實際檔案存在 Firebase Storage，這裡只存參照）
+      pinned: Boolean(prod?.pinned) // [V2.4] 釘選為常用商品
     });
 
     // （DEFAULT_PRODUCTS 已搬到 config.js）
-
-    // ==========================================
-    // [V2.13] 商品圖片：上傳前壓縮
-    // 用 Canvas 把圖片等比例縮小到指定的最長邊，並轉成 JPEG 輸出，
-    // 避免手機拍照的原圖（常見 3~5MB）整張直接上傳，拖慢上傳速度、浪費流量。
-    // 純函式，之後如果要開放手機拍照上傳，也能直接重用。
-    // ==========================================
-    const compressImageFile = (file, maxDimension = PRODUCT_IMAGE_MAX_DIMENSION, quality = PRODUCT_IMAGE_JPEG_QUALITY) => {
-      return new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = (e) => {
-          const img = new Image();
-          img.onload = () => {
-            let { width, height } = img;
-            if (width > maxDimension || height > maxDimension) {
-              if (width > height) {
-                height = Math.round(height * (maxDimension / width));
-                width = maxDimension;
-              } else {
-                width = Math.round(width * (maxDimension / height));
-                height = maxDimension;
-              }
-            }
-            const canvas = document.createElement('canvas');
-            canvas.width = width;
-            canvas.height = height;
-            const ctx = canvas.getContext('2d');
-            ctx.drawImage(img, 0, 0, width, height);
-            canvas.toBlob((blob) => {
-              if (blob) resolve(blob);
-              else reject(new Error('圖片壓縮失敗，請換一張圖片再試一次'));
-            }, 'image/jpeg', quality);
-          };
-          img.onerror = () => reject(new Error('圖片讀取失敗，請確認檔案格式是否正確'));
-          img.src = e.target.result;
-        };
-        reader.onerror = () => reject(new Error('檔案讀取失敗'));
-        reader.readAsDataURL(file);
-      });
-    };
 
     // ==========================================
     // [V2.1] 訂單列表升級：金額計算工具
@@ -1338,6 +1273,89 @@
 
       return drafts;
     };
+
+    // ==========================================
+    // [黑名單] 標準化 / 比對 / 整理（純函式，無副作用，不碰資料庫）
+    // ==========================================
+
+    // 電話標準化：去除非數字字元，把 +886/886 開頭轉回 0 開頭，方便跨格式比對
+    const normalizePhone = (v) => {
+      let digits = String(v || '').replace(/[^\d+]/g, '');
+      if (digits.startsWith('+886')) digits = '0' + digits.slice(4);
+      else if (digits.startsWith('886')) digits = '0' + digits.slice(3);
+      return digits.replace(/\D/g, '');
+    };
+    const BLACKLIST_PHONE_MIN_LEN = 8; // 標準化後電話號碼要 >= 這個長度才納入比對，避免打一半的號碼誤中
+
+    // LINE/IG 帳號標準化：去除開頭@、前後空白、轉小寫，方便跨大小寫/有無@比對
+    const normalizeHandle = (v) => String(v || '').trim().replace(/^@/, '').toLowerCase().replace(/\s+/g, '');
+
+    // 姓名標準化：去除空白；預設值「顧客」視同未填寫，不納入比對（避免大量顧客都用預設值互相誤判）
+    const normalizeName = (v) => {
+      const s = String(v || '').trim().replace(/\s+/g, '');
+      return (!s || s === '顧客') ? '' : s;
+    };
+
+    const sanitizeBlacklistEntry = (raw, id) => ({
+      id: id || raw?.id || '',
+      name: raw?.name || '',
+      phone: raw?.phone || '',
+      ig: raw?.ig || '',
+      line: raw?.line || '',
+      reason: raw?.reason || '',
+      sourceOrderNo: raw?.sourceOrderNo || '',
+      createdAt: raw?.createdAt || '',
+      timestamp: typeof raw?.timestamp === 'number' ? raw.timestamp : 0,
+      createdBy: raw?.createdBy || '',
+    });
+
+    // 比對「顧客資料」是否命中黑名單清單。strong=電話/LINE/IG命中(高信度)，weak=只有姓名命中(低信度，僅供參考)
+    const findBlacklistMatches = (customer, list) => {
+      const cName = normalizeName(customer?.name);
+      const cPhoneRaw = normalizePhone(customer?.phone);
+      const cPhone = cPhoneRaw.length >= BLACKLIST_PHONE_MIN_LEN ? cPhoneRaw : '';
+      const cLine = normalizeHandle(customer?.line);
+      const cIg = normalizeHandle(customer?.ig);
+      const hits = [];
+      (list || []).forEach((entry) => {
+        const fields = [];
+        const ePhoneRaw = normalizePhone(entry.phone);
+        const ePhone = ePhoneRaw.length >= BLACKLIST_PHONE_MIN_LEN ? ePhoneRaw : '';
+        if (cPhone && ePhone && cPhone === ePhone) fields.push('phone');
+        if (cIg && normalizeHandle(entry.ig) === cIg) fields.push('ig');
+        if (cLine && normalizeHandle(entry.line) === cLine) fields.push('line');
+        if (cName && normalizeName(entry.name) === cName) fields.push('name');
+        if (fields.length) hits.push({ entry, fields });
+      });
+      if (!hits.length) return { level: 'none', hits: [] };
+      const strong = hits.some((h) => h.fields.some((f) => f !== 'name'));
+      return { level: strong ? 'strong' : 'weak', hits };
+    };
+
+    // 新增黑名單前的重複偵測：只比對強識別欄位(電話/LINE/IG)，姓名不列入(避免同名同姓誤判)
+    const findBlacklistDuplicate = (draft, list) => {
+      const dPhoneRaw = normalizePhone(draft?.phone);
+      const dPhone = dPhoneRaw.length >= BLACKLIST_PHONE_MIN_LEN ? dPhoneRaw : '';
+      const dLine = normalizeHandle(draft?.line);
+      const dIg = normalizeHandle(draft?.ig);
+      return (list || []).find((entry) => {
+        const ePhoneRaw = normalizePhone(entry.phone);
+        const ePhone = ePhoneRaw.length >= BLACKLIST_PHONE_MIN_LEN ? ePhoneRaw : '';
+        return (dPhone && ePhone && dPhone === ePhone) ||
+               (dLine && normalizeHandle(entry.line) === dLine) ||
+               (dIg && normalizeHandle(entry.ig) === dIg);
+      }) || null;
+    };
+
+    // 從一筆訂單快速帶出「加入黑名單」的草稿內容，給「更多」頁的手動新增或未來訂單列表的快速加入按鈕共用
+    const blacklistDraftFromOrder = (order) => ({
+      name: order?.customerName || '',
+      phone: order?.customerPhone || '',
+      ig: order?.customerIg || '',
+      line: order?.customerLine || '',
+      reason: '',
+      sourceOrderNo: order?.orderNo || '',
+    });
   </script>
   <script type="text/babel">
     // ==========================================
@@ -2187,6 +2205,178 @@
               >
                 清空回收桶
               </button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ==========================================
+    // [黑名單] 手動新增彈窗
+    // ==========================================
+    function BlacklistAddModal({ initialDraft, blacklist, isSaving, onSave, onClose }) {
+      const [form, setForm] = React.useState(() => ({
+        name: initialDraft?.name || '',
+        phone: initialDraft?.phone || '',
+        ig: initialDraft?.ig || '',
+        line: initialDraft?.line || '',
+        reason: initialDraft?.reason || '',
+        sourceOrderNo: initialDraft?.sourceOrderNo || '',
+      }));
+      const [error, setError] = React.useState('');
+
+      const setField = (key, val) => setForm((prev) => ({ ...prev, [key]: val }));
+      const duplicate = findBlacklistDuplicate(form, blacklist);
+
+      const handleSubmit = (e) => {
+        e.preventDefault();
+        setError('');
+        if (!form.phone.trim() && !form.ig.trim() && !form.line.trim()) {
+          setError('電話、IG、LINE 請至少填一項，單靠姓名無法有效比對');
+          return;
+        }
+        onSave({
+          name: form.name.trim(),
+          phone: form.phone.trim(),
+          ig: form.ig.trim(),
+          line: form.line.trim(),
+          reason: form.reason.trim(),
+          sourceOrderNo: form.sourceOrderNo.trim(),
+        });
+      };
+
+      const inputCls = "w-full text-sm px-3 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:border-emerald-500 bg-white";
+
+      return (
+        <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-sm flex items-end sm:items-center justify-center" onClick={onClose}>
+          <div
+            className="bg-white w-full sm:max-w-md rounded-t-3xl sm:rounded-2xl shadow-2xl flex flex-col max-h-[88vh]"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="px-5 pt-4 pb-3 flex items-center justify-between border-b border-slate-100">
+              <div>
+                <h3 className="font-bold text-base text-slate-800">🚫 新增黑名單</h3>
+                <p className="text-[11px] text-slate-400">建立訂單時會依電話/IG/LINE/姓名自動比對提醒</p>
+              </div>
+              <button type="button" onClick={onClose} className="p-1.5 text-slate-400 hover:text-slate-700 rounded-lg hover:bg-slate-100">
+                <IconX size={22} />
+              </button>
+            </div>
+
+            <form onSubmit={handleSubmit} className="p-5 space-y-3.5 overflow-y-auto">
+              <div>
+                <label className="text-xs font-bold text-slate-600 block mb-1">姓名（選填）</label>
+                <input type="text" placeholder="例如：王小美" value={form.name} onChange={(e) => setField('name', e.target.value)} className={inputCls} />
+              </div>
+              <div>
+                <label className="text-xs font-bold text-slate-600 block mb-1">電話</label>
+                <input type="text" placeholder="例如：0912345678" value={form.phone} onChange={(e) => setField('phone', e.target.value)} className={inputCls} />
+              </div>
+              <div>
+                <label className="text-xs font-bold text-slate-600 block mb-1">IG</label>
+                <input type="text" placeholder="例如：mei.shop" value={form.ig} onChange={(e) => setField('ig', e.target.value)} className={inputCls} />
+              </div>
+              <div>
+                <label className="text-xs font-bold text-slate-600 block mb-1">LINE</label>
+                <input type="text" placeholder="例如：mei_0912" value={form.line} onChange={(e) => setField('line', e.target.value)} className={inputCls} />
+              </div>
+              <div>
+                <label className="text-xs font-bold text-slate-600 block mb-1">原因（選填）</label>
+                <textarea rows={2} placeholder="例如：多次未取貨棄單" value={form.reason} onChange={(e) => setField('reason', e.target.value)} className={inputCls + ' resize-none'} />
+              </div>
+
+              {duplicate && (
+                <div className="text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 leading-snug flex items-start gap-1.5">
+                  <IconAlertTriangle size={14} className="flex-shrink-0 mt-0.5" />
+                  <span>黑名單裡已有電話/IG/LINE相符的紀錄（{duplicate.name || '未填姓名'}），仍可繼續新增（例如原因不同想分開記錄）</span>
+                </div>
+              )}
+              {error && (
+                <div className="text-xs text-red-600 bg-red-50 border border-red-200 rounded-lg px-3 py-2 flex items-center gap-2">
+                  <IconAlertTriangle size={16} />
+                  {error}
+                </div>
+              )}
+
+              <div className="flex gap-2 pt-1">
+                <button type="button" onClick={onClose} className="flex-1 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold rounded-xl text-sm transition">
+                  取消
+                </button>
+                <button
+                  type="submit"
+                  disabled={isSaving}
+                  className="flex-1 py-2.5 bg-red-600 hover:bg-red-700 disabled:opacity-50 text-white font-semibold rounded-xl text-sm transition shadow-md flex items-center justify-center gap-1"
+                >
+                  <IconCheck size={18} />
+                  {isSaving ? '儲存中...' : '加入黑名單'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      );
+    }
+
+    // ==========================================
+    // [黑名單] 清單管理彈窗（移除不走回收桶：資料量小、可隨時重新輸入，見交接文件說明）
+    // ==========================================
+    function BlacklistModal({ blacklist, onAdd, onDelete, onClose }) {
+      return (
+        <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-sm flex items-end sm:items-center justify-center" onClick={onClose}>
+          <div
+            className="bg-white w-full sm:max-w-lg rounded-t-3xl sm:rounded-2xl shadow-2xl flex flex-col max-h-[88vh]"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="px-5 pt-4 pb-3 flex items-center justify-between border-b border-slate-100">
+              <div>
+                <h3 className="font-bold text-base text-slate-800">🚫 黑名單管理（{blacklist.length}）</h3>
+                <p className="text-[11px] text-slate-400">新增訂單時會自動比對，命中會跳出提醒</p>
+              </div>
+              <button type="button" onClick={onClose} className="p-1.5 text-slate-400 hover:text-slate-700 rounded-lg hover:bg-slate-100">
+                <IconX size={22} />
+              </button>
+            </div>
+
+            <div className="px-4 pt-3">
+              <button
+                type="button"
+                onClick={onAdd}
+                className="w-full py-2.5 bg-red-50 hover:bg-red-100 text-red-700 font-bold rounded-xl text-sm flex items-center justify-center gap-1.5"
+              >
+                <IconPlus size={16} /> 手動新增黑名單
+              </button>
+            </div>
+
+            <div className="flex-1 overflow-y-auto mt-2 border-t border-slate-100">
+              {blacklist.length === 0 ? (
+                <div className="text-center text-sm text-slate-400 py-12">目前沒有黑名單紀錄</div>
+              ) : blacklist.map((entry) => (
+                <div key={entry.id} className="px-4 py-3 border-b border-slate-100">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="text-sm font-bold text-slate-800 leading-snug break-words">
+                        {entry.name || '（未填姓名）'}
+                      </div>
+                      <div className="text-[11px] text-slate-500 mt-0.5 break-words">
+                        {[entry.phone, entry.ig && `IG:${entry.ig}`, entry.line && `LINE:${entry.line}`].filter(Boolean).join(' · ') || '無聯絡資訊'}
+                      </div>
+                      {entry.reason && (
+                        <div className="text-[11px] text-slate-400 mt-1 break-words">原因：{entry.reason}</div>
+                      )}
+                      {entry.sourceOrderNo && (
+                        <div className="text-[11px] text-slate-400 mt-0.5">來源訂單：{entry.sourceOrderNo}</div>
+                      )}
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => onDelete(entry)}
+                      className="px-2.5 py-1.5 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded-lg text-xs whitespace-nowrap flex-shrink-0"
+                    >
+                      移除
+                    </button>
+                  </div>
+                </div>
+              ))}
             </div>
           </div>
         </div>
@@ -3046,9 +3236,11 @@
         trashOrders,
         trashProducts,
         shippingConfig,
+        blacklist,
         setIsTrashOpen,
         setIsLogOpen,
         setIsShippingSettingsOpen,
+        setIsBlacklistOpen,
         handleExportCSV,
         handleExportProductsExcel,
         handleSignOut,
@@ -3108,6 +3300,21 @@
                       📒 操作日誌
                     </button>
                   </div>
+                </div>
+
+                {/* [黑名單 v2.12.5] */}
+                <div className="bg-white rounded-2xl border border-slate-200/80 p-4 sm:p-5 shadow-sm space-y-2.5">
+                  <h3 className="font-bold text-sm sm:text-base text-slate-800">🚫 黑名單管理</h3>
+                  <p className="text-xs sm:text-sm text-slate-500">
+                    新增訂單時會依電話/IG/LINE/姓名自動比對，命中會跳出提醒（目前共 {blacklist.length} 筆）。
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => setIsBlacklistOpen(true)}
+                    className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs sm:text-sm rounded-xl border border-slate-200 transition whitespace-nowrap"
+                  >
+                    🚫 管理黑名單 ({blacklist.length})
+                  </button>
                 </div>
 
                 {/* [V2.12] Shipping & Discount Settings entry */}
@@ -3204,8 +3411,6 @@
       const [productViewMode, setProductViewMode] = React.useState('grid'); // 'grid' | 'list'
       const [editingProduct, setEditingProduct] = React.useState(null); // Product object or null
       const [isProductModalOpen, setIsProductModalOpen] = React.useState(false);
-      const [isUploadingProductImage, setIsUploadingProductImage] = React.useState(false); // [V2.13]
-      const [imageLightboxUrl, setImageLightboxUrl] = React.useState(null); // [V2.14.1] 點縮圖看大圖用
       
       // Import Preview Modal State
       const [importRawRows, setImportRawRows] = React.useState([]);          // Excel 讀進來的原始列
@@ -3239,6 +3444,12 @@
       const [trashProducts, setTrashProducts] = React.useState([]);
       const [isTrashOpen, setIsTrashOpen] = React.useState(false);
       const [isLogOpen, setIsLogOpen] = React.useState(false);
+
+      // ---------- [黑名單 v2.12.5] ----------
+      const [blacklist, setBlacklist] = React.useState([]);
+      const [isBlacklistOpen, setIsBlacklistOpen] = React.useState(false);
+      const [isBlacklistAddOpen, setIsBlacklistAddOpen] = React.useState(false);
+      const [isSavingBlacklist, setIsSavingBlacklist] = React.useState(false);
 
       const showToast = (msg) => {
         setToastMessage(msg);
@@ -3341,12 +3552,28 @@
           console.error("RTDB Trash Error:", error);
         });
 
+        // 6. [黑名單 v2.12.5]
+        const blacklistRef = dbRef('blacklist');
+        blacklistRef.on('value', (snapshot) => {
+          const val = snapshot.val();
+          if (!val) {
+            setBlacklist([]);
+          } else {
+            const loaded = Object.entries(val).map(([id, data]) => sanitizeBlacklistEntry(data, id));
+            loaded.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+            setBlacklist(loaded);
+          }
+        }, (error) => {
+          console.error("RTDB Blacklist Error:", error);
+        });
+
         return () => {
           ordersRef.off();
           productsRef.off();
           tallyRef.off();
           shippingRef.off();
           trashRef.off();
+          blacklistRef.off();
           connectedRef.off();
         };
       }, []);
@@ -3435,9 +3662,6 @@
       // [V2.8] 送出防連點：送出中鎖住按鈕；同一張訂單重試時沿用同一個訂單編號（重送只會覆蓋、不會多一張）
       const [isSubmittingOrder, setIsSubmittingOrder] = React.useState(false);
       const pendingOrderKeyRef = React.useRef(null);
-      // [V2.13] 新增商品時還沒有商品 ID，圖片要先有地方放，
-      // 所以開啟「新增商品」Modal 時先產生一個暫時代號，圖片路徑用這個代號分組。
-      const productImageSessionKeyRef = React.useRef(null);
 
       // [V2.8] 訂單草稿：填到一半被打斷（切換 App、網頁被系統回收）時，內容不會消失
       const draftKey = `sprout_order_draft_${IS_TEST_MODE ? 'test' : 'prod'}_${user?.uid || 'anon'}`;
@@ -4280,6 +4504,41 @@
         }
       };
 
+      // ---------- [黑名單 v2.12.5] ----------
+      const handleAddBlacklist = async (entry) => {
+        setIsSavingBlacklist(true);
+        try {
+          const ref = dbRef('blacklist').push();
+          await withSyncTracking(ref.set({
+            ...entry,
+            createdAt: new Date().toLocaleString('zh-TW', { hour12: false }),
+            timestamp: Date.now(),
+            createdBy: userEmail,
+          }));
+          logAction('blacklist_create', 'system', ref.key, `加入黑名單：${entry.name || entry.phone || entry.ig || entry.line || '（未填資料）'}`);
+          showToast('✅ 已加入黑名單');
+          setIsBlacklistAddOpen(false);
+        } catch (err) {
+          console.error("Add blacklist error:", err);
+          showToast('❌ 新增失敗，請檢查網路連線');
+        } finally {
+          setIsSavingBlacklist(false);
+        }
+      };
+
+      const handleDeleteBlacklist = async (entry) => {
+        const label = entry.name || entry.phone || entry.ig || entry.line || '（未填資料）';
+        if (!window.confirm(`確定要將「${label}」從黑名單移除嗎？\n（黑名單移除不進回收桶，如需要可以再手動加回來）`)) return;
+        try {
+          await withSyncTracking(dbRef(`blacklist/${entry.id}`).remove());
+          logAction('blacklist_delete', 'system', entry.id, `移除黑名單：${label}`);
+          showToast('已移除黑名單');
+        } catch (err) {
+          console.error("Delete blacklist error:", err);
+          showToast('❌ 移除失敗，請檢查網路連線');
+        }
+      };
+
       // ---------- [V2.2] 測試模式 ----------
       const handleToggleTestMode = () => {
         const url = new URL(window.location.href);
@@ -4333,8 +4592,6 @@
       // Product Library V5.1 Actions
       // ==========================================
       const handleOpenAddProductModal = () => {
-        // [V2.13] 新增商品的圖片上傳路徑代號（此商品存檔前，圖片先暫放在這個代號底下）
-        productImageSessionKeyRef.current = `new_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
         setEditingProduct({
           id: null,
           sku: '',
@@ -4345,66 +4602,14 @@
           category: '服飾',
           note: '',
           status: 'active',
-          pinned: false,
-          imageUrl: ''
+          pinned: false
         });
         setIsProductModalOpen(true);
       };
 
       const handleOpenEditProductModal = (prod) => {
-        productImageSessionKeyRef.current = null; // 編輯既有商品：圖片路徑直接用商品 ID，不需要暫時代號
         setEditingProduct({ ...prod });
         setIsProductModalOpen(true);
-      };
-
-      // [V2.14] 商品圖片：選檔 → 壓縮 → 上傳到 Cloudinary（Unsigned Upload） → 把回傳網址存回 editingProduct.imageUrl
-      // （真正寫進 RTDB 是在按下「儲存商品」的 handleSaveProductModal，這裡只負責把圖片準備好）
-      const handleProductImageUpload = async (e) => {
-        const file = e.target.files && e.target.files[0];
-        e.target.value = ''; // 清空 input，允許重複選同一個檔案
-        if (!file || !editingProduct) return;
-
-        if (!file.type.startsWith('image/')) {
-          showToast('❌ 請選擇圖片檔案');
-          return;
-        }
-        if (file.size > PRODUCT_IMAGE_MAX_RAW_MB * 1024 * 1024) {
-          showToast(`❌ 圖片檔案過大，請選擇小於 ${PRODUCT_IMAGE_MAX_RAW_MB}MB 的圖片`);
-          return;
-        }
-        if (!requireConnection('上傳商品圖片')) return;
-
-        setIsUploadingProductImage(true);
-        try {
-          const blob = await compressImageFile(file);
-          const groupKey = editingProduct.id || productImageSessionKeyRef.current;
-          // 用「測試模式/正式」+ 商品代號分資料夾，比照 dbRef() 的測試資料隔離邏輯，
-          // 測試上傳的圖片不會跟正式圖片混在一起。
-          const folder = `${IS_TEST_MODE ? 'test/' : ''}products/${groupKey}`;
-
-          const formData = new FormData();
-          formData.append('file', blob, 'product.jpg');
-          formData.append('upload_preset', CLOUDINARY_UPLOAD_PRESET);
-          formData.append('folder', folder);
-
-          const res = await fetch(CLOUDINARY_UPLOAD_URL, { method: 'POST', body: formData });
-          const data = await res.json();
-          if (!res.ok || !data.secure_url) {
-            throw new Error(data?.error?.message || '上傳失敗');
-          }
-          setEditingProduct(prev => ({ ...prev, imageUrl: data.secure_url }));
-          showToast('🖼️ 圖片已上傳');
-        } catch (err) {
-          console.error('Product image upload error:', err);
-          showToast('❌ 圖片上傳失敗，請檢查網路連線後再試一次');
-        } finally {
-          setIsUploadingProductImage(false);
-        }
-      };
-
-
-      const handleRemoveProductImage = () => {
-        setEditingProduct(prev => ({ ...prev, imageUrl: '' }));
       };
 
       const handleSaveProductModal = async (e) => {
@@ -4425,7 +4630,6 @@
           note: editingProduct.note.trim(),
           status: editingProduct.status || 'active',
           pinned: Boolean(editingProduct.pinned),
-          imageUrl: editingProduct.imageUrl || '', // [V2.13]
           createdAt: editingProduct.createdAt || new Date().toISOString()
         };
 
@@ -4480,7 +4684,6 @@
             category: prod.category,
             note: prod.note,
             status: 'active',
-            imageUrl: prod.imageUrl || '', // [V2.13] 複製商品沿用同一張圖片，不重新上傳
             createdAt: new Date().toISOString()
           };
           const newRef = dbRef('products').push();
@@ -4951,6 +5154,24 @@
             />
           )}
 
+          {/* [黑名單 v2.12.5] */}
+          {isBlacklistOpen && (
+            <BlacklistModal
+              blacklist={blacklist}
+              onAdd={() => setIsBlacklistAddOpen(true)}
+              onDelete={handleDeleteBlacklist}
+              onClose={() => setIsBlacklistOpen(false)}
+            />
+          )}
+          {isBlacklistAddOpen && (
+            <BlacklistAddModal
+              blacklist={blacklist}
+              isSaving={isSavingBlacklist}
+              onSave={handleAddBlacklist}
+              onClose={() => setIsBlacklistAddOpen(false)}
+            />
+          )}
+
           {/* [V2.4] Product Picker Panel (bottom sheet) */}
           {isPickerPanelOpen && (
             <ProductPickerPanel
@@ -5073,47 +5294,6 @@
                 </div>
 
                 <form onSubmit={handleSaveProductModal} className="p-6 space-y-4">
-                  {/* [V2.13] 商品圖片：先只開放電腦版上傳/預覽，手機版之後再開放 */}
-                  <div className="hidden md:block">
-                    <label className="text-xs font-semibold text-slate-600 mb-1 block">商品圖片</label>
-                    <div className="flex items-center gap-3">
-                      <div className="w-20 h-20 rounded-xl border border-slate-200 bg-slate-50 flex items-center justify-center overflow-hidden flex-shrink-0">
-                        {editingProduct.imageUrl ? (
-                          <img
-                            src={editingProduct.imageUrl}
-                            alt={editingProduct.name || '商品圖片'}
-                            className="w-full h-full object-cover cursor-zoom-in"
-                            onClick={() => setImageLightboxUrl(editingProduct.imageUrl)}
-                          />
-                        ) : (
-                          <IconImage size={24} className="text-slate-300" />
-                        )}
-                      </div>
-                      <div className="flex flex-col items-start gap-1.5">
-                        <label className={`cursor-pointer px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold rounded-lg text-xs transition ${isUploadingProductImage ? 'opacity-50 pointer-events-none' : ''}`}>
-                          {isUploadingProductImage ? '上傳中...' : (editingProduct.imageUrl ? '更換圖片' : '上傳圖片')}
-                          <input
-                            type="file"
-                            accept="image/*"
-                            onChange={handleProductImageUpload}
-                            disabled={isUploadingProductImage}
-                            className="hidden"
-                          />
-                        </label>
-                        {editingProduct.imageUrl && (
-                          <button
-                            type="button"
-                            onClick={handleRemoveProductImage}
-                            className="px-1 text-red-500 hover:text-red-600 font-semibold text-xs transition"
-                          >
-                            移除圖片
-                          </button>
-                        )}
-                      </div>
-                    </div>
-                    <p className="text-[11px] text-slate-400 mt-1.5">上傳後會自動壓縮；手機版商品庫目前還不會顯示圖片。</p>
-                  </div>
-
                   <div className="grid grid-cols-3 gap-3">
                     <div>
                       <label className="text-xs font-semibold text-slate-600 mb-1 block">商品款號 (SKU)</label>
@@ -5228,28 +5408,6 @@
                   </div>
                 </form>
               </div>
-            </div>
-          )}
-
-          {/* [V2.14.1] 商品圖片燈箱：點任何縮圖看原尺寸大圖，點背景或右上角 X 關閉 */}
-          {imageLightboxUrl && (
-            <div
-              className="fixed inset-0 z-[60] bg-slate-900/80 backdrop-blur-sm flex items-center justify-center p-4"
-              onClick={() => setImageLightboxUrl(null)}
-            >
-              <button
-                type="button"
-                onClick={() => setImageLightboxUrl(null)}
-                className="absolute top-4 right-4 text-white/80 hover:text-white bg-white/10 hover:bg-white/20 rounded-full p-2 transition"
-              >
-                <IconX size={22} />
-              </button>
-              <img
-                src={imageLightboxUrl}
-                alt="商品大圖"
-                className="max-w-full max-h-full object-contain rounded-lg shadow-2xl"
-                onClick={(e) => e.stopPropagation()}
-              />
             </div>
           )}
 
@@ -6318,23 +6476,6 @@
                           }`}
                         >
                           <div className="space-y-2">
-                            {/* [V2.13] 商品縮圖：僅電腦版顯示 */}
-                            <div className="hidden md:block">
-                              {p.imageUrl ? (
-                                <img
-                                  src={p.imageUrl}
-                                  alt={p.name}
-                                  loading="lazy"
-                                  className={`w-full h-28 object-cover rounded-xl border border-slate-200 ${productSelectMode ? '' : 'cursor-zoom-in'}`}
-                                  onClick={productSelectMode ? undefined : (e) => { e.stopPropagation(); setImageLightboxUrl(p.imageUrl); }}
-                                />
-                              ) : (
-                                <div className="w-full h-28 rounded-xl border border-dashed border-slate-200 bg-slate-50 flex items-center justify-center">
-                                  <IconImage size={22} className="text-slate-300" />
-                                </div>
-                              )}
-                            </div>
-
                             {/* Header SKU & Category & Stagnant Badge */}
                             <div className="flex items-start justify-between gap-2">
                               <div className="flex flex-wrap items-center gap-1.5">
@@ -6441,7 +6582,6 @@
                       <thead className="bg-slate-50 border-b border-slate-200 text-slate-500">
                         <tr>
                           {productSelectMode && <th className="p-3 w-8"></th>}
-                          <th className="p-3 w-14">圖片</th>
                           <th className="p-3">款號</th>
                           <th className="p-3">商品名稱</th>
                           <th className="p-3">分類</th>
@@ -6472,21 +6612,6 @@
                                   />
                                 </td>
                               )}
-                              <td className="p-3">
-                                {p.imageUrl ? (
-                                  <img
-                                    src={p.imageUrl}
-                                    alt={p.name}
-                                    loading="lazy"
-                                    className={`w-10 h-10 rounded-lg object-cover border border-slate-200 ${productSelectMode ? '' : 'cursor-zoom-in'}`}
-                                    onClick={productSelectMode ? undefined : (e) => { e.stopPropagation(); setImageLightboxUrl(p.imageUrl); }}
-                                  />
-                                ) : (
-                                  <div className="w-10 h-10 rounded-lg border border-dashed border-slate-200 bg-slate-50 flex items-center justify-center">
-                                    <IconImage size={16} className="text-slate-300" />
-                                  </div>
-                                )}
-                              </td>
                               <td className="p-3 font-mono font-bold text-emerald-600">{p.sku || '-'}</td>
                               <td className="p-3 font-bold text-slate-800">{p.pinned ? '📌 ' : ''}{p.name}</td>
                               <td className="p-3 text-slate-500">{p.category || '未分類'}</td>
@@ -6608,9 +6733,11 @@
                   trashOrders,
                   trashProducts,
                   shippingConfig,
+                  blacklist,
                   setIsTrashOpen,
                   setIsLogOpen,
                   setIsShippingSettingsOpen,
+                  setIsBlacklistOpen,
                   handleExportCSV,
                   handleExportProductsExcel,
                   handleSignOut,
