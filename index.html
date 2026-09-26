@@ -59,7 +59,7 @@
     // ==========================================
     // config.js — 版本號 / Firebase設定 / 常數設定值
     // ==========================================
-    const APP_VERSION = '2.13.2';
+    const APP_VERSION = '2.13.3';
     document.title = `Sprout 📱 小豆苗訂單助手 V${APP_VERSION} (Firebase RTDB 實時同步版)`;
 
     const firebaseConfig = {
@@ -3533,7 +3533,7 @@
             setOrders([]);
           } else {
             const loadedOrders = Object.entries(val).map(([id, data]) => 
-              sanitizeOrder({ id, ...data })
+              sanitizeOrder({ ...data, id }) // [v2.13.3修正] id放最後，避免資料裡殘留的id欄位蓋掉Firebase真正的key
             );
             loadedOrders.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
             setOrders(loadedOrders);
@@ -3557,7 +3557,7 @@
             setProducts([]);
           } else {
             const loadedProducts = Object.entries(val).map(([id, data]) => 
-              sanitizeProduct({ id, ...data })
+              sanitizeProduct({ ...data, id }) // [v2.13.3修正] id放最後，確保Firebase真正的key永遠贏過資料裡可能殘留的舊id欄位
             );
             setProducts(loadedProducts);
           }
@@ -3584,7 +3584,7 @@
         trashRef.on('value', (snapshot) => {
           const val = snapshot.val() || {};
           const build = (node, sanitize) => Object.entries(node || {})
-            .map(([id, data]) => ({ ...sanitize({ id, ...data }), deletedAt: data.deletedAt || 0, deletedBy: data.deletedBy || '' }))
+            .map(([id, data]) => ({ ...sanitize({ ...data, id }), deletedAt: data.deletedAt || 0, deletedBy: data.deletedBy || '' })) // [v2.13.3修正] id放最後
             .sort((a, b) => b.deletedAt - a.deletedAt);
           setTrashOrders(build(val.orders, sanitizeOrder));
           setTrashProducts(build(val.products, sanitizeProduct));
