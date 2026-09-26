@@ -59,7 +59,7 @@
     // ==========================================
     // config.js — 版本號 / Firebase設定 / 常數設定值
     // ==========================================
-    const APP_VERSION = '2.13.1';
+    const APP_VERSION = '2.13.2';
     document.title = `Sprout 📱 小豆苗訂單助手 V${APP_VERSION} (Firebase RTDB 實時同步版)`;
 
     const firebaseConfig = {
@@ -4202,6 +4202,7 @@
           }
         } catch (err) {
           console.error("Delete order error:", err);
+          showToast('❌ 刪除失敗，請檢查網路連線或權限設定');
         } finally {
           setConfirmDeleteId(null);
         }
@@ -4869,6 +4870,7 @@
           }
         } catch (err) {
           console.error("Delete product error:", err);
+          showToast('❌ 刪除失敗，請檢查網路連線或權限設定');
         }
       };
 
