@@ -59,7 +59,7 @@
     // ==========================================
     // config.js — 版本號 / Firebase設定 / 常數設定值
     // ==========================================
-    const APP_VERSION = '2.12.9';
+    const APP_VERSION = '2.12.11';
     document.title = `Sprout 📱 小豆苗訂單助手 V${APP_VERSION} (Firebase RTDB 實時同步版)`;
 
     const firebaseConfig = {
@@ -177,6 +177,11 @@
     const MOBILE_QUICK_MAX_LINES = 6;
     const MOBILE_CHARS_PER_LINE = 15; // 手機一行大約能放的字數（含徽章）
 
+    // ---- [v2.12.11] 新增訂單手動輸入商品名稱時的相似商品比對 ----
+    // 純字元層級比對(Levenshtein)，抓的是「打錯字/打一半」這種情境，不是語意理解。
+    const PRODUCT_NAME_SIMILARITY_THRESHOLD = 0.8; // 相似度達 80% 才提示；覺得太寬鬆/太嚴格可調整這個數字
+    const PRODUCT_NAME_SIMILARITY_MAX_RESULTS = 3; // 建議清單最多顯示幾筆
+
     // ---- [商品圖片 v2.12.9] Cloudinary 設定 ----
     // 這個專案沒有信用卡無法用 Firebase Storage（新bucket須升級Blaze方案），改用 Cloudinary 免費方案。
     // 走 Unsigned Upload：cloud name / preset 名稱寫在前端是官方支援的用法，preset 本身可在 Cloudinary 後台設限制。
@@ -186,7 +191,7 @@
     const PRODUCT_IMAGE_MAX_DIMENSION = 1400; // 上傳前壓縮：長邊最大像素
     const PRODUCT_IMAGE_JPEG_QUALITY = 0.82;  // 上傳前壓縮：JPEG品質(0~1)
     const PRODUCT_IMAGE_MAX_RAW_MB = 20;      // 原始檔案超過這個大小直接拒絕(前端擋，Cloudinary端未設限)
-  </script>
+</script>
   <script type="text/babel">
     // ==========================================
     // SVG Icon Components
@@ -421,7 +426,7 @@
         <line x1="7" y1="7" x2="7.01" y2="7"></line>
       </svg>
     );
-  </script>
+</script>
   <script type="text/babel">
     // ==========================================
     // Error Boundary Component
@@ -473,7 +478,7 @@
         return this.props.children;
       }
     }
-  </script>
+</script>
   <script type="text/babel">
 
     // ==========================================
@@ -937,6 +942,47 @@
       const key = String(item.name || '').trim().toLowerCase();
       if (!key) return null;
       return (products || []).find(p => p.id !== item.id && String(p.name || '').trim().toLowerCase() === key) || null;
+    };
+
+    // ---- [v2.12.11] 新增訂單手動輸入商品名稱時的相似商品比對 ----
+    // 純字元層級比對(Levenshtein編輯距離)，抓的是「打錯字/打一半」這種情境，不是語意理解
+    // （例如不會知道「上衣」跟「T恤」是類似概念，只比對字面）。
+    const levenshteinDistance = (a, b) => {
+      const m = a.length, n = b.length;
+      if (m === 0) return n;
+      if (n === 0) return m;
+      let prev = Array.from({ length: n + 1 }, (_, j) => j);
+      for (let i = 1; i <= m; i++) {
+        const curr = [i];
+        for (let j = 1; j <= n; j++) {
+          const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+          curr[j] = Math.min(curr[j - 1] + 1, prev[j] + 1, prev[j - 1] + cost);
+        }
+        prev = curr;
+      }
+      return prev[n];
+    };
+
+    // 回傳 0~1 的相似度（1 = 完全相同）
+    const stringSimilarity = (a, b) => {
+      const s1 = String(a || '').trim().toLowerCase();
+      const s2 = String(b || '').trim().toLowerCase();
+      if (!s1 && !s2) return 1;
+      if (!s1 || !s2) return 0;
+      const maxLen = Math.max(s1.length, s2.length);
+      return 1 - levenshteinDistance(s1, s2) / maxLen;
+    };
+
+    // 找出商品庫裡名稱跟輸入文字相似的商品（排除下架歸檔），依相似度高到低排序，只取前 maxResults 筆
+    const findSimilarProducts = (inputName, products, threshold = PRODUCT_NAME_SIMILARITY_THRESHOLD, maxResults = PRODUCT_NAME_SIMILARITY_MAX_RESULTS) => {
+      const name = String(inputName || '').trim();
+      if (!name) return [];
+      return (products || [])
+        .filter(p => p.status !== 'archived' && p.name)
+        .map(p => ({ product: p, score: stringSimilarity(name, p.name) }))
+        .filter(x => x.score >= threshold)
+        .sort((a, b) => b.score - a.score)
+        .slice(0, maxResults);
     };
 
     // [V2.6.3] 單號若只是「日期 + 姓名」（例如 0914王振婷），跟卡片上已有的日期、姓名重複，展開時就不再顯示
@@ -1413,7 +1459,7 @@
         reader.readAsDataURL(file);
       });
     };
-  </script>
+</script>
   <script type="text/babel">
     // ==========================================
     // [V2.1] 訂單列表升級：小元件
@@ -2549,7 +2595,7 @@
         </div>
       );
     }
-  </script>
+</script>
   <script type="text/babel">
     // ==========================================
     // [V2.5] 登入：只有 Firebase 裡建立的帳號能進來
@@ -2707,7 +2753,7 @@
       if (!user) return <LoginScreen />;
       return <SproutOrderAssistant user={user} onSignOut={() => auth.signOut()} />;
     }
-  </script>
+</script>
   <script type="text/babel">
     // ==========================================
     // tab-orderList.js — 訂單列表分頁（畫面）
@@ -3280,7 +3326,7 @@
               </div>
       );
     }
-  </script>
+</script>
   <script type="text/babel">
     // ==========================================
     // tab-more.js — 「更多」分頁（畫面）
@@ -3437,7 +3483,7 @@
               </div>
       );
     }
-  </script>
+</script>
   <script type="text/babel">
     // ==========================================
     // Main Component: SproutOrderAssistant
@@ -3716,6 +3762,16 @@
 
       const [selectedProductRef, setSelectedProductRef] = React.useState(null);
 
+      // [v2.12.11] 手動輸入商品名稱時的相似商品建議清單（debounce 400ms 後比對，避免每個按鍵都重算）
+      const [nameSuggestions, setNameSuggestions] = React.useState([]);
+      React.useEffect(() => {
+        if (selectedProductRef) { setNameSuggestions([]); return; } // 已經是從商品庫選的，不需要再提示
+        const handle = setTimeout(() => {
+          setNameSuggestions(findSimilarProducts(currentItem.name, products));
+        }, 400);
+        return () => clearTimeout(handle);
+      }, [currentItem.name, products, selectedProductRef]);
+
       // [V2.4] 快速帶入：搜尋 / 全部商品面板 / 自動捲動到編輯區
       const [pickerSearch, setPickerSearch] = React.useState('');
       const [isPickerPanelOpen, setIsPickerPanelOpen] = React.useState(false);
@@ -3912,13 +3968,84 @@
           return;
         }
 
+        // [v2.12.11] 手動輸入且完全找不到相似商品時，詢問是否順便建立為新商品
+        // 這裡重新即時計算一次（不直接讀 nameSuggestions），因為那個 state 有 400ms debounce，
+        // 剛打完字馬上按「加入」的話 nameSuggestions 可能還是舊的，會誤判。
+        if (!selectedProductRef) {
+          const freshMatches = findSimilarProducts(currentItem.name, products);
+          if (freshMatches.length === 0) {
+            const wantCreate = window.confirm(
+              `商品庫中沒有找到跟「${currentItem.name.trim()}」相似的商品，要不要順便建立為新商品？`
+            );
+            if (wantCreate) {
+              handleCreateProductFromOrderItem(currentItem);
+            }
+          }
+        }
+
         addOrMergeItem(currentItem);
-        setCurrentItem(prev => ({
-          ...prev,
+        // [v2.12.10] 加入後一律完全清空，避免下一筆手動輸入沿用上一個商品的資料
+        setCurrentItem({
+          sku: '',
+          name: '',
+          color: '',
+          size: 'F',
+          price: 0,
           qty: 1
-        }));
+        });
+        setSelectedProductRef(null);
+        setNameSuggestions([]);
         showToast('已加入購物清單！');
       };
+
+      // [v2.12.11] 點選「相似商品建議」時只補上款號，價格/顏色/尺寸維持手動輸入的內容
+      const handleApplySuggestedProductSku = (product) => {
+        setCurrentItem(prev => ({ ...prev, sku: product.sku || '' }));
+        setNameSuggestions([]);
+        showToast(product.sku ? `已帶入款號：${product.sku}` : '這個商品沒有設定款號');
+      };
+
+      // [v2.12.11] 手動輸入商品時完全找不到相似商品，使用者選擇「順便建立新商品」→ 用這次輸入的品名/單價/顏色/尺寸建立
+      const handleCreateProductFromOrderItem = async (item) => {
+        const name = String(item.name || '').trim();
+        if (!name) return;
+        const sku = String(item.sku || '').trim();
+
+        // 款號不能跟既有商品重複（含回收桶），跟商品庫「新增商品」用同一套規則；為避免擋住訂單，衝突時只跳過建立，不影響加入訂單
+        if (sku) {
+          const skuKey = sku.toUpperCase();
+          const clash = products.find(p => String(p.sku || '').trim().toUpperCase() === skuKey);
+          if (clash) {
+            showToast(`款號 ${sku} 已被「${clash.name}」使用，這次先不建立新商品，請自行到商品庫處理`);
+            return;
+          }
+        }
+
+        const prodData = {
+          sku,
+          name,
+          price: Number(item.price) || 0,
+          sizes: String(item.size || 'F').trim() || 'F',
+          colors: String(item.color || '').trim() || '預設',
+          category: inferCategoryFromTitle(name, ''),
+          note: '',
+          status: 'active',
+          pinned: false,
+          imageUrl: '',
+          createdAt: new Date().toISOString()
+        };
+
+        try {
+          const newRef = dbRef('products').push();
+          await withSyncTracking(newRef.set(prodData));
+          logAction('product_create', 'product', newRef.key, `新增商品：${prodData.name}（$${prodData.price}）（從新增訂單順便建立）`);
+          showToast(`🎉 已順便建立新商品：「${name}」`);
+        } catch (err) {
+          console.error('Create product from order item error:', err);
+          showToast('❌ 建立新商品失敗，這筆訂單品項仍會照常加入');
+        }
+      };
+
 
       const handleRemoveOrderItem = (id) => {
         setOrderItems(prev => prev.filter(item => item.id !== id));
@@ -6218,6 +6345,25 @@
                         </div>
                       </div>
 
+                      {/* [v2.12.11] 相似商品建議：手動輸入商品名稱、停頓後跟商品庫比對，點選只帶入款號 */}
+                      {nameSuggestions.length > 0 && (
+                        <div className="bg-amber-50 border border-amber-200 rounded-lg p-2.5 space-y-1.5">
+                          <p className="text-[11px] text-amber-700 font-medium">💡 商品庫有相似商品，點選可帶入款號：</p>
+                          <div className="flex flex-wrap gap-1.5">
+                            {nameSuggestions.map(({ product, score }) => (
+                              <button
+                                key={product.id}
+                                type="button"
+                                onClick={() => handleApplySuggestedProductSku(product)}
+                                className="px-2.5 py-1 text-xs font-medium bg-white border border-amber-300 rounded-lg text-amber-800 hover:bg-amber-100"
+                              >
+                                {product.name}{product.sku ? `（${product.sku}）` : ''} · {Math.round(score * 100)}%
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
                       {selectedProductRef && splitProductOptions(selectedProductRef.colors).length > 1 && (
                         <div>
                           <label className="text-[11px] sm:text-xs font-medium text-slate-500 block mb-1">顏色快捷點選</label>
@@ -7016,7 +7162,7 @@
         </div>
       );
     }
-  </script>
+</script>
   <script type="text/babel">
     // Mount Application
     const root = ReactDOM.createRoot(document.getElementById('root'));
