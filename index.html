@@ -59,7 +59,7 @@
     // ==========================================
     // config.js — 版本號 / Firebase設定 / 常數設定值
     // ==========================================
-    const APP_VERSION = '2.12.13';
+    const APP_VERSION = '2.12.14';
     document.title = `Sprout 📱 小豆苗訂單助手 V${APP_VERSION} (Firebase RTDB 實時同步版)`;
 
     const firebaseConfig = {
@@ -425,6 +425,21 @@
       <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}>
         <path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"></path>
         <line x1="7" y1="7" x2="7.01" y2="7"></line>
+      </svg>
+    );
+
+    // [v2.12.14] 新增訂單「上鎖不清空」用的鎖頭圖示
+    const IconLock = ({ size = 20, className = "" }) => (
+      <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}>
+        <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
+        <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
+      </svg>
+    );
+
+    const IconUnlock = ({ size = 20, className = "" }) => (
+      <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}>
+        <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
+        <path d="M7 11V7a5 5 0 0 1 9.9-1"></path>
       </svg>
     );
 </script>
@@ -3772,6 +3787,9 @@
 
       const [selectedProductRef, setSelectedProductRef] = React.useState(null);
 
+      // [v2.12.14] 「加入此訂單品項」後是否保留欄位不清空（同商品要連續輸入不同花色/尺寸時使用）
+      const [isKeepFieldsLocked, setIsKeepFieldsLocked] = React.useState(false);
+
       // [v2.12.11] 手動輸入商品名稱時的相似商品建議清單（debounce 400ms 後比對，避免每個按鍵都重算）
       const [nameSuggestions, setNameSuggestions] = React.useState([]);
       React.useEffect(() => {
@@ -3941,6 +3959,12 @@
         const sizeList = splitProductOptions(prod.sizes);
         const colorList = splitProductOptions(prod.colors);
 
+        // [v2.12.14] 選到單一規格商品（顏色、尺寸都只有1種）時自動解鎖，
+        // 避免使用者忘記解鎖，讓下一個不相關的商品也被鎖住不清空
+        if (isKeepFieldsLocked && colorList.length <= 1 && sizeList.length <= 1) {
+          setIsKeepFieldsLocked(false);
+        }
+
         setCurrentItem({
           sku: prod.sku || '',
           name: prod.name,
@@ -4002,16 +4026,37 @@
         }
 
         addOrMergeItem(currentItem);
-        // [v2.12.10] 加入後一律完全清空，避免下一筆手動輸入沿用上一個商品的資料
-        setCurrentItem({
-          sku: '',
-          name: '',
-          color: '',
-          size: 'F',
-          price: 0,
-          qty: 1
-        });
-        setSelectedProductRef(null);
+
+        // [v2.12.14] 決定加入後要不要完全清空：
+        // 1. 鎖頭上鎖時，一律不完全清空（不用再跳確認）。
+        // 2. 沒上鎖但這個商品（從商品庫選或建議帶入的）有多種顏色/尺寸時，跳出確認問要不要保留繼續輸入同商品的其他規格。
+        const isMultiSpec = !!selectedProductRef && (
+          splitProductOptions(selectedProductRef.colors).length > 1 ||
+          splitProductOptions(selectedProductRef.sizes).length > 1
+        );
+        let keepFields = isKeepFieldsLocked;
+        if (!keepFields && isMultiSpec) {
+          keepFields = window.confirm(
+            `「${currentItem.name.trim()}」有多種花色/尺寸，要保留款號/名稱/單價繼續輸入其他規格嗎？\n（選取消會清空全部欄位）`
+          );
+        }
+
+        if (keepFields) {
+          // 保留款號/名稱/單價，只清空顏色/尺寸、數量重置為1，方便繼續輸入同商品的其他規格
+          // selectedProductRef 也保留，畫面上的顏色/尺寸快捷點選才會繼續顯示
+          setCurrentItem(prev => ({ ...prev, color: '', size: 'F', qty: 1 }));
+        } else {
+          // [v2.12.10] 完全清空，避免下一筆手動輸入沿用上一個商品的資料
+          setCurrentItem({
+            sku: '',
+            name: '',
+            color: '',
+            size: 'F',
+            price: 0,
+            qty: 1
+          });
+          setSelectedProductRef(null);
+        }
         setNameSuggestions([]);
         showToast('已加入購物清單！');
       };
@@ -6341,6 +6386,21 @@
 
                     {/* Selected Item Editor */}
                     <div ref={itemEditorRef} className="bg-slate-50 p-3.5 sm:p-4 rounded-xl border border-slate-200/60 space-y-3">
+                      {/* [v2.12.14] 上鎖不清空：同商品要連續輸入不同花色/尺寸時使用 */}
+                      <div className="flex justify-end">
+                        <button
+                          type="button"
+                          onClick={() => setIsKeepFieldsLocked(v => !v)}
+                          className={`flex items-center gap-1 text-[11px] font-semibold px-2.5 py-1 rounded-full border ${
+                            isKeepFieldsLocked
+                              ? 'bg-amber-100 border-amber-300 text-amber-800'
+                              : 'bg-white border-slate-200 text-slate-400'
+                          }`}
+                        >
+                          <span>{isKeepFieldsLocked ? '已上鎖不清空' : '上鎖不清空'}</span>
+                          {isKeepFieldsLocked ? <IconLock size={14} /> : <IconUnlock size={14} />}
+                        </button>
+                      </div>
                       <div className="grid grid-cols-3 gap-2">
                         <div>
                           <label className="text-[11px] sm:text-xs font-medium text-slate-500 block">商品款號</label>
