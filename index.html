@@ -59,7 +59,7 @@
     // ==========================================
     // config.js — 版本號 / Firebase設定 / 常數設定值
     // ==========================================
-    const APP_VERSION = '2.12.12';
+    const APP_VERSION = '2.13.0';
     document.title = `Sprout 📱 小豆苗訂單助手 V${APP_VERSION} (Firebase RTDB 實時同步版)`;
 
     const firebaseConfig = {
@@ -177,12 +177,6 @@
     const MOBILE_QUICK_MAX_LINES = 6;
     const MOBILE_CHARS_PER_LINE = 15; // 手機一行大約能放的字數（含徽章）
 
-    // ---- [v2.12.11] 新增訂單手動輸入商品名稱時的相似商品比對 ----
-    // 純字元層級比對(Levenshtein)，抓的是「打錯字/打一半」這種情境，不是語意理解。
-    // [v2.12.12] 比對門檻改成依商品名稱長度動態決定容錯字數（見 utils.js 的 getRequiredCharMatches），
-    // 不再是固定百分比；這裡只保留「建議清單最多顯示幾筆」這個常數。
-    const PRODUCT_NAME_SIMILARITY_MAX_RESULTS = 3; // 建議清單最多顯示幾筆
-
     // ---- [商品圖片 v2.12.9] Cloudinary 設定 ----
     // 這個專案沒有信用卡無法用 Firebase Storage（新bucket須升級Blaze方案），改用 Cloudinary 免費方案。
     // 走 Unsigned Upload：cloud name / preset 名稱寫在前端是官方支援的用法，preset 本身可在 Cloudinary 後台設限制。
@@ -192,6 +186,7 @@
     const PRODUCT_IMAGE_MAX_DIMENSION = 1400; // 上傳前壓縮：長邊最大像素
     const PRODUCT_IMAGE_JPEG_QUALITY = 0.82;  // 上傳前壓縮：JPEG品質(0~1)
     const PRODUCT_IMAGE_MAX_RAW_MB = 20;      // 原始檔案超過這個大小直接拒絕(前端擋，Cloudinary端未設限)
+
 </script>
   <script type="text/babel">
     // ==========================================
@@ -427,6 +422,7 @@
         <line x1="7" y1="7" x2="7.01" y2="7"></line>
       </svg>
     );
+
 </script>
   <script type="text/babel">
     // ==========================================
@@ -479,6 +475,7 @@
         return this.props.children;
       }
     }
+
 </script>
   <script type="text/babel">
 
@@ -781,7 +778,8 @@
       customerLine: order?.customerLine || '', // [V2.11] 客人的 LINE ID / 暱稱（只能用 LINE 聯絡的客人）
       customerIg: order?.customerIg || '',     // [V2.11] 客人的 IG 帳號
       deliveryMethod: order?.deliveryMethod || '7-11 取貨付款',
-      storeName: order?.storeName || '',
+      storeName: order?.storeName || '', // 門市名稱（宅配到府時通常留空）
+      storeAddress: order?.storeAddress || '', // [v2.13.0新增] 地址：門市地址（選填）或宅配到府的完整地址
       shippingFee: Number(order?.shippingFee) ?? 60,
       paymentStatus: Boolean(order?.paymentStatus),
       shipmentStatus: order?.shipmentStatus || 'unshipped',
@@ -853,6 +851,37 @@
       Math.round(calcOrderSubtotal(order) + (Number(order?.shippingFee) || 0));
 
     // ==========================================
+    // [v2.13.0] 門市名稱／地址 拆分顯示（含舊資料相容）
+    // 背景：v2.13.0 之前 storeName 是「門市名稱」跟「地址」黏在同一欄的舊格式，
+    // 新訂單會分別存進 storeName／storeAddress 兩個欄位，但舊訂單只有合併過的 storeName、
+    // 沒有 storeAddress。這兩個函式讓畫面顯示時，新舊資料都能得到合理的結果，
+    // 不需要另外跑一次資料庫遷移。
+    // ==========================================
+    // 拆解出 { name, address }：
+    // - 新格式（storeAddress 有值）→ 直接回傳兩個欄位
+    // - 舊格式（storeAddress 是空的）→ 嘗試從 storeName 裡挖出「門市名稱 (地址)」的括號寫法；
+    //   沒有括號的話，宅配到府視為地址，其餘（超商取貨）視為門市名稱，跟舊版單一欄位的語意一致
+    const deriveStoreDisplay = (order) => {
+      const rawName = String(order?.storeName || '').trim();
+      const rawAddr = String(order?.storeAddress || '').trim();
+      if (rawAddr) return { name: rawName, address: rawAddr };
+      if (!rawName) return { name: '', address: '' };
+      const bracketMatch = rawName.match(/^(.*?)[\s]*[（(]([^）)]+)[）)]\s*$/);
+      if (bracketMatch) {
+        return { name: bracketMatch[1].trim(), address: bracketMatch[2].trim() };
+      }
+      if (order?.deliveryMethod === '宅配到府') return { name: '', address: rawName };
+      return { name: rawName, address: '' };
+    };
+
+    // 合併成單行顯示用的文字，例如「世貿門市／台北市信義區信義路五段5號1樓」
+    const formatStoreLine = (order) => {
+      const { name, address } = deriveStoreDisplay(order);
+      if (name && address) return `${name}／${address}`;
+      return name || address || '';
+    };
+
+    // ==========================================
     // [V2.7] 回收桶 + 操作日誌 共用工具
     // ==========================================
     const ORDER_FIELD_LABELS = {
@@ -862,7 +891,8 @@
       customerLine: 'LINE',
       customerIg: 'IG',
       deliveryMethod: '物流方式',
-      storeName: '門市/地址',
+      storeName: '門市名稱',
+      storeAddress: '地址', // [v2.13.0新增]
       shippingFee: '運費',
       paymentStatus: '付款狀態',
       shipmentStatus: '出貨狀態',
@@ -943,56 +973,6 @@
       const key = String(item.name || '').trim().toLowerCase();
       if (!key) return null;
       return (products || []).find(p => p.id !== item.id && String(p.name || '').trim().toLowerCase() === key) || null;
-    };
-
-    // ---- [v2.12.11] 新增訂單手動輸入商品名稱時的相似商品比對 ----
-    // 純字元層級比對(Levenshtein編輯距離)，抓的是「打錯字/打一半」這種情境，不是語意理解
-    // （例如不會知道「上衣」跟「T恤」是類似概念，只比對字面）。
-    const levenshteinDistance = (a, b) => {
-      const m = a.length, n = b.length;
-      if (m === 0) return n;
-      if (n === 0) return m;
-      let prev = Array.from({ length: n + 1 }, (_, j) => j);
-      for (let i = 1; i <= m; i++) {
-        const curr = [i];
-        for (let j = 1; j <= n; j++) {
-          const cost = a[i - 1] === b[j - 1] ? 0 : 1;
-          curr[j] = Math.min(curr[j - 1] + 1, prev[j] + 1, prev[j - 1] + cost);
-        }
-        prev = curr;
-      }
-      return prev[n];
-    };
-
-    // 回傳 0~1 的相似度（1 = 完全相同）
-    const stringSimilarity = (a, b) => {
-      const s1 = String(a || '').trim().toLowerCase();
-      const s2 = String(b || '').trim().toLowerCase();
-      if (!s1 && !s2) return 1;
-      if (!s1 || !s2) return 0;
-      const maxLen = Math.max(s1.length, s2.length);
-      return 1 - levenshteinDistance(s1, s2) / maxLen;
-    };
-
-    // 依商品名稱長度動態決定「至少要對到幾個字」：商品名稱字數的一半(無條件進位)要對上，
-    // 名稱越短容錯字數越少、越長容錯越多。例如 3字商品要對到2字、4字對到2字、5字對到3字。
-    const getRequiredCharMatches = (len) => Math.ceil(len / 2);
-
-    // 找出商品庫裡名稱跟輸入文字相似的商品（排除下架歸檔），依相似度高到低排序，只取前 maxResults 筆
-    const findSimilarProducts = (inputName, products, maxResults = PRODUCT_NAME_SIMILARITY_MAX_RESULTS) => {
-      const name = String(inputName || '').trim();
-      if (!name) return [];
-      return (products || [])
-        .filter(p => p.status !== 'archived' && p.name)
-        .map(p => {
-          const productName = String(p.name).trim();
-          const distance = levenshteinDistance(name.toLowerCase(), productName.toLowerCase());
-          const allowedDistance = productName.length - getRequiredCharMatches(productName.length);
-          return { product: p, score: stringSimilarity(name, productName), matched: distance <= allowedDistance };
-        })
-        .filter(x => x.matched)
-        .sort((a, b) => b.score - a.score)
-        .slice(0, maxResults);
     };
 
     // [V2.6.3] 單號若只是「日期 + 姓名」（例如 0914王振婷），跟卡片上已有的日期、姓名重複，展開時就不再顯示
@@ -1469,6 +1449,7 @@
         reader.readAsDataURL(file);
       });
     };
+
 </script>
   <script type="text/babel">
     // ==========================================
@@ -1495,6 +1476,7 @@
 
     // 編輯訂單 Modal（欄位對應主程式資料結構）
     function OrderEditModal({ order, onClose, onSave }) {
+      const storeParts = deriveStoreDisplay(order);
       const [form, setForm] = React.useState(() => ({
         orderNo: order.orderNo || '',
         customerName: order.customerName || '',
@@ -1502,7 +1484,8 @@
         customerLine: order.customerLine || '',
         customerIg: order.customerIg || '',
         deliveryMethod: order.deliveryMethod || '7-11 取貨付款',
-        storeName: order.storeName || '',
+        storeName: storeParts.name,
+        storeAddress: storeParts.address, // [v2.13.0新增] 若是舊資料，這裡已經用括號規則拆過一次，存檔時就會變成新格式
         shippingFee: order.shippingFee,
         paymentStatus: Boolean(order.paymentStatus),
         shipmentStatus: order.shipmentStatus || 'unshipped',
@@ -1556,6 +1539,7 @@
           customerIg: form.customerIg.trim(),
           deliveryMethod: form.deliveryMethod,
           storeName: form.storeName.trim(),
+          storeAddress: form.storeAddress.trim(),
           shippingFee: Number(form.shippingFee) || 0,
           paymentStatus: Boolean(form.paymentStatus),
           shipmentStatus: form.shipmentStatus,
@@ -1619,15 +1603,24 @@
                 </div>
               </div>
 
-              <div className="grid grid-cols-3 gap-3">
-                <div className="col-span-2">
-                  <label className="text-xs font-semibold text-slate-600 mb-1 block">門市名稱或地址</label>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="text-xs font-semibold text-slate-600 mb-1 block">
+                    門市名稱{form.deliveryMethod === '宅配到府' && <span className="text-slate-400 font-normal">（選填）</span>}
+                  </label>
                   <input type="text" value={form.storeName} onChange={(e) => setField('storeName', e.target.value)} className={inputCls} />
                 </div>
                 <div>
-                  <label className="text-xs font-semibold text-slate-600 mb-1 block">運費 ($)</label>
-                  <input type="number" value={form.shippingFee} onChange={(e) => setField('shippingFee', e.target.value)} className={inputCls} />
+                  <label className="text-xs font-semibold text-slate-600 mb-1 block">
+                    {form.deliveryMethod === '宅配到府' ? '宅配地址' : '門市地址'}{form.deliveryMethod !== '宅配到府' && <span className="text-slate-400 font-normal">（選填）</span>}
+                  </label>
+                  <input type="text" value={form.storeAddress} onChange={(e) => setField('storeAddress', e.target.value)} className={inputCls} />
                 </div>
+              </div>
+
+              <div>
+                <label className="text-xs font-semibold text-slate-600 mb-1 block">運費 ($)</label>
+                <input type="number" value={form.shippingFee} onChange={(e) => setField('shippingFee', e.target.value)} className={inputCls} />
               </div>
 
               {/* 商品明細 */}
@@ -2605,6 +2598,7 @@
         </div>
       );
     }
+
 </script>
   <script type="text/babel">
     // ==========================================
@@ -2763,6 +2757,7 @@
       if (!user) return <LoginScreen />;
       return <SproutOrderAssistant user={user} onSignOut={() => auth.signOut()} />;
     }
+
 </script>
   <script type="text/babel">
     // ==========================================
@@ -3161,7 +3156,7 @@
                                 <IconTruck size={16} className="text-slate-400 mt-0.5 flex-shrink-0" />
                                 <span>
                                   <span className="font-semibold">{order.deliveryMethod}</span>
-                                  <span> - {order.storeName || '無門市/地址資訊'}</span>
+                                  <span> - {formatStoreLine(order) || '無門市/地址資訊'}</span>
                                 </span>
                               </div>
 
@@ -3259,7 +3254,7 @@
                                 </div>
                                 <div className="mt-2 text-sm text-slate-700">
                                   <span className="text-slate-500">到貨店家：</span>
-                                  <span className="font-semibold">{order.storeName || '＿＿＿＿＿＿'}</span>
+                                  <span className="font-semibold">{formatStoreLine(order) || '＿＿＿＿＿＿'}</span>
                                   <span className="ml-8 text-slate-500">建立：</span>
                                   <span className="font-mono text-slate-600">{dateShort}</span>
                                 </div>
@@ -3336,6 +3331,7 @@
               </div>
       );
     }
+
 </script>
   <script type="text/babel">
     // ==========================================
@@ -3493,6 +3489,7 @@
               </div>
       );
     }
+
 </script>
   <script type="text/babel">
     // ==========================================
@@ -3755,6 +3752,7 @@
       const [customerIg, setCustomerIg] = React.useState('');     // [V2.11]
       const [deliveryMethod, setDeliveryMethod] = React.useState('7-11 取貨付款');
       const [storeName, setStoreName] = React.useState('');
+      const [storeAddress, setStoreAddress] = React.useState(''); // [v2.13.0新增] 門市地址／宅配地址，跟門市名稱分開存
       const [shippingFee, setShippingFee] = React.useState(DEFAULT_SHIPPING_CONFIG.fees['7-11 取貨付款']);
       const [shippingFeeAuto, setShippingFeeAuto] = React.useState(true); // 運費是否跟著物流方式/滿額自動帶入
       const [orderNote, setOrderNote] = React.useState('');
@@ -3771,16 +3769,6 @@
       });
 
       const [selectedProductRef, setSelectedProductRef] = React.useState(null);
-
-      // [v2.12.11] 手動輸入商品名稱時的相似商品建議清單（debounce 400ms 後比對，避免每個按鍵都重算）
-      const [nameSuggestions, setNameSuggestions] = React.useState([]);
-      React.useEffect(() => {
-        if (selectedProductRef) { setNameSuggestions([]); return; } // 已經是從商品庫選的，不需要再提示
-        const handle = setTimeout(() => {
-          setNameSuggestions(findSimilarProducts(currentItem.name, products));
-        }, 400);
-        return () => clearTimeout(handle);
-      }, [currentItem.name, products, selectedProductRef]);
 
       // [V2.4] 快速帶入：搜尋 / 全部商品面板 / 自動捲動到編輯區
       const [pickerSearch, setPickerSearch] = React.useState('');
@@ -3810,6 +3798,7 @@
               setCustomerIg(d.customerIg || '');
               setDeliveryMethod(d.deliveryMethod || '7-11 取貨付款');
               setStoreName(d.storeName || '');
+              setStoreAddress(d.storeAddress || '');
               setShippingFee(Number.isFinite(Number(d.shippingFee)) ? Number(d.shippingFee) : DEFAULT_SHIPPING_CONFIG.fees['7-11 取貨付款']);
               setShippingFeeAuto(false); // 還原草稿代表她可能已經自己調過運費，先不要再自動覆蓋
               setOrderNote(d.orderNote || '');
@@ -3830,19 +3819,19 @@
         try {
           const hasContent = lineText.trim() || customerName.trim() || customerPhone.trim() ||
             customerLine.trim() || customerIg.trim() ||
-            storeName.trim() || orderNote.trim() || orderItems.length > 0;
+            storeName.trim() || storeAddress.trim() || orderNote.trim() || orderItems.length > 0;
           if (!hasContent) {
             localStorage.removeItem(draftKey);
             return;
           }
           localStorage.setItem(draftKey, JSON.stringify({
             ts: Date.now(), lineText, customerName, customerPhone, customerLine, customerIg, deliveryMethod,
-            storeName, shippingFee, orderNote, orderItems
+            storeName, storeAddress, shippingFee, orderNote, orderItems
           }));
         } catch (err) {
           // 私密瀏覽模式等情況無法儲存草稿，不影響正常使用
         }
-      }, [draftReady, lineText, customerName, customerPhone, customerLine, customerIg, deliveryMethod, storeName, shippingFee, orderNote, orderItems]);
+      }, [draftReady, lineText, customerName, customerPhone, customerLine, customerIg, deliveryMethod, storeName, storeAddress, shippingFee, orderNote, orderItems]);
 
       const handleDiscardDraft = () => {
         setLineText('');
@@ -3851,6 +3840,7 @@
         setCustomerLine('');
         setCustomerIg('');
         setStoreName('');
+        setStoreAddress('');
         setOrderNote('');
         setOrderItems([]);
         setSelectedProductRef(null);
@@ -3883,41 +3873,69 @@
 
         let name = '';
         let phone = '';
-        let store = '';
+        let store = '';     // 門市名稱
+        let address = '';   // 地址
         let delivery = deliveryMethod;
 
-        const phoneMatch = lineText.match(/(?:電話|手機|tel|phone)?[:\s]*(\+?\d{8,15}|09\d{8}|\d{3}[-\s]?\d{3}[-\s]?\d{4})/i) || lineText.match(/(09\d{2}[-\s]?\d{3}[-\s]?\d{3})/);
+        const phoneMatch = lineText.match(/(?:電話|手機|tel|phone)?[:：\s]*(\+?\d{8,15}|09\d{8}|\d{3}[-\s]?\d{3}[-\s]?\d{4})/i) || lineText.match(/(09\d{2}[-\s]?\d{3}[-\s]?\d{3})/);
         if (phoneMatch) {
           phone = phoneMatch[1].replace(/[-\s]/g, '');
         }
 
+        // 找出「整行」含有關鍵字的那一行，而不是只抓關鍵字後面的文字——
+        // 避免像「世貿門市 (地址)」這種店名本身就包含「門市」兩字時，
+        // 把「世貿」誤判成關鍵字前綴而被丟掉（v2.13.0 修正的 bug）。
+        const findLine = (regex) => {
+          const lines = lineText.split('\n').map(l => l.trim()).filter(Boolean);
+          return lines.find(l => regex.test(l)) || '';
+        };
+
+        // 把整行文字拆成「門市名稱」跟「地址」：
+        // 先去掉「門市:」「店名:」這種明確的標籤字首，再嘗試抓「名稱 (地址)」的括號寫法。
+        // 注意：「全家」「7-11」這類品牌字不能當標籤去除，否則像「全家松山店」會被誤刪成「松山店」。
+        const extractStoreParts = (line) => {
+          if (!line) return { store: '', address: '' };
+          const stripped = line.replace(/^(?:門市|店名|地址|宅配)[:：\s]*/i, '').trim();
+          const cleaned = stripped || line.trim();
+          const bracketMatch = cleaned.match(/^(.*?)[\s]*[（(]([^）)]+)[）)]\s*$/);
+          if (bracketMatch) {
+            return { store: bracketMatch[1].trim(), address: bracketMatch[2].trim() };
+          }
+          return { store: cleaned, address: '' };
+        };
+
         if (/全家|familymart/i.test(lineText)) {
           delivery = '全家取貨付款';
-          const storeMatch = lineText.match(/(?:全家|門市|店名)[:\s]*([^\n,，]+)/i);
-          if (storeMatch) store = storeMatch[1].trim();
-        } else if (/宅配|郵寄|地址/i.test(lineText)) {
+          const parts = extractStoreParts(findLine(/全家|familymart|門市|店名/i));
+          store = parts.store;
+          address = parts.address;
+        } else if (/宅配|郵寄/i.test(lineText) || /地址[:：\s]/i.test(lineText)) {
           delivery = '宅配到府';
-          const addrMatch = lineText.match(/(?:地址|宅配)[:\s]*([^\n]+)/i);
-          if (addrMatch) store = addrMatch[1].trim();
+          const line = findLine(/地址|宅配|郵寄/i);
+          const parts = extractStoreParts(line);
+          // 宅配沒有「門市名稱」的概念，抓到的內容整段當地址
+          address = (parts.store && parts.address) ? `${parts.store} ${parts.address}` : (parts.address || parts.store);
         } else {
           delivery = '7-11 取貨付款';
-          const storeMatch = lineText.match(/(?:7-11|711|7-eleven|門市|店名)[:\s]*([^\n,，]+)/i);
-          if (storeMatch) store = storeMatch[1].trim();
+          const parts = extractStoreParts(findLine(/7-11|711|7-eleven|門市|店名/i));
+          store = parts.store;
+          address = parts.address;
         }
 
-        const nameMatch = lineText.match(/(?:姓名|名字|收件人|稱呼)[:\s]*([^\n,，]+)/i);
+        const nameMatch = lineText.match(/(?:姓名|名字|收件人|稱呼)[:：\s]*([^\n,，]+)/i);
         if (nameMatch) {
           name = nameMatch[1].trim();
         } else {
           const lines = lineText.split('\n').map(l => l.trim()).filter(Boolean);
           if (lines.length > 0 && !lines[0].match(/\d{8,}/) && lines[0].length <= 20) {
-            name = lines[0].replace(/^(姓名|名字|收件人)[:\s]*/i, '');
+            name = lines[0].replace(/^(姓名|名字|收件人)[:：\s]*/i, '');
           }
         }
 
         if (name) setCustomerName(name);
         if (phone) setCustomerPhone(phone);
         if (store) setStoreName(store);
+        if (address) setStoreAddress(address);
         setDeliveryMethod(delivery);
 
         showToast('✨ 智慧解析對話成功！');
@@ -3978,85 +3996,13 @@
           return;
         }
 
-        // [v2.12.11] 手動輸入且完全找不到相似商品時，詢問是否順便建立為新商品
-        // 這裡重新即時計算一次（不直接讀 nameSuggestions），因為那個 state 有 400ms debounce，
-        // 剛打完字馬上按「加入」的話 nameSuggestions 可能還是舊的，會誤判。
-        if (!selectedProductRef) {
-          const freshMatches = findSimilarProducts(currentItem.name, products);
-          if (freshMatches.length === 0) {
-            const wantCreate = window.confirm(
-              `商品庫中沒有找到跟「${currentItem.name.trim()}」相似的商品，要不要順便建立為新商品？`
-            );
-            if (wantCreate) {
-              handleCreateProductFromOrderItem(currentItem);
-            }
-          }
-        }
-
         addOrMergeItem(currentItem);
-        // [v2.12.10] 加入後一律完全清空，避免下一筆手動輸入沿用上一個商品的資料
-        setCurrentItem({
-          sku: '',
-          name: '',
-          color: '',
-          size: 'F',
-          price: 0,
+        setCurrentItem(prev => ({
+          ...prev,
           qty: 1
-        });
-        setSelectedProductRef(null);
-        setNameSuggestions([]);
+        }));
         showToast('已加入購物清單！');
       };
-
-      // [v2.12.12] 點選「相似商品建議」：完全套用商品庫資料（款號/名稱/價格/顏色/尺寸），
-      // 跟從商品庫選取的行為一致，若有多種顏色/尺寸會自動選第一個、並跳出快捷點選讓使用者換規格，
-      // 換完再按「加入此訂單品項」即可（不用另外做一個彈窗視窗）。
-      const handleApplySuggestedProduct = (product) => {
-        handleSelectProductFromLibrary(product);
-        setNameSuggestions([]);
-      };
-
-      // [v2.12.11] 手動輸入商品時完全找不到相似商品，使用者選擇「順便建立新商品」→ 用這次輸入的品名/單價/顏色/尺寸建立
-      const handleCreateProductFromOrderItem = async (item) => {
-        const name = String(item.name || '').trim();
-        if (!name) return;
-        const sku = String(item.sku || '').trim();
-
-        // 款號不能跟既有商品重複（含回收桶），跟商品庫「新增商品」用同一套規則；為避免擋住訂單，衝突時只跳過建立，不影響加入訂單
-        if (sku) {
-          const skuKey = sku.toUpperCase();
-          const clash = products.find(p => String(p.sku || '').trim().toUpperCase() === skuKey);
-          if (clash) {
-            showToast(`款號 ${sku} 已被「${clash.name}」使用，這次先不建立新商品，請自行到商品庫處理`);
-            return;
-          }
-        }
-
-        const prodData = {
-          sku,
-          name,
-          price: Number(item.price) || 0,
-          sizes: String(item.size || 'F').trim() || 'F',
-          colors: String(item.color || '').trim() || '預設',
-          category: inferCategoryFromTitle(name, ''),
-          note: '',
-          status: 'active',
-          pinned: false,
-          imageUrl: '',
-          createdAt: new Date().toISOString()
-        };
-
-        try {
-          const newRef = dbRef('products').push();
-          await withSyncTracking(newRef.set(prodData));
-          logAction('product_create', 'product', newRef.key, `新增商品：${prodData.name}（$${prodData.price}）（從新增訂單順便建立）`);
-          showToast(`🎉 已順便建立新商品：「${name}」`);
-        } catch (err) {
-          console.error('Create product from order item error:', err);
-          showToast('❌ 建立新商品失敗，這筆訂單品項仍會照常加入');
-        }
-      };
-
 
       const handleRemoveOrderItem = (id) => {
         setOrderItems(prev => prev.filter(item => item.id !== id));
@@ -4215,6 +4161,7 @@
           customerIg: customerIg.trim(),
           deliveryMethod,
           storeName,
+          storeAddress: storeAddress.trim(),
           shippingFee: Number(shippingFee),
           paymentStatus: false,
           shipmentStatus: 'unshipped',
@@ -4487,7 +4434,8 @@
           'LINE': o.customerLine,
           'IG': o.customerIg,
           '配送方式': o.deliveryMethod,
-          '門市/地址': o.storeName,
+          '門市名稱': deriveStoreDisplay(o).name,
+          '地址': deriveStoreDisplay(o).address,
           '付款狀態': o.paymentStatus ? '已付款' : '未付款',
           '出貨狀態': o.shipmentStatus === 'shipped' ? '已出貨' : '待出貨',
           '商品明細': o.items.map(i =>
@@ -5160,6 +5108,7 @@
             o.customerLine.toLowerCase().includes(q) ||
             o.customerIg.toLowerCase().includes(q) ||
             o.storeName.toLowerCase().includes(q) ||
+            (o.storeAddress || '').toLowerCase().includes(q) ||
             o.orderNo.toLowerCase().includes(q) ||
             o.note.toLowerCase().includes(q) ||
             o.items.some(i => i.name.toLowerCase().includes(q) || i.sku.toLowerCase().includes(q))
@@ -5296,12 +5245,13 @@
         }
 
         let csvContent = '\uFEFF';
-        csvContent += '訂單編號,顧客姓名,電話,LINE,IG,配送方式,門市或地址,購買品項細項,商品小計,運費,訂單總金額,付款狀態,出貨狀態,備註事項,建立時間\n';
+        csvContent += '訂單編號,顧客姓名,電話,LINE,IG,配送方式,門市名稱,地址,購買品項細項,商品小計,運費,訂單總金額,付款狀態,出貨狀態,備註事項,建立時間\n';
 
         orders.forEach(o => {
           const itemsDetail = o.items.map(i => `[${i.sku}]${i.name}-${i.color}/${i.size} x${i.qty}`).join('; ');
           const subtotal = calcOrderSubtotal(o);
           const total = calcOrderTotal(o);
+          const storeParts = deriveStoreDisplay(o);
 
           const row = [
             o.id,
@@ -5310,7 +5260,8 @@
             `"${(o.customerLine || '').replace(/"/g, '""')}"`,
             `"${(o.customerIg || '').replace(/"/g, '""')}"`,
             `"${o.deliveryMethod}"`,
-            `"${o.storeName.replace(/"/g, '""')}"`,
+            `"${storeParts.name.replace(/"/g, '""')}"`,
+            `"${storeParts.address.replace(/"/g, '""')}"`,
             `"${itemsDetail.replace(/"/g, '""')}"`,
             subtotal,
             o.shippingFee,
@@ -6155,29 +6106,45 @@
                       ))}
                     </div>
 
-                    <div className="grid grid-cols-3 gap-3">
-                      <div className="col-span-2">
-                        <label className="text-xs sm:text-sm font-medium text-slate-600 mb-1 block">門市名稱或地址</label>
+                    {/* [v2.13.0] 門市名稱／地址拆成兩個獨立欄位；宅配到府時「門市名稱」留空即可 */}
+                    <div className="grid grid-cols-2 gap-3">
+                      <div>
+                        <label className="text-xs sm:text-sm font-medium text-slate-600 mb-1 block">
+                          門市名稱{deliveryMethod === '宅配到府' && <span className="text-slate-400 font-normal">（選填）</span>}
+                        </label>
                         <input
                           type="text"
-                          placeholder={deliveryMethod === '宅配到府' ? '請輸入完整宅配地址' : '超商門市名稱'}
+                          placeholder={deliveryMethod === '宅配到府' ? '選填，例如收件人代稱' : '例如：世貿門市'}
                           value={storeName}
                           onChange={(e) => setStoreName(e.target.value)}
                           className="w-full text-xs sm:text-sm px-3 py-2 md:py-2.5 rounded-lg border border-slate-200 focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500 focus:outline-none"
                         />
                       </div>
                       <div>
-                        <label className="text-xs sm:text-sm font-medium text-slate-600 mb-1 flex items-center gap-1.5">
-                          運費 ($)
-                          {shippingFeeAuto && <span className="text-[10px] font-normal text-emerald-600 bg-emerald-50 px-1.5 py-0.5 rounded">自動</span>}
+                        <label className="text-xs sm:text-sm font-medium text-slate-600 mb-1 block">
+                          {deliveryMethod === '宅配到府' ? '宅配地址' : '門市地址'}{deliveryMethod !== '宅配到府' && <span className="text-slate-400 font-normal">（選填）</span>}
                         </label>
                         <input
-                          type="number"
-                          value={shippingFee}
-                          onChange={(e) => handleShippingFeeInput(Number(e.target.value))}
+                          type="text"
+                          placeholder={deliveryMethod === '宅配到府' ? '請輸入完整宅配地址' : '例如：台北市信義區信義路五段5號1樓'}
+                          value={storeAddress}
+                          onChange={(e) => setStoreAddress(e.target.value)}
                           className="w-full text-xs sm:text-sm px-3 py-2 md:py-2.5 rounded-lg border border-slate-200 focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500 focus:outline-none"
                         />
                       </div>
+                    </div>
+
+                    <div>
+                      <label className="text-xs sm:text-sm font-medium text-slate-600 mb-1 flex items-center gap-1.5">
+                        運費 ($)
+                        {shippingFeeAuto && <span className="text-[10px] font-normal text-emerald-600 bg-emerald-50 px-1.5 py-0.5 rounded">自動</span>}
+                      </label>
+                      <input
+                        type="number"
+                        value={shippingFee}
+                        onChange={(e) => handleShippingFeeInput(Number(e.target.value))}
+                        className="w-full text-xs sm:text-sm px-3 py-2 md:py-2.5 rounded-lg border border-slate-200 focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500 focus:outline-none"
+                      />
                     </div>
 
                     <div>
@@ -6355,25 +6322,6 @@
                           />
                         </div>
                       </div>
-
-                      {/* [v2.12.11] 相似商品建議：手動輸入商品名稱、停頓後跟商品庫比對，點選只帶入款號 */}
-                      {nameSuggestions.length > 0 && (
-                        <div className="bg-amber-50 border border-amber-200 rounded-lg p-2.5 space-y-1.5">
-                          <p className="text-[11px] text-amber-700 font-medium">💡 商品庫有相似商品，點選可帶入款號：</p>
-                          <div className="flex flex-wrap gap-1.5">
-                            {nameSuggestions.map(({ product, score }) => (
-                              <button
-                                key={product.id}
-                                type="button"
-                                onClick={() => handleApplySuggestedProduct(product)}
-                                className="px-2.5 py-1 text-xs font-medium bg-white border border-amber-300 rounded-lg text-amber-800 hover:bg-amber-100"
-                              >
-                                {product.name}{product.sku ? `（${product.sku}）` : ''} · {Math.round(score * 100)}%
-                              </button>
-                            ))}
-                          </div>
-                        </div>
-                      )}
 
                       {selectedProductRef && splitProductOptions(selectedProductRef.colors).length > 1 && (
                         <div>
@@ -7173,6 +7121,7 @@
         </div>
       );
     }
+
 </script>
   <script type="text/babel">
     // Mount Application
