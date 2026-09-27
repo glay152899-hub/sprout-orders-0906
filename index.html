@@ -59,7 +59,7 @@
     // ==========================================
     // config.js — 版本號 / Firebase設定 / 常數設定值
     // ==========================================
-    const APP_VERSION = '2.13.4';
+    const APP_VERSION = '2.13.5';
     document.title = `Sprout 📱 小豆苗訂單助手 V${APP_VERSION} (Firebase RTDB 實時同步版)`;
 
     const firebaseConfig = {
@@ -108,6 +108,18 @@
     };
 
     const ADJUSTMENT_SKU = 'ADJ';
+
+    // ---- [v2.13.5] 還原JSON備份：允許還原的節點清單 ----
+    // 檔名對應 Firebase 路徑；只白名單這幾個，避免使用者選錯檔案把 test/demo_cart 這類非正式資料寫進正式路徑，
+    // 或是把不相關的檔案內容誤寫進資料庫。key 是節點路徑，label 是畫面上顯示的名稱。
+    const RESTORE_ALLOWED_NODES = [
+      { key: 'orders', label: '訂單', filename: 'orders.json' },
+      { key: 'products', label: '商品庫', filename: 'products.json' },
+      { key: 'blacklist', label: '黑名單', filename: 'blacklist.json' },
+      { key: 'settings', label: '設定（運費/折扣等）', filename: 'settings.json' },
+      { key: 'trash', label: '回收桶', filename: 'trash.json' },
+      { key: 'logs', label: '操作日誌', filename: 'logs.json' }
+    ];
 
     const QUICK_PICK_HALF_LIFE_DAYS = 7;   // 權重減半所需天數
     const QUICK_PICK_RECENT_DAYS = 14;     // 畫面上顯示「近 N 天賣出幾件」
@@ -2520,6 +2532,241 @@
     }
 
     // ==========================================
+    // [v2.13.5] 還原JSON備份：讀取本機JSON檔案，合併寫回Firebase
+    // 流程：選檔案 → 預覽勾選要還原哪些節點 → 重新輸入密碼驗證身分 → 還原前自動下載目前資料當「還原點」→ 合併寫入
+    // 安全設計：
+    // 1. 只認 RESTORE_ALLOWED_NODES 白名單裡的檔名，避免選錯檔案寫進不相關的路徑
+    // 2. 用 Firebase Auth 的 reauthenticateWithCredential 真的重新驗證密碼，不是前端自己比對
+    // 3. 寫入用 update()（合併），不會刪除節點裡沒被提到的其他既有資料
+    // 4. 動手寫入前，一定先把「現在」的資料下載一份，讓使用者手上永遠留著還原前的版本
+    // ==========================================
+    function RestoreBackupModal({ onConfirm, onClose }) {
+      const [step, setStep] = React.useState('pick'); // pick → preview → password → working → done
+      const [parsedFiles, setParsedFiles] = React.useState([]); // [{node,label,filename,data,count}]
+      const [unrecognized, setUnrecognized] = React.useState([]); // 選到但認不出檔名的檔案
+      const [selectedNodes, setSelectedNodes] = React.useState(() => new Set());
+      const [password, setPassword] = React.useState('');
+      const [error, setError] = React.useState('');
+      const [resultSummary, setResultSummary] = React.useState(null);
+      const fileInputRef = React.useRef(null);
+
+      const handleFiles = async (fileList) => {
+        setError('');
+        const files = Array.from(fileList || []);
+        if (files.length === 0) return;
+
+        const nextParsed = [];
+        const nextUnrecognized = [];
+
+        for (const file of files) {
+          const match = RESTORE_ALLOWED_NODES.find(
+            (n) => n.filename.toLowerCase() === file.name.toLowerCase()
+          );
+          if (!match) {
+            nextUnrecognized.push(file.name);
+            continue;
+          }
+          try {
+            const text = await file.text();
+            const data = JSON.parse(text);
+            if (typeof data !== 'object' || data === null || Array.isArray(data)) {
+              nextUnrecognized.push(`${file.name}（內容格式不是預期的物件，已略過）`);
+              continue;
+            }
+            nextParsed.push({
+              node: match.key,
+              label: match.label,
+              filename: file.name,
+              data,
+              count: Object.keys(data).length
+            });
+          } catch (err) {
+            nextUnrecognized.push(`${file.name}（不是有效的JSON檔案，已略過）`);
+          }
+        }
+
+        if (nextParsed.length === 0) {
+          setError('沒有辨識出任何可還原的檔案，請確認檔名是否為 orders.json／products.json／blacklist.json／settings.json／trash.json／logs.json 其中之一');
+          setUnrecognized(nextUnrecognized);
+          return;
+        }
+
+        setParsedFiles(nextParsed);
+        setUnrecognized(nextUnrecognized);
+        setSelectedNodes(new Set(nextParsed.map((p) => p.node))); // 預設全選
+        setStep('preview');
+      };
+
+      const toggleNode = (node) => {
+        setSelectedNodes((prev) => {
+          const next = new Set(prev);
+          if (next.has(node)) next.delete(node); else next.add(node);
+          return next;
+        });
+      };
+
+      const handleConfirmPassword = async () => {
+        if (!password) {
+          setError('請輸入密碼');
+          return;
+        }
+        setError('');
+        setStep('working');
+        try {
+          const selections = parsedFiles.filter((p) => selectedNodes.has(p.node));
+          const summary = await onConfirm({ selections, password });
+          setResultSummary(summary);
+          setStep('done');
+        } catch (err) {
+          console.error('Restore error:', err);
+          setError(err?.message || '還原失敗，請確認密碼是否正確、網路是否正常');
+          setStep('password');
+        }
+      };
+
+      const inputCls = "w-full text-sm px-3.5 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500 bg-white";
+
+      return (
+        <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-sm flex items-end sm:items-center justify-center" onClick={step === 'working' ? undefined : onClose}>
+          <div
+            className="bg-white w-full sm:max-w-lg rounded-t-3xl sm:rounded-2xl shadow-2xl flex flex-col max-h-[88vh]"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="px-5 pt-4 pb-3 flex items-center justify-between border-b border-slate-100">
+              <div>
+                <h3 className="font-bold text-base text-slate-800">📥 還原 JSON 備份</h3>
+                <p className="text-[11px] text-slate-400">合併寫入，不會刪除現有的其他資料</p>
+              </div>
+              {step !== 'working' && (
+                <button type="button" onClick={onClose} className="p-1.5 text-slate-400 hover:text-slate-700 rounded-lg hover:bg-slate-100">
+                  <IconX size={22} />
+                </button>
+              )}
+            </div>
+
+            <div className="flex-1 overflow-y-auto p-5 space-y-4">
+              {step === 'pick' && (
+                <>
+                  <div className="bg-amber-50 border border-amber-200 rounded-xl p-3 text-xs text-amber-800 space-y-1">
+                    <p>⚠️ 還原會把備份檔裡的資料寫回資料庫，請確認是正確的備份檔案。</p>
+                    <p>檔名需為：orders.json／products.json／blacklist.json／settings.json／trash.json／logs.json，一次可以選多個檔案。</p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => fileInputRef.current?.click()}
+                    className="w-full py-8 border-2 border-dashed border-slate-300 rounded-xl text-slate-500 hover:border-emerald-400 hover:text-emerald-600 flex flex-col items-center gap-2"
+                  >
+                    <IconFileDown size={28} />
+                    <span className="text-sm font-semibold">點此選擇備份 JSON 檔案</span>
+                  </button>
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept=".json,application/json"
+                    multiple
+                    className="hidden"
+                    onChange={(e) => handleFiles(e.target.files)}
+                  />
+                  {error && (
+                    <div className="text-xs text-red-600 bg-red-50 border border-red-200 rounded-lg px-3 py-2">{error}</div>
+                  )}
+                </>
+              )}
+
+              {step === 'preview' && (
+                <>
+                  <p className="text-xs text-slate-500">辨識出以下檔案，勾選要還原的節點（合併寫入，不會刪除現有其他資料）：</p>
+                  <div className="space-y-2">
+                    {parsedFiles.map((p) => (
+                      <label key={p.node} className="flex items-center gap-3 p-3 rounded-xl border border-slate-200 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={selectedNodes.has(p.node)}
+                          onChange={() => toggleNode(p.node)}
+                          className="w-4 h-4 accent-emerald-600"
+                        />
+                        <div className="flex-1 min-w-0">
+                          <div className="text-sm font-bold text-slate-800">{p.label}</div>
+                          <div className="text-[11px] text-slate-400">{p.filename} · 共 {p.count} 筆</div>
+                        </div>
+                      </label>
+                    ))}
+                  </div>
+                  {unrecognized.length > 0 && (
+                    <div className="text-[11px] text-slate-400 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2">
+                      已略過無法辨識的檔案：{unrecognized.join('、')}
+                    </div>
+                  )}
+                  <button
+                    type="button"
+                    disabled={selectedNodes.size === 0}
+                    onClick={() => setStep('password')}
+                    className="w-full py-3 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-40 text-white font-bold text-sm rounded-xl"
+                  >
+                    下一步：確認身分（已選 {selectedNodes.size} 個節點）
+                  </button>
+                </>
+              )}
+
+              {(step === 'password' || step === 'working') && (
+                <>
+                  <div className="bg-red-50 border border-red-200 rounded-xl p-3 text-xs text-red-700 space-y-1">
+                    <p>🔒 為避免誤觸，還原前請再輸入一次登入密碼確認身分。</p>
+                    <p>系統會先自動下載一份「還原前」的現有資料備份，再進行還原，萬一選錯還能救回來。</p>
+                  </div>
+                  <div>
+                    <label className="text-xs font-semibold text-slate-600 mb-1 block">請重新輸入密碼</label>
+                    <input
+                      type="password"
+                      autoComplete="current-password"
+                      value={password}
+                      disabled={step === 'working'}
+                      onChange={(e) => setPassword(e.target.value)}
+                      className={inputCls}
+                    />
+                  </div>
+                  {error && (
+                    <div className="text-xs text-red-600 bg-red-50 border border-red-200 rounded-lg px-3 py-2">{error}</div>
+                  )}
+                  <button
+                    type="button"
+                    disabled={step === 'working'}
+                    onClick={handleConfirmPassword}
+                    className="w-full py-3 bg-red-600 hover:bg-red-700 disabled:opacity-50 text-white font-bold text-sm rounded-xl"
+                  >
+                    {step === 'working' ? '還原中，請稍候…' : '確認並開始還原'}
+                  </button>
+                </>
+              )}
+
+              {step === 'done' && resultSummary && (
+                <>
+                  <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-4 text-sm text-emerald-800 space-y-2">
+                    <p className="font-bold">✅ 還原完成</p>
+                    <ul className="text-xs space-y-1">
+                      {resultSummary.map((s) => (
+                        <li key={s.node}>{s.label}：合併寫入 {s.count} 筆</li>
+                      ))}
+                    </ul>
+                    <p className="text-[11px] text-emerald-600">還原前的資料已自動下載一份到瀏覽器下載資料夾，請妥善保存。</p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={onClose}
+                    className="w-full py-3 bg-slate-800 hover:bg-slate-700 text-white font-bold text-sm rounded-xl"
+                  >
+                    完成
+                  </button>
+                </>
+              )}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+
+    // ==========================================
     // [V2.7] 操作日誌視窗：最近 200 筆，編輯訂單可「還原此次修改」
     // ==========================================
     function LogModal({ orders, onRevert, onClose }) {
@@ -3378,6 +3625,7 @@
         blacklist,
         setIsTrashOpen,
         setIsLogOpen,
+        setIsRestoreModalOpen,
         setIsShippingSettingsOpen,
         setIsBlacklistOpen,
         handleExportCSV,
@@ -3437,6 +3685,13 @@
                       className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs sm:text-sm rounded-xl border border-slate-200 transition whitespace-nowrap"
                     >
                       📒 操作日誌
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setIsRestoreModalOpen(true)}
+                      className="px-4 py-2 bg-red-50 hover:bg-red-100 text-red-700 font-bold text-xs sm:text-sm rounded-xl border border-red-200 transition whitespace-nowrap"
+                    >
+                      📥 還原 JSON 備份
                     </button>
                   </div>
                 </div>
@@ -3588,6 +3843,7 @@
       const [trashProducts, setTrashProducts] = React.useState([]);
       const [isTrashOpen, setIsTrashOpen] = React.useState(false);
       const [isLogOpen, setIsLogOpen] = React.useState(false);
+      const [isRestoreModalOpen, setIsRestoreModalOpen] = React.useState(false); // [v2.13.5] 還原JSON備份
 
       // ---------- [黑名單 v2.12.5] ----------
       const [blacklist, setBlacklist] = React.useState([]);
@@ -4778,7 +5034,70 @@
         }
       };
 
-      // ---------- [V2.7] 日誌：還原「編輯訂單」 ----------
+      // ---------- [v2.13.5] 還原JSON備份 ----------
+      // selections: [{node, label, filename, data, count}]；password: 使用者重新輸入的登入密碼
+      // 回傳 [{node, label, count}] 給 modal 顯示結果摘要；任何一步失敗都會 throw，modal 接住顯示錯誤訊息
+      const handlePerformRestore = async ({ selections, password }) => {
+        if (!selections || selections.length === 0) {
+          throw new Error('沒有選擇要還原的節點');
+        }
+
+        // 1. 用 Firebase Auth 真的重新驗證密碼（不是前端自己比對），密碼錯誤會在這裡直接 throw
+        try {
+          const credential = firebase.auth.EmailAuthProvider.credential(user.email, password);
+          await firebase.auth().currentUser.reauthenticateWithCredential(credential);
+        } catch (err) {
+          console.error('Reauth error:', err);
+          throw new Error('密碼不正確，請重新輸入');
+        }
+
+        if (!requireConnection('還原備份')) {
+          throw new Error('目前沒有網路連線，無法還原');
+        }
+
+        // 2. 動手寫入前，先把「現在」選到的這幾個節點的資料各自下載一份，當作還原前的還原點
+        try {
+          const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+          for (const sel of selections) {
+            const snapshot = await dbRef(sel.node).once('value');
+            const currentData = snapshot.val() || {};
+            const blob = new Blob([JSON.stringify(currentData, null, 2)], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement('a');
+            link.setAttribute('href', url);
+            link.setAttribute('download', `還原前備份_${sel.node}_${timestamp}.json`);
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+            URL.revokeObjectURL(url);
+          }
+        } catch (err) {
+          console.error('Safety backup download error:', err);
+          throw new Error('自動備份「還原前資料」失敗，為安全起見已取消這次還原，請確認後再試一次');
+        }
+
+        // 3. 合併寫入：update() 只會新增/覆蓋同名的 key，不會刪除節點裡沒被提到的其他既有資料
+        const summary = [];
+        try {
+          for (const sel of selections) {
+            await withSyncTracking(dbRef(sel.node).update(sel.data));
+            summary.push({ node: sel.node, label: sel.label, count: sel.count });
+          }
+        } catch (err) {
+          console.error('Restore write error:', err);
+          throw new Error('部分或全部節點寫入失敗，請檢查網路連線或權限設定（還原前的備份已下載，資料不會遺失）');
+        }
+
+        logAction(
+          'restore_json_backup',
+          'system',
+          '',
+          `還原JSON備份（合併寫入）：${summary.map(s => `${s.label} ${s.count}筆`).join('、')}`
+        );
+        return summary;
+      };
+
+
       const handleRevertOrderEdit = async (entry) => {
         const order = orders.find(o => o.id === entry.targetId);
         if (!order) {
@@ -5459,6 +5778,14 @@
               <IconSparkles size={16} className="text-amber-400" />
               {toastMessage}
             </div>
+          )}
+
+          {/* [v2.13.5] 還原JSON備份 Modal */}
+          {isRestoreModalOpen && (
+            <RestoreBackupModal
+              onConfirm={handlePerformRestore}
+              onClose={() => setIsRestoreModalOpen(false)}
+            />
           )}
 
           {/* Delete Order Modal */}
@@ -7261,6 +7588,7 @@
                   blacklist,
                   setIsTrashOpen,
                   setIsLogOpen,
+                  setIsRestoreModalOpen,
                   setIsShippingSettingsOpen,
                   setIsBlacklistOpen,
                   handleExportCSV,
