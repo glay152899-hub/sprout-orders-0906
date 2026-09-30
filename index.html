@@ -59,7 +59,7 @@
     // ==========================================
     // config.js — 版本號 / Firebase設定 / 常數設定值
     // ==========================================
-    const APP_VERSION = '2.14.3';
+    const APP_VERSION = '2.14.4';
     document.title = `Sprout 📱 小豆苗訂單助手 V${APP_VERSION} (Firebase RTDB 實時同步版)`;
 
     const firebaseConfig = {
@@ -972,8 +972,13 @@
       if (!/^\d{4}/.test(no)) return false;
       const d = new Date(order.timestamp);
       if (isNaN(d.getTime())) return false;
-      const mmdd = `${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`;
-      return no.slice(0, 4) === mmdd;
+      const mm = String(d.getMonth() + 1).padStart(2, '0');
+      const dd = String(d.getDate()).padStart(2, '0');
+      // [v2.14.4] 單號開頭可能是 YYYYMMDD（8碼）、民國 YYYMMDD（7碼）或舊的 MMDD（4碼）；
+      // 開頭日期與訂單日期一致時，單號的日期部分只是重複資訊，卡片上不必再顯示一次
+      if (no.startsWith(`${d.getFullYear()}${mm}${dd}`)) return true;
+      if (no.startsWith(`${d.getFullYear() - 1911}${mm}${dd}`)) return true;
+      return no.slice(0, 4) === `${mm}${dd}`;
     };
 
     // [V2.6.2] 訂單卡片上的簡短日期：今年的訂單只顯示「9/16」，其他年份顯示完整日期
@@ -1305,21 +1310,63 @@
 
     // [V2.4] 工作表名稱前四碼 = 建單日期（MMDD，例如「0901林 涔」→ 9/1）。
     // 年份沒寫：先假設今年；若算出來比今天晚超過 2 天，就當成去年。時間統一設成中午 12 點。
-    const inferOrderTimestampFromSheetName = (sheetName, nowMs = Date.now()) => {
-      const m = /^(\d{2})(\d{2})/.exec(String(sheetName || '').trim());
+    // [v2.14.4 年份修正] 由工作表名稱解析訂單日期。回傳 { timestamp, source, year }：
+    //   source = 'full'         → 名稱開頭自帶年份：YYYYMMDD（如 20260703王明）
+    //   source = 'roc'          → 民國年 YYYMMDD（如 1140222熊熊，換算成西元）
+    //   source = 'mmdd-chosen'  → 只有 MMDD，年份採用使用者指定的 assumedYear
+    //   source = 'mmdd-guessed' → 只有 MMDD 且沒指定年份：沿用舊做法（今年，若比今天晚超過兩天就算去年）
+    //   null                    → 看不出日期（或日期不存在，例如 0231）
+    const parseSheetNameDate = (sheetName, opts = {}) => {
+      const nowMs = opts.nowMs !== undefined ? opts.nowMs : Date.now();
+      const assumedYear = Number(opts.assumedYear) || 0;
+      const name = String(sheetName || '').trim();
+      const build = (year, month, day) => {
+        if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+        const d = new Date(year, month - 1, day, 12, 0, 0);
+        if (d.getMonth() !== month - 1 || d.getDate() !== day) return null; // 例如 0231 這種不存在的日期
+        return d;
+      };
+      let m = /^(20\d{2})(\d{2})(\d{2})/.exec(name);           // YYYYMMDD
+      if (m) {
+        const d = build(Number(m[1]), Number(m[2]), Number(m[3]));
+        if (d) return { timestamp: d.getTime(), source: 'full', year: d.getFullYear() };
+      }
+      m = /^(1\d{2})(\d{2})(\d{2})/.exec(name);                // 民國 YYYMMDD（民國100~199年）
+      if (m) {
+        const d = build(Number(m[1]) + 1911, Number(m[2]), Number(m[3]));
+        if (d) return { timestamp: d.getTime(), source: 'roc', year: d.getFullYear() };
+      }
+      m = /^(\d{2})(\d{2})/.exec(name);                          // MMDD
       if (!m) return null;
       const month = Number(m[1]);
       const day = Number(m[2]);
-      if (month < 1 || month > 12 || day < 1 || day > 31) return null;
-
+      if (assumedYear) {
+        const d = build(assumedYear, month, day);
+        return d ? { timestamp: d.getTime(), source: 'mmdd-chosen', year: assumedYear } : null;
+      }
       const year = new Date(nowMs).getFullYear();
-      let d = new Date(year, month - 1, day, 12, 0, 0);
-      if (d.getMonth() !== month - 1) return null; // 例如 0231 這種不存在的日期
-      if (d.getTime() > nowMs + 2 * 86400000) d = new Date(year - 1, month - 1, day, 12, 0, 0);
-      return d.getTime();
+      let d = build(year, month, day);
+      if (!d) return null;
+      if (d.getTime() > nowMs + 2 * 86400000) d = build(year - 1, month, day);
+      return d ? { timestamp: d.getTime(), source: 'mmdd-guessed', year: d.getFullYear() } : null;
     };
 
-    const parseOrderExcelWorkbook = (workbook, defaultShippingFee = 38) => {
+    // 舊介面保留（只回傳時間戳）
+    const inferOrderTimestampFromSheetName = (sheetName, nowMs = Date.now()) => {
+      const r = parseSheetNameDate(sheetName, { nowMs });
+      return r ? r.timestamp : null;
+    };
+
+    // 預覽視窗改選年份時使用：只有「只有 MMDD」的訂單會受影響；自帶年份的（YYYYMMDD／民國年）不動。
+    // assumedYear 為空 → 還原成自動判斷。回傳新的 draft（不修改原物件）。
+    const resolveDraftTimestamp = (draft, assumedYear, nowMs = Date.now()) => {
+      if (!draft || (draft.yearSource !== 'mmdd-guessed' && draft.yearSource !== 'mmdd-chosen')) return draft;
+      const r = parseSheetNameDate(draft.orderNo, { assumedYear, nowMs });
+      if (!r) return { ...draft, orderTimestamp: null, yearSource: null };
+      return { ...draft, orderTimestamp: r.timestamp, yearSource: r.source };
+    };
+
+    const parseOrderExcelWorkbook = (workbook, defaultShippingFee = 38, options = {}) => {
       const drafts = [];
 
       workbook.SheetNames.forEach(sheetName => {
@@ -1478,6 +1525,7 @@
             }));
           }
 
+          const sheetDate = parseSheetNameDate(cleanedSheetName, { assumedYear: options.assumedYear });
           drafts.push({
             orderNo: cleanedSheetName,
             customerName,
@@ -1491,7 +1539,8 @@
             note: '由 Excel 檔案匯入',
             // 以下兩個欄位僅供預覽與計算用，寫入資料庫前會移除
             excelTotal,
-            orderTimestamp: inferOrderTimestampFromSheetName(cleanedSheetName)
+            orderTimestamp: sheetDate ? sheetDate.timestamp : null,
+            yearSource: sheetDate ? sheetDate.source : null   // [v2.14.4] full／roc／mmdd-chosen／mmdd-guessed／null
           });
         }
       });
@@ -2087,6 +2136,20 @@
     // 訂單 Excel 匯入預覽 Modal（可勾選、標示重複單號 / 已對齊 Excel 總計）
     function OrderImportPreviewModal({ drafts, existingOrderNos, existingOrders, trashOrderNos, isSaving, onClose, onConfirm }) {
       const [statusKey, setStatusKey] = React.useState('pending');
+      // [v2.14.4] 分頁名只有 MMDD（沒有年份）時，讓使用者在預覽時指定年份；'' = 自動判斷（今年，太晚則算去年）
+      const [assumedYear, setAssumedYear] = React.useState('');
+      const needsYearChoice = React.useMemo(
+        () => drafts.some(d => d.yearSource === 'mmdd-guessed' || d.yearSource === 'mmdd-chosen'),
+        [drafts]
+      );
+      const yearOptions = React.useMemo(() => {
+        const y = new Date().getFullYear();
+        return [y + 1, y, y - 1, y - 2, y - 3];
+      }, []);
+      const shownDrafts = React.useMemo(
+        () => drafts.map(d => resolveDraftTimestamp(d, assumedYear)),
+        [drafts, assumedYear]
+      );
 
       const rows = React.useMemo(() => {
         // 現有訂單的「簽章」（同客人 + 同商品 + 同金額），用來找出疑似已存在的訂單
@@ -2096,7 +2159,7 @@
           if (!sigMap.has(s)) sigMap.set(s, o);
         });
 
-        return drafts.map((d, idx) => {
+        return shownDrafts.map((d, idx) => {
           const computed = calcOrderTotal(d);
           const isDuplicate = Boolean(d.orderNo) && existingOrderNos.has(d.orderNo);
           return {
@@ -2110,7 +2173,7 @@
             adjustLine: d.items.find(i => i.sku === ADJUSTMENT_SKU) || null
           };
         });
-      }, [drafts, existingOrderNos, existingOrders, trashOrderNos]);
+      }, [shownDrafts, existingOrderNos, existingOrders, trashOrderNos]);
 
       const [selected, setSelected] = React.useState(
         () => new Set(rows.filter(r => !r.isDuplicate && !r.similar && !r.isEmpty).map(r => r.idx))
@@ -2154,6 +2217,25 @@
                 <IconX size={20} />
               </button>
             </div>
+
+            {needsYearChoice && (
+              <div className="px-4 pt-3 space-y-1.5">
+                <div className="text-xs font-bold text-slate-600">訂單年份</div>
+                <div className="flex items-center gap-2">
+                  <select
+                    value={assumedYear}
+                    onChange={(e) => setAssumedYear(e.target.value)}
+                    className="flex-1 px-3 py-2 border border-slate-200 rounded-xl text-sm bg-white text-slate-700 focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                  >
+                    <option value="">自動判斷（今年；日期比今天晚就算去年）</option>
+                    {yearOptions.map(y => <option key={y} value={y}>{y} 年</option>)}
+                  </select>
+                </div>
+                <p className="text-[11px] text-amber-700 leading-snug">
+                  有些工作表名稱只有月日（例如 0703），沒有年份。請確認下面每筆的 📅 日期是否正確；分頁名稱自帶年份的（例如 20260703 或民國 1140703）不受這個選項影響。
+                </p>
+              </div>
+            )}
 
             <div className="px-4 pt-3 space-y-1.5">
               <div className="text-xs font-bold text-slate-600">匯入後的訂單狀態</div>
@@ -2209,7 +2291,7 @@
                         {r.adjustLine && <span className="text-[11px] bg-amber-100 text-amber-800 px-2 py-0.5 rounded-full font-bold">含差額調整</span>}
                       </div>
                       <div className="text-[11px] sm:text-xs text-slate-500 mt-0.5">
-                        {r.d.orderTimestamp ? `📅 ${new Date(r.d.orderTimestamp).toLocaleDateString('zh-TW')}` : '📅 匯入當天'} · {r.d.customerPhone || '無電話'} · {r.d.deliveryMethod} · {r.d.storeName || '無門市資訊'}
+                        {r.d.orderTimestamp ? `📅 ${new Date(r.d.orderTimestamp).toLocaleDateString('zh-TW')}` : '📅 匯入當天'}{(r.d.yearSource === 'mmdd-guessed' || r.d.yearSource === 'mmdd-chosen') && <span className="ml-1 text-amber-600">（年份{r.d.yearSource === 'mmdd-chosen' ? '已指定' : '自動判斷'}）</span>} · {r.d.customerPhone || '無電話'} · {r.d.deliveryMethod} · {r.d.storeName || '無門市資訊'}
                       </div>
 
                       <div className="mt-2 space-y-0.5 text-[11px] sm:text-xs text-slate-600">
@@ -6202,7 +6284,7 @@
 
           selectedDrafts.forEach((draft, i) => {
             const newKey = dbRef('orders').push().key;
-            const { excelTotal, orderTimestamp, ...orderData } = draft;
+            const { excelTotal, orderTimestamp, yearSource, ...orderData } = draft; // yearSource 只供預覽用，不寫入資料庫
             const baseTs = orderTimestamp || now; // [V2.4] 以工作表名稱推算的建單日期為準
             const linkedItems = orderData.items.map(item => {
               if (item.sku || isAdjustmentItem(item)) return item;
