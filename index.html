@@ -59,7 +59,7 @@
     // ==========================================
     // config.js — 版本號 / Firebase設定 / 常數設定值
     // ==========================================
-    const APP_VERSION = '2.14.4';
+    const APP_VERSION = '2.14.5';
     document.title = `Sprout 📱 小豆苗訂單助手 V${APP_VERSION} (Firebase RTDB 實時同步版)`;
 
     const firebaseConfig = {
@@ -875,12 +875,59 @@
     // ==========================================
     // [V2.7] 回收桶 + 操作日誌 共用工具
     // ==========================================
+    // [v2.14.5] 訂單日期：日期選擇器用的 YYYY-MM-DD（本地時間）
+    const toDateInputValue = (ts) => {
+      const d = new Date(ts);
+      if (ts === null || ts === undefined || ts === '' || isNaN(d.getTime())) return '';
+      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    };
+
+    // [v2.14.5] 依使用者選的日期（YYYY-MM-DD）產生訂單的 timestamp 與 createdAt（顯示用文字）。
+    // 時間點取 nowMs 的「時:分:秒」（新增訂單＝現在；編輯舊訂單＝該訂單原本的時間點，只改日期不改時間）。
+    // 日期空白或不合法 → 直接用 nowMs。
+    const buildOrderStamp = (dateStr, nowMs = Date.now()) => {
+      const base = new Date(nowMs);
+      let d = base;
+      const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(dateStr || ''));
+      if (m) {
+        const y = Number(m[1]), mo = Number(m[2]), da = Number(m[3]);
+        const c = new Date(y, mo - 1, da, base.getHours(), base.getMinutes(), base.getSeconds());
+        if (c.getFullYear() === y && c.getMonth() === mo - 1 && c.getDate() === da) d = c;
+      }
+      return { timestamp: d.getTime(), createdAt: d.toLocaleString('zh-TW', { hour12: false }) };
+    };
+
+    // [v2.14.5] 手動新增商品時，款號留空 → 自動編 SKU-數字（規則與 Excel 匯入商品相同：
+    // 現有商品＋回收桶商品的款號都算已使用，從已使用的最大編號往後接）
+    const nextAutoSku = (existingProducts, reservedSkus = []) => {
+      const used = new Set(
+        [...(existingProducts || []).map(p => p.sku), ...reservedSkus]
+          .map(s => String(s || '').trim().toUpperCase())
+          .filter(Boolean)
+      );
+      let counter = [...used].reduce((max, s) => {
+        const m = /^SKU-(\d+)$/.exec(s);
+        return m ? Math.max(max, Number(m[1])) : max;
+      }, 0);
+      let sku;
+      do { sku = `SKU-${++counter}`; } while (used.has(sku));
+      return sku;
+    };
+
+    // [v2.14.5] 從檔名猜年份：檔名開頭或數字以外的字元之後，出現「20xx＋月份(01~12)」（例：202507訂購單.xlsx → 2025）
+    const suggestYearFromFileName = (fileName) => {
+      const m = /(?:^|[^0-9])(20\d{2})(?:0[1-9]|1[0-2])(?![0-9])/.exec(String(fileName || ''));
+      return m ? Number(m[1]) : null;
+    };
+
     const ORDER_FIELD_LABELS = {
       orderNo: '單號',
       customerName: '姓名',
       customerPhone: '電話',
       customerLine: 'LINE',
       customerIg: 'IG',
+      timestamp: '訂單日期',            // [v2.14.5新增]
+      createdAt: '訂單日期（顯示用）',  // [v2.14.5新增] 與 timestamp 一起改，日誌只顯示一次
       deliveryMethod: '物流方式',
       storeName: '門市名稱',
       storeAddress: '地址', // [v2.13.0新增]
@@ -901,6 +948,7 @@
     const shortUser = (email) => String(email || '').split('@')[0] || '（未知）';
 
     const formatLogValue = (key, value) => {
+      if (key === 'timestamp') return toDateInputValue(value) || String(value);
       if (key === 'paymentStatus') return value ? '已付款' : '未付款';
       if (key === 'shipmentStatus') return value === 'shipped' ? '已出貨' : '待出貨';
       if (value === '' || value === null || value === undefined) return '（空）';
@@ -910,7 +958,7 @@
     // 把「編輯訂單」日誌的 before / after 轉成一行看得懂的文字（商品明細只說有修改）
     const describeEditDiff = (entry) => {
       if (!entry?.before || !entry?.after) return '';
-      return Object.keys(entry.after).map(key => {
+      return Object.keys(entry.after).filter(key => !(key === 'createdAt' && 'timestamp' in entry.after)).map(key => {
         if (key === 'items') return '商品明細已修改';
         return `${ORDER_FIELD_LABELS[key] || key}：${formatLogValue(key, entry.before[key])} → ${formatLogValue(key, entry.after[key])}`;
       }).join('；');
@@ -1874,6 +1922,7 @@
         customerPhone: order.customerPhone || '',
         customerLine: order.customerLine || '',
         customerIg: order.customerIg || '',
+        orderDate: toDateInputValue(order.timestamp), // [v2.14.5] 訂單日期可修改
         deliveryMethod: order.deliveryMethod || '7-11 取貨付款',
         storeName: storeParts.name,
         storeAddress: storeParts.address, // [v2.13.0新增] 若是舊資料，這裡已經用括號規則拆過一次，存檔時就會變成新格式
@@ -1884,6 +1933,8 @@
         items: (order.items || []).map(i => ({ ...i }))
       }));
       const [error, setError] = React.useState('');
+      const initialOrderDate = React.useRef(toDateInputValue(order.timestamp));
+      const todayStr = toDateInputValue(Date.now());
 
       const setField = (field, value) => setForm(prev => ({ ...prev, [field]: value }));
 
@@ -1922,7 +1973,7 @@
         if (form.items.length === 0) { setError('請至少保留一項商品'); return; }
         if (form.items.some(i => !String(i.name || '').trim())) { setError('商品名稱不可空白'); return; }
 
-        onSave(order, {
+        const edited = {
           orderNo: form.orderNo.trim(),
           customerName: form.customerName.trim(),
           customerPhone: form.customerPhone.trim(),
@@ -1936,7 +1987,14 @@
           shipmentStatus: form.shipmentStatus,
           note: form.note.trim(),
           items: form.items.map(sanitizeItem)
-        });
+        };
+        // [v2.14.5] 日期有改才寫入：沿用該訂單原本的「時:分:秒」，只換日期；timestamp 與顯示用的 createdAt 一起改
+        if (form.orderDate && form.orderDate !== initialOrderDate.current) {
+          const stamp = buildOrderStamp(form.orderDate, Number(order.timestamp) || Date.now());
+          edited.timestamp = stamp.timestamp;
+          edited.createdAt = stamp.createdAt;
+        }
+        onSave(order, edited);
       };
 
       const inputCls = "w-full text-xs sm:text-sm px-3 py-2 rounded-xl border border-slate-200 focus:outline-none focus:border-emerald-500 bg-white";
@@ -1979,6 +2037,20 @@
                   <label className="text-xs font-semibold text-slate-600 mb-1 block">IG 帳號</label>
                   <input type="text" placeholder="例如：mei.shop" value={form.customerIg} onChange={(e) => setField('customerIg', e.target.value)} className={inputCls} />
                 </div>
+              </div>
+
+              <div>
+                <label className="text-xs font-semibold text-slate-600 mb-1 block">訂單日期</label>
+                <input
+                  type="date"
+                  value={form.orderDate}
+                  max={todayStr}
+                  onChange={(e) => setField('orderDate', e.target.value)}
+                  className={inputCls}
+                />
+                {form.orderDate && form.orderDate !== initialOrderDate.current && (
+                  <p className="text-[11px] text-amber-700 mt-1">訂單日期將由 {initialOrderDate.current || '（原本沒有日期）'} 改為 {form.orderDate}（時間點不變）。排序、日期篩選與統計會跟著新日期走。</p>
+                )}
               </div>
 
               <div className="grid grid-cols-2 gap-3">
@@ -2134,18 +2206,20 @@
     };
 
     // 訂單 Excel 匯入預覽 Modal（可勾選、標示重複單號 / 已對齊 Excel 總計）
-    function OrderImportPreviewModal({ drafts, existingOrderNos, existingOrders, trashOrderNos, isSaving, onClose, onConfirm }) {
+    function OrderImportPreviewModal({ drafts, existingOrderNos, existingOrders, trashOrderNos, isSaving, onClose, onConfirm, suggestedYear }) {
       const [statusKey, setStatusKey] = React.useState('pending');
       // [v2.14.4] 分頁名只有 MMDD（沒有年份）時，讓使用者在預覽時指定年份；'' = 自動判斷（今年，太晚則算去年）
-      const [assumedYear, setAssumedYear] = React.useState('');
+      const [assumedYear, setAssumedYear] = React.useState(suggestedYear ? String(suggestedYear) : ''); // [v2.14.5] 有從檔名猜到年份就當預設
       const needsYearChoice = React.useMemo(
         () => drafts.some(d => d.yearSource === 'mmdd-guessed' || d.yearSource === 'mmdd-chosen'),
         [drafts]
       );
       const yearOptions = React.useMemo(() => {
         const y = new Date().getFullYear();
-        return [y + 1, y, y - 1, y - 2, y - 3];
-      }, []);
+        const list = [y + 1, y, y - 1, y - 2, y - 3];
+        if (suggestedYear && !list.includes(Number(suggestedYear))) list.push(Number(suggestedYear));
+        return list.sort((a, b) => b - a);
+      }, [suggestedYear]);
       const shownDrafts = React.useMemo(
         () => drafts.map(d => resolveDraftTimestamp(d, assumedYear)),
         [drafts, assumedYear]
@@ -2232,7 +2306,7 @@
                   </select>
                 </div>
                 <p className="text-[11px] text-amber-700 leading-snug">
-                  有些工作表名稱只有月日（例如 0703），沒有年份。請確認下面每筆的 📅 日期是否正確；分頁名稱自帶年份的（例如 20260703 或民國 1140703）不受這個選項影響。
+                  {suggestedYear ? `已依檔名預設為 ${suggestedYear} 年，可自行更改。` : ''}有些工作表名稱只有月日（例如 0703），沒有年份。請確認下面每筆的 📅 日期是否正確；分頁名稱自帶年份的（例如 20260703 或民國 1140703）不受這個選項影響。
                 </p>
               </div>
             )}
@@ -4408,10 +4482,10 @@
                   </div>
                   <div className="grid grid-cols-3 gap-3">
                     <div>
-                      <label className="text-xs font-semibold text-slate-600 mb-1 block">商品款號 (SKU)</label>
+                      <label className="text-xs font-semibold text-slate-600 mb-1 block">{editingProduct.id ? '商品款號 (SKU)' : '商品款號 (SKU)・選填，空白會自動編號'}</label>
                       <input
                         type="text"
-                        placeholder="A01"
+                        placeholder={editingProduct.id ? 'A01' : '空白＝自動編號'}
                         value={editingProduct.sku}
                         onChange={(e) => setEditingProduct({ ...editingProduct, sku: e.target.value })}
                         className="w-full text-xs sm:text-sm px-3 py-2 rounded-xl border border-slate-200 focus:outline-none focus:border-emerald-500"
@@ -5306,6 +5380,7 @@
       // [V2.1] Order List Upgrade States
       const [editingOrder, setEditingOrder] = React.useState(null); // Order object or null
       const [orderImportDrafts, setOrderImportDrafts] = React.useState([]);
+      const [orderImportSuggestedYear, setOrderImportSuggestedYear] = React.useState(null); // [v2.14.5] 從檔名猜到的年份
       const [isOrderImportModalOpen, setIsOrderImportModalOpen] = React.useState(false);
       const [isOrderParsing, setIsOrderParsing] = React.useState(false);
       const [isOrderImporting, setIsOrderImporting] = React.useState(false);
@@ -5523,6 +5598,7 @@
       const [shippingFee, setShippingFee] = React.useState(DEFAULT_SHIPPING_CONFIG.fees['7-11 取貨付款']);
       const [shippingFeeAuto, setShippingFeeAuto] = React.useState(true); // 運費是否跟著物流方式/滿額自動帶入
       const [orderNote, setOrderNote] = React.useState('');
+      const [orderDate, setOrderDate] = React.useState(''); // [v2.14.5] 新增訂單的日期（YYYY-MM-DD）；空白＝今天
       
       const [orderItems, setOrderItems] = React.useState([]);
 
@@ -5582,6 +5658,7 @@
               setShippingFee(Number.isFinite(Number(d.shippingFee)) ? Number(d.shippingFee) : DEFAULT_SHIPPING_CONFIG.fees['7-11 取貨付款']);
               setShippingFeeAuto(false); // 還原草稿代表她可能已經自己調過運費，先不要再自動覆蓋
               setOrderNote(d.orderNote || '');
+              setOrderDate(/^\d{4}-\d{2}-\d{2}$/.test(String(d.orderDate || '')) ? d.orderDate : '');
               setOrderItems(Array.isArray(d.orderItems) ? d.orderItems.map(sanitizeItem) : []);
               setDraftRestored(true);
             } else {
@@ -5606,12 +5683,12 @@
           }
           localStorage.setItem(draftKey, JSON.stringify({
             ts: Date.now(), lineText, customerName, customerPhone, customerLine, customerIg, deliveryMethod,
-            storeName, storeAddress, shippingFee, orderNote, orderItems
+            storeName, storeAddress, shippingFee, orderNote, orderDate, orderItems
           }));
         } catch (err) {
           // 私密瀏覽模式等情況無法儲存草稿，不影響正常使用
         }
-      }, [draftReady, lineText, customerName, customerPhone, customerLine, customerIg, deliveryMethod, storeName, storeAddress, shippingFee, orderNote, orderItems]);
+      }, [draftReady, lineText, customerName, customerPhone, customerLine, customerIg, deliveryMethod, storeName, storeAddress, shippingFee, orderNote, orderDate, orderItems]);
 
       const handleDiscardDraft = () => {
         setLineText('');
@@ -5622,6 +5699,7 @@
         setStoreName('');
         setStoreAddress('');
         setOrderNote('');
+        setOrderDate('');
         setOrderItems([]);
         setSelectedProductRef(null);
         setDraftRestored(false);
@@ -6043,6 +6121,7 @@
         // 重送也只會覆蓋同一筆，不會多出一張。
         const orderKey = pendingOrderKeyRef.current || (pendingOrderKeyRef.current = dbRef('orders').push().key);
 
+        const orderStamp = buildOrderStamp(orderDate); // [v2.14.5] orderDate 空白＝現在；有選日期＝該日（時間點取現在），timestamp 與 createdAt 同源
         const newOrderObj = {
           customerName,
           customerPhone,
@@ -6056,8 +6135,8 @@
           shipmentStatus: 'unshipped',
           items: orderItems,
           note: orderNote,
-          createdAt: new Date().toLocaleString('zh-TW', { hour12: false }),
-          timestamp: Date.now()
+          createdAt: orderStamp.createdAt,
+          timestamp: orderStamp.timestamp // [v2.14.5] 可指定訂單日期（補登舊單）
         };
 
         // 最近 3 天內已經有看起來相同的訂單（同客人、同商品、同金額）→ 先提醒，由使用者決定
@@ -6108,6 +6187,7 @@
           setStoreName('');
           setStoreAddress(''); // [v2.13.4修正] 之前拆分門市名稱/地址時漏了這行，地址欄位送出後不會清空
           setOrderNote('');
+          setOrderDate('');
           setOrderItems([]);
           setLineText('');
           setSelectedProductRef(null);
@@ -6211,7 +6291,7 @@
           // 日誌保留「修改前」的值，之後可以在日誌裡一鍵還原
           const before = {};
           Object.keys(changes).forEach(k => { before[k] = original[k]; });
-          const labels = Object.keys(changes).map(k => ORDER_FIELD_LABELS[k] || k);
+          const labels = Object.keys(changes).filter(k => !(k === 'createdAt' && 'timestamp' in changes)).map(k => ORDER_FIELD_LABELS[k] || k);
           logAction('order_edit', 'order', original.id, `編輯訂單：${edited.customerName}（${labels.join('、')}）`, { before, after: changes });
 
           showToast(`✅ 訂單「${edited.customerName}」已更新並同步雲端`);
@@ -6239,6 +6319,7 @@
             if (drafts.length === 0) {
               showToast('⚠️ 未能解析出有效訂單，請確認 Excel 格式');
             } else {
+              setOrderImportSuggestedYear(suggestYearFromFileName(file.name));
               setOrderImportDrafts(drafts);
               setIsOrderImportModalOpen(true);
             }
@@ -6583,7 +6664,7 @@
           return;
         }
         if (!entry.before) return;
-        const labels = Object.keys(entry.before).map(k => ORDER_FIELD_LABELS[k] || k);
+        const labels = Object.keys(entry.before).filter(k => !(k === 'createdAt' && 'timestamp' in entry.before)).map(k => ORDER_FIELD_LABELS[k] || k);
         if (!window.confirm(`要把「${order.customerName}」的這些欄位還原到修改前嗎？\n${labels.join('、')}\n（之後又改過的內容會被蓋回去）`)) return;
 
         try {
@@ -6762,6 +6843,11 @@
           imageUrl: editingProduct.imageUrl || '', // [商品圖片 v2.12.9]
           createdAt: editingProduct.createdAt || new Date().toISOString()
         };
+
+        // [v2.14.5] 手動新增商品且款號留空 → 自動編號 SKU-數字（編輯既有商品不動它的款號）
+        if (!editingProduct.id && !prodData.sku) {
+          prodData.sku = nextAutoSku(products, trashProducts.map(p => p.sku));
+        }
 
         // [V2.8] 款號不能跟別的商品重複（款號是訂單、熱銷統計對應商品的依據）
         const skuKey = prodData.sku.toUpperCase();
@@ -7385,6 +7471,7 @@
               existingOrders={orders}
               trashOrderNos={trashOrderNos}
               isSaving={isOrderImporting}
+              suggestedYear={orderImportSuggestedYear}
               onClose={() => { if (!isOrderImporting) { setIsOrderImportModalOpen(false); setOrderImportDrafts([]); } }}
               onConfirm={handleConfirmOrderImport}
             />
@@ -7713,6 +7800,18 @@
                         onChange={(e) => handleShippingFeeInput(Number(e.target.value))}
                         className="w-full text-xs sm:text-sm px-3 py-2 md:py-2.5 rounded-lg border border-slate-200 focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500 focus:outline-none"
                       />
+                    </div>
+
+                    <div>
+                      <label className="text-xs sm:text-sm font-medium text-slate-600 mb-1 block">訂單日期（補登舊單才需要改）</label>
+                      <input
+                        type="date"
+                        value={orderDate || toDateInputValue(Date.now())}
+                        max={toDateInputValue(Date.now())}
+                        onChange={(e) => setOrderDate(e.target.value === toDateInputValue(Date.now()) ? '' : e.target.value)}
+                        className={`w-full text-xs sm:text-sm px-3 py-2 md:py-2 rounded-lg border focus:outline-none ${orderDate ? 'border-amber-400 bg-amber-50' : 'border-slate-200'}`}
+                      />
+                      {orderDate && <p className="text-[11px] text-amber-700 mt-1">⚠️ 這張訂單的日期不是今天，會記成 {orderDate}。</p>}
                     </div>
 
                     <div>
