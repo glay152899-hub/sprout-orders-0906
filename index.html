@@ -59,7 +59,7 @@
     // ==========================================
     // config.js — 版本號 / Firebase設定 / 常數設定值
     // ==========================================
-    const APP_VERSION = '2.14.5';
+    const APP_VERSION = '2.14.7';
     document.title = `Sprout 📱 小豆苗訂單助手 V${APP_VERSION} (Firebase RTDB 實時同步版)`;
 
     const firebaseConfig = {
@@ -118,6 +118,8 @@
         { id: 'd_default_2pcs', enabled: true, minQty: 2, percent: 95, label: '滿兩件95折' }
       ],
       customLines: [],
+      customLinesStartDate: '', // [v2.14.7] 自訂優惠／備註行的活動期間；空白＝長期有效
+      customLinesEndDate: '',
       showSubtotalWhenNoDiscount: true
     };
 
@@ -889,7 +891,8 @@
       const base = new Date(nowMs);
       let d = base;
       const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(dateStr || ''));
-      if (m) {
+      // [v2.14.6] 不接受未來的日期（以真實的今天為準；欄位 max 只是提示，桌機可直接打字）
+      if (m && String(dateStr) <= toDateInputValue(Date.now())) {
         const y = Number(m[1]), mo = Number(m[2]), da = Number(m[3]);
         const c = new Date(y, mo - 1, da, base.getHours(), base.getMinutes(), base.getSeconds());
         if (c.getFullYear() === y && c.getMonth() === mo - 1 && c.getDate() === da) d = c;
@@ -918,6 +921,72 @@
     const suggestYearFromFileName = (fileName) => {
       const m = /(?:^|[^0-9])(20\d{2})(?:0[1-9]|1[0-2])(?![0-9])/.exec(String(fileName || ''));
       return m ? Number(m[1]) : null;
+    };
+
+    // [v2.14.6] 顧客姓名欄裡的 (IG:帳號)、(line:帳號) 拆成獨立欄位。
+    // 回傳 { name, ig, line, status }；status：
+    //   none（沒有標記，原樣）／split（正常拆出）／split_space（帳號含空白，視為 IG 顯示名稱，整段保留）／
+    //   split_nick（帳號含 / 或 ;，依「稱呼／帳號」規則拆出）／platform_only（只有標記沒帳號，標記拆掉）／
+    //   account_only（只有帳號沒有姓名）／ambiguous（寫法不明確，整欄原樣不拆）
+    const sheetNicknameOf = (sheetName) =>
+      String(sheetName || '').trim().replace(/^(?:20\d{2}\d{4}|1\d{2}\d{4}|\d{4})/, '').trim();
+
+    const splitCustomerNameAccounts = (rawName, sheetName = '') => {
+      const raw = String(rawName || '').trim();
+      const whole = (status) => ({ name: raw, ig: '', line: '', status });
+      if (!raw) return whole('none');
+      // [v2.14.7] 真實的「姓名＋標記」不會很長；過長的內容（例如誤貼大段文字）直接不處理，避免正規表示式變慢
+      if (raw.length > 200) return whole('none');
+      // [v2.14.7] 括號不成對（半形全形合計）→ 不處理，免得拆出殘缺的括號
+      const opens = (raw.match(/[(（]/g) || []).length;
+      const closes = (raw.match(/[)）]/g) || []).length;
+      if (opens !== closes) return whole(/[(（]\s*[:：]?\s*(?:ig|line)/i.test(raw) ? 'ambiguous' : 'none');
+      const GROUP = /[(（]\s*(ig|line)\s*(?:[:：]\s*([^()（）]*))?\s*[)）]/gi;
+      const groups = [...raw.matchAll(GROUP)];
+      const looksLikeMarker = /[(（]\s*[:：]?\s*(?:ig|line)/i.test(raw);
+      if (groups.length === 0) {
+        // 整格只有「IG:帳號」「line:帳號」（沒有括號、沒有姓名）→ 視為只有帳號
+        const bare = /^(ig|line)\s*[:：]\s*([^\s()（）:：][^()（）:：]*)$/i.exec(raw);
+        if (bare && !/[\/;；]/.test(bare[2])) {
+          const acct = bare[2].trim();
+          return bare[1].toLowerCase() === 'ig'
+            ? { name: '', ig: acct, line: '', status: 'account_only' }
+            : { name: '', ig: '', line: acct, status: 'account_only' };
+        }
+        return whole(looksLikeMarker ? 'ambiguous' : 'none'); // (line帳號) 沒冒號、括號不成對…
+      }
+      // 同一平台出現兩次 → 不拆
+      const platforms = groups.map(g => g[1].toLowerCase());
+      if (new Set(platforms).size !== platforms.length) return whole('ambiguous');
+      // 第一個標記之前＝姓名；標記之後除了其他標記與空白，不可再有文字（例如「棄單」「取消」）
+      const first = groups[0].index;
+      const tail = raw.slice(first).replace(GROUP, '').trim();
+      if (tail) return whole('ambiguous');
+      const nick = sheetNicknameOf(sheetName).toLowerCase().replace(/\s+/g, '');
+      const norm = (t) => String(t || '').toLowerCase().replace(/\s+/g, '');
+      let ig = '', line = '', status = 'split';
+      for (const g of groups) {
+        let acct = (g[2] || '').trim();
+        if (!acct) { if (status === 'split') status = 'platform_only'; continue; }
+        if (/[:：]/.test(acct)) return whole('ambiguous');                    // 冒號重複、前置冒號
+        if (/[\/;；]/.test(acct)) {                                            // 稱呼／帳號（B 類）
+          const parts = acct.split(/[\/;；]/);
+          const left = parts[0].trim();
+          const right = parts.slice(1).join('/').trim();
+          if (!nick) return whole('ambiguous');
+          if (norm(left) === nick) acct = right;
+          else if (norm(right) === nick) acct = left;
+          else return whole('ambiguous');
+          if (!acct || /[\/;；]/.test(acct)) return whole('ambiguous');
+          status = 'split_nick';
+        } else if (/\s/.test(acct) && status === 'split') {
+          status = 'split_space';                                              // 帳號含空白＝IG 顯示名稱，整段保留
+        }
+        if (g[1].toLowerCase() === 'ig') ig = acct; else line = acct;
+      }
+      const name = raw.slice(0, first).trim();
+      if (!name && !ig && !line) return whole('ambiguous');
+      return { name, ig, line, status: !name ? 'account_only' : status };
     };
 
     const ORDER_FIELD_LABELS = {
@@ -997,12 +1066,16 @@
 
     // 找「看起來重複」的訂單：簽章相同（同客人 + 同商品 + 同金額），或單號相同。
     // withinDays：只比對最近 N 天內的訂單（建立訂單時用，避免每週回購的客人一直被提醒）。
-    const findDuplicateOrder = (item, orders, withinDays = null, nowMs = Date.now()) => {
+    // [v2.14.7] twoWay：補登舊單時用雙向（訂單日期前後各 withinDays 天）；一般新增維持原本只看「過去」的行為
+    const findDuplicateOrder = (item, orders, withinDays = null, nowMs = Date.now(), twoWay = false) => {
       const sig = orderSignature(item);
       const orderNo = String(item.orderNo || '').trim();
       return (orders || []).find(o => {
         if (o.id === item.id) return false;
-        if (withinDays !== null && nowMs - (Number(o.timestamp) || 0) > withinDays * 86400000) return false;
+        if (withinDays !== null) {
+          const gap = nowMs - (Number(o.timestamp) || 0);
+          if ((twoWay ? Math.abs(gap) : gap) > withinDays * 86400000) return false;
+        }
         if (orderSignature(o) === sig) return true;
         return Boolean(orderNo) && String(o.orderNo || '').trim() === orderNo;
       }) || null;
@@ -1071,6 +1144,23 @@
     // ==========================================
     // 整理公版設定：資料庫完全沒有設定(null)時用預設值；已經存過的設定，缺的欄位不再補預設優惠規則
     // （Firebase 不會存空陣列，若刪光優惠規則後又被補回預設，使用者會以為刪不掉）
+    // [v2.14.7] 優惠活動期間：日期字串皆為 YYYY-MM-DD（本地日期）；空白＝不限。以「訂單自己的日期」判斷，
+    // 所以補登舊單、日後重新產生舊訂單的訊息，結果都跟當時的活動一致。
+    const normalizePromoDate = (v) => /^\d{4}-\d{2}-\d{2}$/.test(String(v || '')) ? String(v) : '';
+    const isDateInPromoRange = (dateStr, startDate, endDate) => {
+      if (startDate && dateStr < startDate) return false;
+      if (endDate && dateStr > endDate) return false;
+      return true;
+    };
+    // 給設定畫面看的狀態說明（相對於 todayStr）
+    const describePromoPeriod = (startDate, endDate, todayStr) => {
+      if (startDate && endDate && startDate > endDate) return { state: 'invalid', text: '⚠️ 結束日早於開始日，這條永遠不會套用' };
+      if (!startDate && !endDate) return { state: 'always', text: '⚠️ 長期有效（沒有設日期，要靠手動關閉）' };
+      if (startDate && todayStr < startDate) return { state: 'upcoming', text: `尚未開始（${startDate} 起）` };
+      if (endDate && todayStr > endDate) return { state: 'ended', text: `已結束（${endDate} 止）` };
+      return { state: 'active', text: `套用中${endDate ? `（到 ${endDate}）` : `（${startDate} 起，沒有結束日）`}` };
+    };
+
     const sanitizeMessageTemplate = (raw) => {
       const def = DEFAULT_MESSAGE_TEMPLATE;
       if (!raw || typeof raw !== 'object') {
@@ -1084,13 +1174,17 @@
           enabled: d.enabled !== false,
           minQty: Math.max(1, Math.floor(Number(d.minQty) || 1)),
           percent: Math.min(100, Math.max(0, Number(d.percent) || 0)),
-          label: String(d.label || '')
+          label: String(d.label || ''),
+          startDate: normalizePromoDate(d.startDate), // [v2.14.7]
+          endDate: normalizePromoDate(d.endDate)
         }));
       return {
         prefix: typeof raw.prefix === 'string' ? raw.prefix : def.prefix,
         suffix: typeof raw.suffix === 'string' ? raw.suffix : def.suffix,
         discounts,
         customLines: toArray(raw.customLines).map(x => String(x || '')).filter(x => x.trim()),
+        customLinesStartDate: normalizePromoDate(raw.customLinesStartDate), // [v2.14.7]
+        customLinesEndDate: normalizePromoDate(raw.customLinesEndDate),
         showSubtotalWhenNoDiscount: raw.showSubtotalWhenNoDiscount !== false
       };
     };
@@ -1118,11 +1212,15 @@
       const totalQty = goodsItems.reduce((s, it) => s + (Number(it.qty) || 1), 0);
       const adjustSum = adjustItems.reduce((s, it) => s + (Number(it.price) || 0) * (Number(it.qty) || 1), 0);
 
+      // [v2.14.7] 優惠依「訂單日期」自動套用：不在活動期間內的規則視同沒有
+      const orderDateStr = toDateInputValue(order?.timestamp) || toDateInputValue(Date.now());
+
       // 找出符合條件、折後金額最低的那條優惠規則
       let bestRule = null;
       let bestAmount = goodsSubtotal;
       t.discounts.forEach(d => {
         if (!d.enabled || d.percent <= 0 || d.percent >= 100) return;
+        if (!isDateInPromoRange(orderDateStr, d.startDate, d.endDate)) return;
         if (totalQty < d.minQty) return;
         const amount = Math.round(goodsSubtotal * d.percent / 100);
         if (amount < bestAmount) { bestAmount = amount; bestRule = d; }
@@ -1135,7 +1233,9 @@
         middle.push(`商品金額${goodsSubtotal}`);
       }
       if (adjustSum !== 0) middle.push(`其他調整${adjustSum}`);
-      t.customLines.forEach(line => middle.push(fill(line)));
+      if (isDateInPromoRange(orderDateStr, t.customLinesStartDate, t.customLinesEndDate)) {
+        t.customLines.forEach(line => middle.push(fill(line)));
+      }
 
       const fee = Number(order?.shippingFee) || 0;
       const feeLabel = order?.deliveryMethod === '宅配到府' ? '宅配運費' : '賣貨便運費';
@@ -1428,6 +1528,8 @@
 
         let customerName = '';
         let customerPhone = '';
+        let customerIgLabel = '';   // [v2.14.6] 整理小工具標準格式的「IG：」「LINE：」標籤欄
+        let customerLineLabel = '';
         let shippingMethod = '7-11';
         let storeAddress = '';
         let shippingFee = defaultShippingFee;
@@ -1442,6 +1544,15 @@
               const nameMatch = cell.match(/(?:顧客姓名|收件人)\s*[:：]\s*(.*)/);
               if (nameMatch && nameMatch[1]) customerName = nameMatch[1].trim();
               else if (row[c + 1]) customerName = String(row[c + 1]).trim();
+            }
+            // [v2.14.6] 標籤必須是整格「IG：xxx」「LINE：xxx」或單獨的「IG」「LINE」（值在右邊格），避免誤抓商品名（例如 LINE FRIENDS）
+            const platformLabel = /^(IG|LINE)\s*[:：]\s*(.*)$/i.exec(cell) || /^(IG|LINE)$/i.exec(cell);
+            if (platformLabel) {
+              let val = (platformLabel[2] !== undefined && platformLabel[2] !== '') ? platformLabel[2].trim() : (row[c + 1] ? String(row[c + 1]).trim() : '');
+              if (platformLabel[2] === undefined || platformLabel[2] === '') {
+                if (/[:：]/.test(val)) val = ''; // [v2.14.7] 右邊格本身是另一個標籤（例如「LINE：xyz」「手機：09…」）→ 不是這個欄位的值
+              }
+              if (platformLabel[1].toUpperCase() === 'IG') customerIgLabel = val; else customerLineLabel = val;
             }
             if (cell.includes('手機') || cell.includes('電話')) {
               const phoneMatch = cell.match(/(?:手機|電話)\s*[:：]\s*(.*)/);
@@ -1462,6 +1573,11 @@
         customerName = cleanExcelPlaceholder(customerName);
         customerPhone = cleanExcelPlaceholder(customerPhone);
         storeAddress = cleanExcelPlaceholder(storeAddress);
+        // [v2.14.6] 姓名裡的 (IG:…)／(line:…) 拆成獨立欄位；標籤欄（若有）優先於姓名裡拆出的值
+        const nameSplit = splitCustomerNameAccounts(customerName, cleanedSheetName);
+        customerName = nameSplit.name;
+        const customerIg = cleanExcelPlaceholder(customerIgLabel) || nameSplit.ig;
+        const customerLine = cleanExcelPlaceholder(customerLineLabel) || nameSplit.line;
         if (!customerName) customerName = cleanedSheetName;
 
         // 2. 尋找商品表頭列 (品項, 金額, 數量)
@@ -1578,6 +1694,8 @@
             orderNo: cleanedSheetName,
             customerName,
             customerPhone,
+            customerIg,
+            customerLine,
             deliveryMethod: mapImportedDelivery(shippingMethod),
             storeName: storeAddress,
             shippingFee: draftShipping,
@@ -1972,6 +2090,8 @@
         if (!form.customerName.trim()) { setError('請輸入顧客姓名'); return; }
         if (form.items.length === 0) { setError('請至少保留一項商品'); return; }
         if (form.items.some(i => !String(i.name || '').trim())) { setError('商品名稱不可空白'); return; }
+        // [v2.14.7] 只在日期「被改動」時才檢查，原本就是未來日期的舊訂單仍可只改其他欄位
+        if (form.orderDate && form.orderDate !== initialOrderDate.current && form.orderDate > todayStr) { setError('訂單日期不能是未來的日期'); return; }
 
         const edited = {
           orderNo: form.orderNo.trim(),
@@ -2357,6 +2477,12 @@
                     <div className="flex-1 min-w-0">
                       <div className="flex flex-wrap items-center gap-1.5">
                         <span className="font-bold text-slate-800">{r.d.customerName}</span>
+                      {(r.d.customerIg || r.d.customerLine) && (
+                        <span className="ml-1.5 text-[11px] font-normal text-slate-500">{r.d.customerIg ? `IG：${r.d.customerIg}` : ''}{r.d.customerIg && r.d.customerLine ? '　' : ''}{r.d.customerLine ? `LINE：${r.d.customerLine}` : ''}</span>
+                      )}
+                      {splitCustomerNameAccounts(r.d.customerName, r.d.orderNo).status === 'ambiguous' && (
+                        <span className="ml-1.5 text-[11px] font-normal text-amber-600">⚠️ 姓名含 IG／LINE 標記，未自動拆分</span>
+                      )}
                         <span className="text-[11px] bg-slate-100 text-slate-600 px-2 py-0.5 rounded-md font-mono">📄 {r.d.orderNo}</span>
                         {r.isDuplicate && <span className="text-[11px] bg-amber-100 text-amber-800 px-2 py-0.5 rounded-full font-bold">單號已存在</span>}
                         {r.similar && <span className="text-[11px] bg-amber-100 text-amber-800 px-2 py-0.5 rounded-full font-bold">疑似已存在（{formatOrderStamp(r.similar)} 建立）</span>}
@@ -3284,9 +3410,12 @@
 
     function MessageTemplateModal({ template, onSave, onClose, isSaving }) {
       const [form, setForm] = React.useState(() => sanitizeMessageTemplate(template));
+      const todayStr = toDateInputValue(Date.now());
+      const [previewDate, setPreviewDate] = React.useState(todayStr); // [v2.14.7] 預覽用的「訂單日期」（可選未來，看活動還沒開始時的樣子）
 
       // 預覽用的範例訂單（不是真的訂單）
       const sampleOrder = {
+        timestamp: new Date(`${previewDate || todayStr}T12:00:00`).getTime(),
         customerName: '王小美',
         deliveryMethod: '7-11 取貨付款',
         shippingFee: 38,
@@ -3302,7 +3431,7 @@
       }));
       const addRule = () => setForm(prev => ({
         ...prev,
-        discounts: [...prev.discounts, { id: `d_${Date.now()}`, enabled: true, minQty: 2, percent: 95, label: '滿2件95折' }]
+        discounts: [...prev.discounts, { id: `d_${Date.now()}`, enabled: true, minQty: 2, percent: 95, label: '滿2件95折', startDate: '', endDate: '' }]
       }));
       const removeRule = (id) => setForm(prev => ({ ...prev, discounts: prev.discounts.filter(d => d.id !== id) }));
 
@@ -3348,10 +3477,21 @@
                         <button type="button" onClick={() => removeRule(d.id)} className="ml-auto text-slate-400 hover:text-red-600 p-1"><IconTrash2 size={15} /></button>
                       </div>
                       <input type="text" value={d.label} onChange={(e) => updateRule(d.id, { label: e.target.value })} className={inputCls} placeholder="訊息顯示文字，例如：滿兩件95折" />
+                      <div className="flex items-center gap-1.5 text-[11px] text-slate-500">
+                        <span className="shrink-0">活動期間</span>
+                        <input type="date" value={d.startDate || ''} onChange={(e) => updateRule(d.id, { startDate: e.target.value })} className="flex-1 min-w-0 text-xs px-2 py-1 rounded-lg border border-slate-200" />
+                        <span>～</span>
+                        <input type="date" value={d.endDate || ''} onChange={(e) => updateRule(d.id, { endDate: e.target.value })} className="flex-1 min-w-0 text-xs px-2 py-1 rounded-lg border border-slate-200" />
+                      </div>
+                      {(() => {
+                        const info = describePromoPeriod(d.startDate, d.endDate, todayStr);
+                        const cls = info.state === 'active' ? 'text-emerald-700' : info.state === 'upcoming' ? 'text-sky-700' : info.state === 'ended' ? 'text-slate-400' : 'text-amber-700';
+                        return <p className={`text-[11px] ${cls}`}>{d.enabled ? '' : '（已停用）'}{info.text}</p>;
+                      })()}
                     </div>
                   ))}
                 </div>
-                <p className="text-[11px] text-slate-400 mt-1.5">折數填 95 代表 95 折（原價 ×0.95）。多條規則同時符合時，只套用折後最便宜的那一條。優惠只影響訊息顯示，不會改動訂單本身的金額。</p>
+                <p className="text-[11px] text-slate-400 mt-1.5">折數填 95 代表 95 折（原價 ×0.95）。多條規則同時符合時，只套用折後最便宜的那一條。優惠只影響訊息顯示，不會改動訂單本身的金額。<b>優惠依「訂單日期」判斷：訂單日期落在活動期間內才會套用</b>，不用再手動關閉；日期都留空＝長期有效。</p>
               </div>
 
               <div>
@@ -3363,6 +3503,17 @@
                   className={inputCls}
                   placeholder="例如：本週加購小物85折"
                 />
+                <div className="flex items-center gap-1.5 text-[11px] text-slate-500 mt-1.5">
+                  <span className="shrink-0">這幾行的活動期間</span>
+                  <input type="date" value={form.customLinesStartDate || ''} onChange={(e) => setField('customLinesStartDate', e.target.value)} className="flex-1 min-w-0 text-xs px-2 py-1 rounded-lg border border-slate-200" />
+                  <span>～</span>
+                  <input type="date" value={form.customLinesEndDate || ''} onChange={(e) => setField('customLinesEndDate', e.target.value)} className="flex-1 min-w-0 text-xs px-2 py-1 rounded-lg border border-slate-200" />
+                </div>
+                {form.customLines.some(x => String(x).trim()) && (() => {
+                  const info = describePromoPeriod(form.customLinesStartDate, form.customLinesEndDate, todayStr);
+                  const cls = info.state === 'active' ? 'text-emerald-700' : info.state === 'upcoming' ? 'text-sky-700' : info.state === 'ended' ? 'text-slate-400' : 'text-amber-700';
+                  return <p className={`text-[11px] mt-1 ${cls}`}>{info.text}</p>;
+                })()}
                 <label className="flex items-center gap-2 mt-2 text-xs text-slate-600">
                   <input type="checkbox" checked={form.showSubtotalWhenNoDiscount} onChange={(e) => setField('showSubtotalWhenNoDiscount', e.target.checked)} className="w-4 h-4 accent-emerald-600" />
                   沒有符合優惠時，仍顯示「商品金額」一行
@@ -3377,6 +3528,10 @@
 
               <div>
                 <label className="text-xs font-semibold text-slate-600 mb-1 block">預覽（範例訂單）</label>
+                <div className="flex items-center gap-2 mb-1.5 text-[11px] text-slate-500">
+                  <span className="shrink-0">假設訂單日期</span>
+                  <input type="date" value={previewDate} onChange={(e) => setPreviewDate(e.target.value)} className="flex-1 min-w-0 text-xs px-2 py-1 rounded-lg border border-slate-200" />
+                </div>
                 <pre className="text-xs leading-relaxed whitespace-pre-wrap bg-slate-50 border border-slate-200 rounded-xl p-3 text-slate-700">{buildOrderMessage(sampleOrder, form)}</pre>
               </div>
             </div>
@@ -6140,9 +6295,10 @@
         };
 
         // 最近 3 天內已經有看起來相同的訂單（同客人、同商品、同金額）→ 先提醒，由使用者決定
-        const dup = findDuplicateOrder({ ...newOrderObj, id: orderKey }, orders, 3);
+        // [v2.14.6/7] 補登舊單（有選日期）：以訂單自己的日期、前後各 3 天比對；一般新增維持「最近 3 天內」
+        const dup = findDuplicateOrder({ ...newOrderObj, id: orderKey }, orders, 3, newOrderObj.timestamp, Boolean(orderDate));
         if (dup && !window.confirm(
-          `最近 3 天內已經有一筆看起來相同的訂單：\n${dup.customerName}　$${calcOrderTotal(dup)}　${formatOrderStamp(dup)} 建立\n\n仍要建立這一筆嗎？`
+          `${orderDate ? '這個訂單日期前後 3 天內' : '最近 3 天內'}已經有一筆看起來相同的訂單：\n${dup.customerName}　$${calcOrderTotal(dup)}　${formatOrderStamp(dup)} 建立\n\n仍要建立這一筆嗎？`
         )) {
           return;
         }
@@ -7808,7 +7964,7 @@
                         type="date"
                         value={orderDate || toDateInputValue(Date.now())}
                         max={toDateInputValue(Date.now())}
-                        onChange={(e) => setOrderDate(e.target.value === toDateInputValue(Date.now()) ? '' : e.target.value)}
+                        onChange={(e) => { const v = e.target.value; setOrderDate(v === toDateInputValue(Date.now()) || v > toDateInputValue(Date.now()) ? '' : v); }} /* [v2.14.6] 選今天或未來日期 → 視為今天 */
                         className={`w-full text-xs sm:text-sm px-3 py-2 md:py-2 rounded-lg border focus:outline-none ${orderDate ? 'border-amber-400 bg-amber-50' : 'border-slate-200'}`}
                       />
                       {orderDate && <p className="text-[11px] text-amber-700 mt-1">⚠️ 這張訂單的日期不是今天，會記成 {orderDate}。</p>}
