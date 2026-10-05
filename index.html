@@ -59,7 +59,7 @@
     // ==========================================
     // config.js — 版本號 / Firebase設定 / 常數設定值
     // ==========================================
-    const APP_VERSION = '2.14.7';
+    const APP_VERSION = '2.14.8';
     document.title = `Sprout 📱 小豆苗訂單助手 V${APP_VERSION} (Firebase RTDB 實時同步版)`;
 
     const firebaseConfig = {
@@ -1550,7 +1550,9 @@
             if (platformLabel) {
               let val = (platformLabel[2] !== undefined && platformLabel[2] !== '') ? platformLabel[2].trim() : (row[c + 1] ? String(row[c + 1]).trim() : '');
               if (platformLabel[2] === undefined || platformLabel[2] === '') {
-                if (/[:：]/.test(val)) val = ''; // [v2.14.7] 右邊格本身是另一個標籤（例如「LINE：xyz」「手機：09…」）→ 不是這個欄位的值
+                // [v2.14.8] 右邊格若本身是另一個欄位的標籤（例如「LINE：xyz」「手機：09…」）→ 不是這個欄位的值；
+                // 用標籤白名單判斷，這樣貼了 IG 連結、含冒號的值（https://…）也不會被誤丟
+                if (/^(?:(?:IG|LINE|手機|電話|顧客姓名|收件人|姓名|地址|取貨|運費|總計|品項|備註)|[^\s:：]{0,8}(?:門市|店家|賣貨便))\s*[:：]/i.test(val)) val = ''; // 後半＝任何以 門市／店家／賣貨便 結尾的標籤（7-11門市、取件門市、到貨店家…）；此正規表示式由 B 帳號驗證
               }
               if (platformLabel[1].toUpperCase() === 'IG') customerIgLabel = val; else customerLineLabel = val;
             }
@@ -3356,6 +3358,16 @@
     function OrderMessageModal({ order, template, onClose, showToast }) {
       const [text, setText] = React.useState(() => buildOrderMessage(order, template));
       const [copied, setCopied] = React.useState(false);
+      // [v2.14.8] 這則訊息若帶出了「沒設活動期間」的長期優惠，提醒使用者（避免活動結束後忘了關，一直帶優惠）
+      const undatedPromoNames = React.useMemo(() => {
+        const t = sanitizeMessageTemplate(template);
+        const base = buildOrderMessage(order, template);
+        const names = t.discounts
+          .filter(d => d.enabled && d.percent > 0 && d.percent < 100 && !d.startDate && !d.endDate && d.label && base.includes(d.label))
+          .map(d => d.label);
+        const lines = t.customLines.map(x => String(x).trim()).filter(x => x && !x.includes('{') && !t.customLinesStartDate && !t.customLinesEndDate && base.includes(x));
+        return [...names, ...lines.map(x => `自訂行「${x.length > 12 ? x.slice(0, 12) + '…' : x}」`)];
+      }, [order, template]);
 
       const handleCopy = async () => {
         const ok = await copyTextToClipboard(text);
@@ -3380,6 +3392,11 @@
               </button>
             </div>
             <div className="flex-1 overflow-y-auto p-5 space-y-3">
+              {undatedPromoNames.length > 0 && (
+                <div className="text-[12px] leading-snug text-amber-800 bg-amber-50 border border-amber-200 rounded-xl px-3 py-2">
+                  ⚠️ 這則訊息帶出了沒設活動期間的長期優惠：{undatedPromoNames.join('、')}。如果活動已經結束，請到「更多 → 編輯公版訊息」設定日期或關閉，才不會之後的訊息一直帶優惠。
+                </div>
+              )}
               <textarea
                 value={text}
                 onChange={(e) => { setText(e.target.value); setCopied(false); }}
@@ -3485,8 +3502,10 @@
                       </div>
                       {(() => {
                         const info = describePromoPeriod(d.startDate, d.endDate, todayStr);
+                        // [v2.14.8] 停用的規則一律灰色只顯示「已停用」，避免與「套用中」並列的矛盾文字
+                        if (!d.enabled) return <p className="text-[11px] text-slate-400">已停用（不會套用）</p>;
                         const cls = info.state === 'active' ? 'text-emerald-700' : info.state === 'upcoming' ? 'text-sky-700' : info.state === 'ended' ? 'text-slate-400' : 'text-amber-700';
-                        return <p className={`text-[11px] ${cls}`}>{d.enabled ? '' : '（已停用）'}{info.text}</p>;
+                        return <p className={`text-[11px] ${cls}`}>{info.text}</p>;
                       })()}
                     </div>
                   ))}
