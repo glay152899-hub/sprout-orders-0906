@@ -59,7 +59,7 @@
     // ==========================================
     // config.js — 版本號 / Firebase設定 / 常數設定值
     // ==========================================
-    const APP_VERSION = '2.14.8';
+    const APP_VERSION = '2.14.9';
     document.title = `Sprout 📱 小豆苗訂單助手 V${APP_VERSION} (Firebase RTDB 實時同步版)`;
 
     const firebaseConfig = {
@@ -471,6 +471,11 @@
     }
   </script>
   <script type="text/babel">
+    // ==========================================
+    // utils-core.js  (v2.14.9 Phase 3，由 utils.js 原樣搬出)
+    // 基礎工具：日期格式與日期選擇器轉換、訂單時間戳產生、複製到剪貼簿、圖片壓縮
+    // 只搬位置，不改內容；各檔案共用全域（見 index.html 的載入順序）
+    // ==========================================
 
     // ==========================================
     // Helper Functions & Data Sanitizers
@@ -481,6 +486,334 @@
       if (isNaN(d.getTime())) return '無紀錄';
       return `${d.getFullYear()}/${String(d.getMonth() + 1).padStart(2, '0')}/${String(d.getDate()).padStart(2, '0')}`;
     };
+
+    // ==========================================
+    // [V2.7] 回收桶 + 操作日誌 共用工具
+    // ==========================================
+    // [v2.14.5] 訂單日期：日期選擇器用的 YYYY-MM-DD（本地時間）
+    const toDateInputValue = (ts) => {
+      const d = new Date(ts);
+      if (ts === null || ts === undefined || ts === '' || isNaN(d.getTime())) return '';
+      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    };
+
+    // [v2.14.5] 依使用者選的日期（YYYY-MM-DD）產生訂單的 timestamp 與 createdAt（顯示用文字）。
+    // 時間點取 nowMs 的「時:分:秒」（新增訂單＝現在；編輯舊訂單＝該訂單原本的時間點，只改日期不改時間）。
+    // 日期空白或不合法 → 直接用 nowMs。
+    const buildOrderStamp = (dateStr, nowMs = Date.now()) => {
+      const base = new Date(nowMs);
+      let d = base;
+      const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(dateStr || ''));
+      // [v2.14.6] 不接受未來的日期（以真實的今天為準；欄位 max 只是提示，桌機可直接打字）
+      if (m && String(dateStr) <= toDateInputValue(Date.now())) {
+        const y = Number(m[1]), mo = Number(m[2]), da = Number(m[3]);
+        const c = new Date(y, mo - 1, da, base.getHours(), base.getMinutes(), base.getSeconds());
+        if (c.getFullYear() === y && c.getMonth() === mo - 1 && c.getDate() === da) d = c;
+      }
+      return { timestamp: d.getTime(), createdAt: d.toLocaleString('zh-TW', { hour12: false }) };
+    };
+
+    // 複製文字到剪貼簿：優先用新API，LINE 內建瀏覽器等不支援時退回舊方法。回傳 true/false。
+    const copyTextToClipboard = async (text) => {
+      try {
+        if (navigator.clipboard && window.isSecureContext) {
+          await navigator.clipboard.writeText(text);
+          return true;
+        }
+      } catch (err) { /* 往下走舊方法 */ }
+      try {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.setAttribute('readonly', '');
+        ta.style.position = 'fixed';
+        ta.style.top = '-1000px';
+        document.body.appendChild(ta);
+        ta.select();
+        ta.setSelectionRange(0, text.length);
+        const ok = document.execCommand('copy');
+        document.body.removeChild(ta);
+        return ok;
+      } catch (err) {
+        return false;
+      }
+    };
+
+    // ==========================================
+    // [商品圖片 v2.12.9] 上傳前壓縮（純函式，用Canvas等比例縮小+轉JPEG，不依賴任何外部狀態）
+    // ==========================================
+    const compressImageFile = (file, maxDimension = PRODUCT_IMAGE_MAX_DIMENSION, quality = PRODUCT_IMAGE_JPEG_QUALITY) => {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = (e) => {
+          const img = new Image();
+          img.onload = () => {
+            let { width, height } = img;
+            if (width > maxDimension || height > maxDimension) {
+              if (width > height) {
+                height = Math.round(height * (maxDimension / width));
+                width = maxDimension;
+              } else {
+                width = Math.round(width * (maxDimension / height));
+                height = maxDimension;
+              }
+            }
+            const canvas = document.createElement('canvas');
+            canvas.width = width;
+            canvas.height = height;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(img, 0, 0, width, height);
+            canvas.toBlob((blob) => {
+              if (blob) resolve(blob);
+              else reject(new Error('圖片壓縮失敗，請換一張圖片再試一次'));
+            }, 'image/jpeg', quality);
+          };
+          img.onerror = () => reject(new Error('圖片讀取失敗，請確認檔案格式是否正確'));
+          img.src = e.target.result;
+        };
+        reader.onerror = () => reject(new Error('檔案讀取失敗'));
+        reader.readAsDataURL(file);
+      });
+    };
+  </script>
+  <script type="text/babel">
+    // ==========================================
+    // utils-order.js  (v2.14.9 Phase 3，由 utils.js 原樣搬出)
+    // 訂單相關：資料清理(sanitize)、金額計算、門市顯示、操作日誌格式、重複訂單判斷、訂單時間顯示
+    // 只搬位置，不改內容；各檔案共用全域（見 index.html 的載入順序）
+    // ==========================================
+
+    const sanitizeItem = (item) => ({
+      id: item?.id || `item_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`,
+      sku: item?.sku || '',
+      name: item?.name || '未命名商品',
+      color: item?.color || '',
+      size: item?.size || 'F',
+      price: Number(item?.price) || 0,
+      qty: Number(item?.qty) || 1
+    });
+
+    const sanitizeOrder = (order) => ({
+      id: order?.id || `ORD${Date.now()}`,
+      orderNo: order?.orderNo || '', // [V2.1] 選填：Excel 匯入時帶入工作表名稱 (例如 0901林 涔)
+      customerName: order?.customerName || '顧客',
+      customerPhone: order?.customerPhone || '',
+      customerLine: order?.customerLine || '', // [V2.11] 客人的 LINE ID / 暱稱（只能用 LINE 聯絡的客人）
+      customerIg: order?.customerIg || '',     // [V2.11] 客人的 IG 帳號
+      deliveryMethod: order?.deliveryMethod || '7-11 取貨付款',
+      storeName: order?.storeName || '', // 門市名稱（宅配到府時通常留空）
+      storeAddress: order?.storeAddress || '', // [v2.13.0新增] 地址：門市地址（選填）或宅配到府的完整地址
+      shippingFee: Number(order?.shippingFee) ?? 60,
+      paymentStatus: Boolean(order?.paymentStatus),
+      shipmentStatus: order?.shipmentStatus || 'unshipped',
+      items: Array.isArray(order?.items) ? order.items.map(sanitizeItem) : [],
+      note: order?.note || '',
+      createdAt: order?.createdAt || new Date().toLocaleString('zh-TW', { hour12: false }),
+      timestamp: order?.timestamp || Date.now()
+    });
+
+    // 讀進來的設定可能缺欄位（例如剛升級、資料庫還是舊格式），一律補上預設值
+    const sanitizeShippingConfig = (raw) => {
+      const fees = { ...DEFAULT_SHIPPING_CONFIG.fees };
+      DELIVERY_METHODS.forEach(({ key }) => {
+        const v = raw?.fees?.[key];
+        if (Number.isFinite(Number(v)) && Number(v) >= 0) fees[key] = Number(v);
+      });
+      return {
+        fees,
+        freeShippingEnabled: raw?.freeShippingEnabled !== undefined ? Boolean(raw.freeShippingEnabled) : DEFAULT_SHIPPING_CONFIG.freeShippingEnabled,
+        freeShippingThreshold: Number.isFinite(Number(raw?.freeShippingThreshold)) ? Number(raw.freeShippingThreshold) : DEFAULT_SHIPPING_CONFIG.freeShippingThreshold
+      };
+    };
+
+    // 依物流方式與目前小計，算出建議運費（滿額免運時回傳 0）
+    const suggestShippingFee = (deliveryMethod, subtotal, config) => {
+      if (config.freeShippingEnabled && subtotal >= config.freeShippingThreshold) return 0;
+      return config.fees[deliveryMethod] ?? 0;
+    };
+
+    // （ADJUSTMENT_SKU 已搬到 config.js）
+    const isAdjustmentItem = (item) => Number(item?.price) < 0 || item?.sku === ADJUSTMENT_SKU;
+
+    const calcOrderSubtotal = (order) =>
+      (order?.items || []).reduce((sum, i) => sum + (Number(i.price) || 0) * (Number(i.qty) || 0), 0);
+
+    // 統一四捨五入成整數，避免小數單價造成 99.99999 之類的顯示
+    const calcOrderTotal = (order) =>
+      Math.round(calcOrderSubtotal(order) + (Number(order?.shippingFee) || 0));
+
+    // ==========================================
+    // [v2.13.0] 門市名稱／地址 拆分顯示（含舊資料相容）
+    // 背景：v2.13.0 之前 storeName 是「門市名稱」跟「地址」黏在同一欄的舊格式，
+    // 新訂單會分別存進 storeName／storeAddress 兩個欄位，但舊訂單只有合併過的 storeName、
+    // 沒有 storeAddress。這兩個函式讓畫面顯示時，新舊資料都能得到合理的結果，
+    // 不需要另外跑一次資料庫遷移。
+    // ==========================================
+    // 拆解出 { name, address }：
+    // - 新格式（storeAddress 有值）→ 直接回傳兩個欄位
+    // - 舊格式（storeAddress 是空的）→ 嘗試從 storeName 裡挖出「門市名稱 (地址)」的括號寫法；
+    //   沒有括號的話，宅配到府視為地址，其餘（超商取貨）視為門市名稱，跟舊版單一欄位的語意一致
+    const deriveStoreDisplay = (order) => {
+      const rawName = String(order?.storeName || '').trim();
+      const rawAddr = String(order?.storeAddress || '').trim();
+      if (rawAddr) return { name: rawName, address: rawAddr };
+      if (!rawName) return { name: '', address: '' };
+      const bracketMatch = rawName.match(/^(.*?)[\s]*[（(]([^）)]+)[）)]\s*$/);
+      if (bracketMatch) {
+        return { name: bracketMatch[1].trim(), address: bracketMatch[2].trim() };
+      }
+      if (order?.deliveryMethod === '宅配到府') return { name: '', address: rawName };
+      return { name: rawName, address: '' };
+    };
+
+    // 合併成單行顯示用的文字，例如「世貿門市／台北市信義區信義路五段5號1樓」
+    const formatStoreLine = (order) => {
+      const { name, address } = deriveStoreDisplay(order);
+      if (name && address) return `${name}／${address}`;
+      return name || address || '';
+    };
+
+    const ORDER_FIELD_LABELS = {
+      orderNo: '單號',
+      customerName: '姓名',
+      customerPhone: '電話',
+      customerLine: 'LINE',
+      customerIg: 'IG',
+      timestamp: '訂單日期',            // [v2.14.5新增]
+      createdAt: '訂單日期（顯示用）',  // [v2.14.5新增] 與 timestamp 一起改，日誌只顯示一次
+      deliveryMethod: '物流方式',
+      storeName: '門市名稱',
+      storeAddress: '地址', // [v2.13.0新增]
+      shippingFee: '運費',
+      paymentStatus: '付款狀態',
+      shipmentStatus: '出貨狀態',
+      note: '備註',
+      items: '商品明細'
+    };
+
+    const formatLogTime = (ts) => {
+      const d = new Date(Number(ts));
+      if (isNaN(d.getTime())) return '';
+      const pad = (n) => String(n).padStart(2, '0');
+      return `${d.getMonth() + 1}/${d.getDate()} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    };
+
+    const shortUser = (email) => String(email || '').split('@')[0] || '（未知）';
+
+    const formatLogValue = (key, value) => {
+      if (key === 'timestamp') return toDateInputValue(value) || String(value);
+      if (key === 'paymentStatus') return value ? '已付款' : '未付款';
+      if (key === 'shipmentStatus') return value === 'shipped' ? '已出貨' : '待出貨';
+      if (value === '' || value === null || value === undefined) return '（空）';
+      return String(value);
+    };
+
+    // 把「編輯訂單」日誌的 before / after 轉成一行看得懂的文字（商品明細只說有修改）
+    const describeEditDiff = (entry) => {
+      if (!entry?.before || !entry?.after) return '';
+      return Object.keys(entry.after).filter(key => !(key === 'createdAt' && 'timestamp' in entry.after)).map(key => {
+        if (key === 'items') return '商品明細已修改';
+        return `${ORDER_FIELD_LABELS[key] || key}：${formatLogValue(key, entry.before[key])} → ${formatLogValue(key, entry.after[key])}`;
+      }).join('；');
+    };
+
+    // [V2.7.2] 訂單時間戳記：Excel 匯入的訂單時間是我們固定填的「中午 12 點」（沒有真實時間），
+    // 只有在程式裡建立的訂單才有真實時間，所以匯入的訂單只顯示日期。
+    const isSyntheticNoonTs = (ts) => {
+      const d = new Date(Number(ts));
+      if (isNaN(d.getTime())) return true;
+      const noon = new Date(d.getFullYear(), d.getMonth(), d.getDate(), 12, 0, 0, 0).getTime();
+      return Math.abs(d.getTime() - noon) <= 5000; // 匯入時為了維持順序會差幾毫秒
+    };
+
+    const formatOrderTimeShort = (ts) => {
+      if (isSyntheticNoonTs(ts)) return '';
+      const d = new Date(Number(ts));
+      return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+    };
+
+    // 例如「9/21 14:32」；匯入的訂單只有「9/16」
+    const formatOrderStamp = (order) => {
+      const date = formatOrderDateShort(order?.createdAt);
+      const time = formatOrderTimeShort(order?.timestamp);
+      return time ? `${date} ${time}` : date;
+    };
+
+    // 「相同訂單」：同一位客人、同樣的商品明細、同樣的總金額
+    const orderSignature = (o) => {
+      const items = (o.items || [])
+        .map(i => `${String(i.name || '').trim()}|${i.color || ''}|${i.size || ''}|${Number(i.price) || 0}|${Number(i.qty) || 0}`)
+        .sort()
+        .join(';');
+      return `${String(o.customerName || '').trim()}#${calcOrderTotal(o)}#${items}`;
+    };
+
+    // 找「看起來重複」的訂單：簽章相同（同客人 + 同商品 + 同金額），或單號相同。
+    // withinDays：只比對最近 N 天內的訂單（建立訂單時用，避免每週回購的客人一直被提醒）。
+    // [v2.14.7] twoWay：補登舊單時用雙向（訂單日期前後各 withinDays 天）；一般新增維持原本只看「過去」的行為
+    const findDuplicateOrder = (item, orders, withinDays = null, nowMs = Date.now(), twoWay = false) => {
+      const sig = orderSignature(item);
+      const orderNo = String(item.orderNo || '').trim();
+      return (orders || []).find(o => {
+        if (o.id === item.id) return false;
+        if (withinDays !== null) {
+          const gap = nowMs - (Number(o.timestamp) || 0);
+          if ((twoWay ? Math.abs(gap) : gap) > withinDays * 86400000) return false;
+        }
+        if (orderSignature(o) === sig) return true;
+        return Boolean(orderNo) && String(o.orderNo || '').trim() === orderNo;
+      }) || null;
+    };
+
+    // [V2.6.3] 單號若只是「日期 + 姓名」（例如 0914王振婷），跟卡片上已有的日期、姓名重複，展開時就不再顯示
+    const isOrderNoRedundant = (order) => {
+      const no = String(order?.orderNo || '');
+      if (!/^\d{4}/.test(no)) return false;
+      const d = new Date(order.timestamp);
+      if (isNaN(d.getTime())) return false;
+      const mm = String(d.getMonth() + 1).padStart(2, '0');
+      const dd = String(d.getDate()).padStart(2, '0');
+      // [v2.14.4] 單號開頭可能是 YYYYMMDD（8碼）、民國 YYYMMDD（7碼）或舊的 MMDD（4碼）；
+      // 開頭日期與訂單日期一致時，單號的日期部分只是重複資訊，卡片上不必再顯示一次
+      if (no.startsWith(`${d.getFullYear()}${mm}${dd}`)) return true;
+      if (no.startsWith(`${d.getFullYear() - 1911}${mm}${dd}`)) return true;
+      return no.slice(0, 4) === `${mm}${dd}`;
+    };
+
+    // [V2.6.2] 訂單卡片上的簡短日期：今年的訂單只顯示「9/16」，其他年份顯示完整日期
+    const formatOrderDateShort = (createdAt) => {
+      const datePart = String(createdAt || '').split(' ')[0];
+      const parts = datePart.split('/');
+      if (parts.length === 3 && Number(parts[0]) === new Date().getFullYear()) return `${parts[1]}/${parts[2]}`;
+      return datePart;
+    };
+
+    // [V2.6] 訂單日期篩選：把時間戳轉成「本地日期」YYYY-MM-DD
+    const toDateKey = (ts) => {
+      const d = new Date(ts);
+      if (isNaN(d.getTime())) return '';
+      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    };
+
+    const formatDateChipLabel = (key, nowMs = Date.now()) => {
+      if (key === toDateKey(nowMs)) return '今天';
+      if (key === toDateKey(nowMs - 86400000)) return '昨天';
+      const [, m, d] = key.split('-');
+      return `${Number(m)}/${Number(d)}`;
+    };
+
+    // ==========================================
+    // [V2.4] 新增訂單「快速帶入」：近期熱銷自動排序
+    // 不去猜「檔期」，改用時間衰減：越近的訂單權重越高（每過 N 天減半），
+    // 所以這一檔的明星商品會自動浮上來、上一檔的舊明星商品自然沉下去。
+    // ==========================================
+    // （QUICK_PICK_* 常數 已搬到 config.js）
+  </script>
+  <script type="text/babel">
+    // ==========================================
+    // utils-product.js  (v2.14.9 Phase 3，由 utils.js 原樣搬出)
+    // 商品相關：商品資料清理與匯入、款號、滯銷判斷、相似商品比對、快速挑選排序
+    // 只搬位置，不改內容；各檔案共用全域（見 index.html 的載入順序）
+    // ==========================================
 
     const inferCategoryFromTitle = (title, currentCat = '') => {
       if (currentCat && currentCat !== '未分類') return currentCat;
@@ -753,35 +1086,6 @@
       });
     };
 
-    const sanitizeItem = (item) => ({
-      id: item?.id || `item_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`,
-      sku: item?.sku || '',
-      name: item?.name || '未命名商品',
-      color: item?.color || '',
-      size: item?.size || 'F',
-      price: Number(item?.price) || 0,
-      qty: Number(item?.qty) || 1
-    });
-
-    const sanitizeOrder = (order) => ({
-      id: order?.id || `ORD${Date.now()}`,
-      orderNo: order?.orderNo || '', // [V2.1] 選填：Excel 匯入時帶入工作表名稱 (例如 0901林 涔)
-      customerName: order?.customerName || '顧客',
-      customerPhone: order?.customerPhone || '',
-      customerLine: order?.customerLine || '', // [V2.11] 客人的 LINE ID / 暱稱（只能用 LINE 聯絡的客人）
-      customerIg: order?.customerIg || '',     // [V2.11] 客人的 IG 帳號
-      deliveryMethod: order?.deliveryMethod || '7-11 取貨付款',
-      storeName: order?.storeName || '', // 門市名稱（宅配到府時通常留空）
-      storeAddress: order?.storeAddress || '', // [v2.13.0新增] 地址：門市地址（選填）或宅配到府的完整地址
-      shippingFee: Number(order?.shippingFee) ?? 60,
-      paymentStatus: Boolean(order?.paymentStatus),
-      shipmentStatus: order?.shipmentStatus || 'unshipped',
-      items: Array.isArray(order?.items) ? order.items.map(sanitizeItem) : [],
-      note: order?.note || '',
-      createdAt: order?.createdAt || new Date().toLocaleString('zh-TW', { hour12: false }),
-      timestamp: order?.timestamp || Date.now()
-    });
-
     const sanitizeProduct = (prod) => ({
       id: prod?.id || `prod_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`,
       sku: prod?.sku || '',
@@ -813,93 +1117,6 @@
     // 預設值只在資料庫還沒存過設定時使用（不會自動寫入資料庫，存了才算數）
     // （DEFAULT_SHIPPING_CONFIG 已搬到 config.js）
 
-    // 讀進來的設定可能缺欄位（例如剛升級、資料庫還是舊格式），一律補上預設值
-    const sanitizeShippingConfig = (raw) => {
-      const fees = { ...DEFAULT_SHIPPING_CONFIG.fees };
-      DELIVERY_METHODS.forEach(({ key }) => {
-        const v = raw?.fees?.[key];
-        if (Number.isFinite(Number(v)) && Number(v) >= 0) fees[key] = Number(v);
-      });
-      return {
-        fees,
-        freeShippingEnabled: raw?.freeShippingEnabled !== undefined ? Boolean(raw.freeShippingEnabled) : DEFAULT_SHIPPING_CONFIG.freeShippingEnabled,
-        freeShippingThreshold: Number.isFinite(Number(raw?.freeShippingThreshold)) ? Number(raw.freeShippingThreshold) : DEFAULT_SHIPPING_CONFIG.freeShippingThreshold
-      };
-    };
-
-    // 依物流方式與目前小計，算出建議運費（滿額免運時回傳 0）
-    const suggestShippingFee = (deliveryMethod, subtotal, config) => {
-      if (config.freeShippingEnabled && subtotal >= config.freeShippingThreshold) return 0;
-      return config.fees[deliveryMethod] ?? 0;
-    };
-
-    // （ADJUSTMENT_SKU 已搬到 config.js）
-    const isAdjustmentItem = (item) => Number(item?.price) < 0 || item?.sku === ADJUSTMENT_SKU;
-
-    const calcOrderSubtotal = (order) =>
-      (order?.items || []).reduce((sum, i) => sum + (Number(i.price) || 0) * (Number(i.qty) || 0), 0);
-
-    // 統一四捨五入成整數，避免小數單價造成 99.99999 之類的顯示
-    const calcOrderTotal = (order) =>
-      Math.round(calcOrderSubtotal(order) + (Number(order?.shippingFee) || 0));
-
-    // ==========================================
-    // [v2.13.0] 門市名稱／地址 拆分顯示（含舊資料相容）
-    // 背景：v2.13.0 之前 storeName 是「門市名稱」跟「地址」黏在同一欄的舊格式，
-    // 新訂單會分別存進 storeName／storeAddress 兩個欄位，但舊訂單只有合併過的 storeName、
-    // 沒有 storeAddress。這兩個函式讓畫面顯示時，新舊資料都能得到合理的結果，
-    // 不需要另外跑一次資料庫遷移。
-    // ==========================================
-    // 拆解出 { name, address }：
-    // - 新格式（storeAddress 有值）→ 直接回傳兩個欄位
-    // - 舊格式（storeAddress 是空的）→ 嘗試從 storeName 裡挖出「門市名稱 (地址)」的括號寫法；
-    //   沒有括號的話，宅配到府視為地址，其餘（超商取貨）視為門市名稱，跟舊版單一欄位的語意一致
-    const deriveStoreDisplay = (order) => {
-      const rawName = String(order?.storeName || '').trim();
-      const rawAddr = String(order?.storeAddress || '').trim();
-      if (rawAddr) return { name: rawName, address: rawAddr };
-      if (!rawName) return { name: '', address: '' };
-      const bracketMatch = rawName.match(/^(.*?)[\s]*[（(]([^）)]+)[）)]\s*$/);
-      if (bracketMatch) {
-        return { name: bracketMatch[1].trim(), address: bracketMatch[2].trim() };
-      }
-      if (order?.deliveryMethod === '宅配到府') return { name: '', address: rawName };
-      return { name: rawName, address: '' };
-    };
-
-    // 合併成單行顯示用的文字，例如「世貿門市／台北市信義區信義路五段5號1樓」
-    const formatStoreLine = (order) => {
-      const { name, address } = deriveStoreDisplay(order);
-      if (name && address) return `${name}／${address}`;
-      return name || address || '';
-    };
-
-    // ==========================================
-    // [V2.7] 回收桶 + 操作日誌 共用工具
-    // ==========================================
-    // [v2.14.5] 訂單日期：日期選擇器用的 YYYY-MM-DD（本地時間）
-    const toDateInputValue = (ts) => {
-      const d = new Date(ts);
-      if (ts === null || ts === undefined || ts === '' || isNaN(d.getTime())) return '';
-      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-    };
-
-    // [v2.14.5] 依使用者選的日期（YYYY-MM-DD）產生訂單的 timestamp 與 createdAt（顯示用文字）。
-    // 時間點取 nowMs 的「時:分:秒」（新增訂單＝現在；編輯舊訂單＝該訂單原本的時間點，只改日期不改時間）。
-    // 日期空白或不合法 → 直接用 nowMs。
-    const buildOrderStamp = (dateStr, nowMs = Date.now()) => {
-      const base = new Date(nowMs);
-      let d = base;
-      const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(dateStr || ''));
-      // [v2.14.6] 不接受未來的日期（以真實的今天為準；欄位 max 只是提示，桌機可直接打字）
-      if (m && String(dateStr) <= toDateInputValue(Date.now())) {
-        const y = Number(m[1]), mo = Number(m[2]), da = Number(m[3]);
-        const c = new Date(y, mo - 1, da, base.getHours(), base.getMinutes(), base.getSeconds());
-        if (c.getFullYear() === y && c.getMonth() === mo - 1 && c.getDate() === da) d = c;
-      }
-      return { timestamp: d.getTime(), createdAt: d.toLocaleString('zh-TW', { hour12: false }) };
-    };
-
     // [v2.14.5] 手動新增商品時，款號留空 → 自動編 SKU-數字（規則與 Excel 匯入商品相同：
     // 現有商品＋回收桶商品的款號都算已使用，從已使用的最大編號往後接）
     const nextAutoSku = (existingProducts, reservedSkus = []) => {
@@ -917,219 +1134,11 @@
       return sku;
     };
 
-    // [v2.14.5] 從檔名猜年份：檔名開頭或數字以外的字元之後，出現「20xx＋月份(01~12)」（例：202507訂購單.xlsx → 2025）
-    const suggestYearFromFileName = (fileName) => {
-      const m = /(?:^|[^0-9])(20\d{2})(?:0[1-9]|1[0-2])(?![0-9])/.exec(String(fileName || ''));
-      return m ? Number(m[1]) : null;
-    };
-
-    // [v2.14.6] 顧客姓名欄裡的 (IG:帳號)、(line:帳號) 拆成獨立欄位。
-    // 回傳 { name, ig, line, status }；status：
-    //   none（沒有標記，原樣）／split（正常拆出）／split_space（帳號含空白，視為 IG 顯示名稱，整段保留）／
-    //   split_nick（帳號含 / 或 ;，依「稱呼／帳號」規則拆出）／platform_only（只有標記沒帳號，標記拆掉）／
-    //   account_only（只有帳號沒有姓名）／ambiguous（寫法不明確，整欄原樣不拆）
-    const sheetNicknameOf = (sheetName) =>
-      String(sheetName || '').trim().replace(/^(?:20\d{2}\d{4}|1\d{2}\d{4}|\d{4})/, '').trim();
-
-    const splitCustomerNameAccounts = (rawName, sheetName = '') => {
-      const raw = String(rawName || '').trim();
-      const whole = (status) => ({ name: raw, ig: '', line: '', status });
-      if (!raw) return whole('none');
-      // [v2.14.7] 真實的「姓名＋標記」不會很長；過長的內容（例如誤貼大段文字）直接不處理，避免正規表示式變慢
-      if (raw.length > 200) return whole('none');
-      // [v2.14.7] 括號不成對（半形全形合計）→ 不處理，免得拆出殘缺的括號
-      const opens = (raw.match(/[(（]/g) || []).length;
-      const closes = (raw.match(/[)）]/g) || []).length;
-      if (opens !== closes) return whole(/[(（]\s*[:：]?\s*(?:ig|line)/i.test(raw) ? 'ambiguous' : 'none');
-      const GROUP = /[(（]\s*(ig|line)\s*(?:[:：]\s*([^()（）]*))?\s*[)）]/gi;
-      const groups = [...raw.matchAll(GROUP)];
-      const looksLikeMarker = /[(（]\s*[:：]?\s*(?:ig|line)/i.test(raw);
-      if (groups.length === 0) {
-        // 整格只有「IG:帳號」「line:帳號」（沒有括號、沒有姓名）→ 視為只有帳號
-        const bare = /^(ig|line)\s*[:：]\s*([^\s()（）:：][^()（）:：]*)$/i.exec(raw);
-        if (bare && !/[\/;；]/.test(bare[2])) {
-          const acct = bare[2].trim();
-          return bare[1].toLowerCase() === 'ig'
-            ? { name: '', ig: acct, line: '', status: 'account_only' }
-            : { name: '', ig: '', line: acct, status: 'account_only' };
-        }
-        return whole(looksLikeMarker ? 'ambiguous' : 'none'); // (line帳號) 沒冒號、括號不成對…
-      }
-      // 同一平台出現兩次 → 不拆
-      const platforms = groups.map(g => g[1].toLowerCase());
-      if (new Set(platforms).size !== platforms.length) return whole('ambiguous');
-      // 第一個標記之前＝姓名；標記之後除了其他標記與空白，不可再有文字（例如「棄單」「取消」）
-      const first = groups[0].index;
-      const tail = raw.slice(first).replace(GROUP, '').trim();
-      if (tail) return whole('ambiguous');
-      const nick = sheetNicknameOf(sheetName).toLowerCase().replace(/\s+/g, '');
-      const norm = (t) => String(t || '').toLowerCase().replace(/\s+/g, '');
-      let ig = '', line = '', status = 'split';
-      for (const g of groups) {
-        let acct = (g[2] || '').trim();
-        if (!acct) { if (status === 'split') status = 'platform_only'; continue; }
-        if (/[:：]/.test(acct)) return whole('ambiguous');                    // 冒號重複、前置冒號
-        if (/[\/;；]/.test(acct)) {                                            // 稱呼／帳號（B 類）
-          const parts = acct.split(/[\/;；]/);
-          const left = parts[0].trim();
-          const right = parts.slice(1).join('/').trim();
-          if (!nick) return whole('ambiguous');
-          if (norm(left) === nick) acct = right;
-          else if (norm(right) === nick) acct = left;
-          else return whole('ambiguous');
-          if (!acct || /[\/;；]/.test(acct)) return whole('ambiguous');
-          status = 'split_nick';
-        } else if (/\s/.test(acct) && status === 'split') {
-          status = 'split_space';                                              // 帳號含空白＝IG 顯示名稱，整段保留
-        }
-        if (g[1].toLowerCase() === 'ig') ig = acct; else line = acct;
-      }
-      const name = raw.slice(0, first).trim();
-      if (!name && !ig && !line) return whole('ambiguous');
-      return { name, ig, line, status: !name ? 'account_only' : status };
-    };
-
-    const ORDER_FIELD_LABELS = {
-      orderNo: '單號',
-      customerName: '姓名',
-      customerPhone: '電話',
-      customerLine: 'LINE',
-      customerIg: 'IG',
-      timestamp: '訂單日期',            // [v2.14.5新增]
-      createdAt: '訂單日期（顯示用）',  // [v2.14.5新增] 與 timestamp 一起改，日誌只顯示一次
-      deliveryMethod: '物流方式',
-      storeName: '門市名稱',
-      storeAddress: '地址', // [v2.13.0新增]
-      shippingFee: '運費',
-      paymentStatus: '付款狀態',
-      shipmentStatus: '出貨狀態',
-      note: '備註',
-      items: '商品明細'
-    };
-
-    const formatLogTime = (ts) => {
-      const d = new Date(Number(ts));
-      if (isNaN(d.getTime())) return '';
-      const pad = (n) => String(n).padStart(2, '0');
-      return `${d.getMonth() + 1}/${d.getDate()} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
-    };
-
-    const shortUser = (email) => String(email || '').split('@')[0] || '（未知）';
-
-    const formatLogValue = (key, value) => {
-      if (key === 'timestamp') return toDateInputValue(value) || String(value);
-      if (key === 'paymentStatus') return value ? '已付款' : '未付款';
-      if (key === 'shipmentStatus') return value === 'shipped' ? '已出貨' : '待出貨';
-      if (value === '' || value === null || value === undefined) return '（空）';
-      return String(value);
-    };
-
-    // 把「編輯訂單」日誌的 before / after 轉成一行看得懂的文字（商品明細只說有修改）
-    const describeEditDiff = (entry) => {
-      if (!entry?.before || !entry?.after) return '';
-      return Object.keys(entry.after).filter(key => !(key === 'createdAt' && 'timestamp' in entry.after)).map(key => {
-        if (key === 'items') return '商品明細已修改';
-        return `${ORDER_FIELD_LABELS[key] || key}：${formatLogValue(key, entry.before[key])} → ${formatLogValue(key, entry.after[key])}`;
-      }).join('；');
-    };
-
-    // [V2.7.2] 訂單時間戳記：Excel 匯入的訂單時間是我們固定填的「中午 12 點」（沒有真實時間），
-    // 只有在程式裡建立的訂單才有真實時間，所以匯入的訂單只顯示日期。
-    const isSyntheticNoonTs = (ts) => {
-      const d = new Date(Number(ts));
-      if (isNaN(d.getTime())) return true;
-      const noon = new Date(d.getFullYear(), d.getMonth(), d.getDate(), 12, 0, 0, 0).getTime();
-      return Math.abs(d.getTime() - noon) <= 5000; // 匯入時為了維持順序會差幾毫秒
-    };
-
-    const formatOrderTimeShort = (ts) => {
-      if (isSyntheticNoonTs(ts)) return '';
-      const d = new Date(Number(ts));
-      return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
-    };
-
-    // 例如「9/21 14:32」；匯入的訂單只有「9/16」
-    const formatOrderStamp = (order) => {
-      const date = formatOrderDateShort(order?.createdAt);
-      const time = formatOrderTimeShort(order?.timestamp);
-      return time ? `${date} ${time}` : date;
-    };
-
-    // 「相同訂單」：同一位客人、同樣的商品明細、同樣的總金額
-    const orderSignature = (o) => {
-      const items = (o.items || [])
-        .map(i => `${String(i.name || '').trim()}|${i.color || ''}|${i.size || ''}|${Number(i.price) || 0}|${Number(i.qty) || 0}`)
-        .sort()
-        .join(';');
-      return `${String(o.customerName || '').trim()}#${calcOrderTotal(o)}#${items}`;
-    };
-
-    // 找「看起來重複」的訂單：簽章相同（同客人 + 同商品 + 同金額），或單號相同。
-    // withinDays：只比對最近 N 天內的訂單（建立訂單時用，避免每週回購的客人一直被提醒）。
-    // [v2.14.7] twoWay：補登舊單時用雙向（訂單日期前後各 withinDays 天）；一般新增維持原本只看「過去」的行為
-    const findDuplicateOrder = (item, orders, withinDays = null, nowMs = Date.now(), twoWay = false) => {
-      const sig = orderSignature(item);
-      const orderNo = String(item.orderNo || '').trim();
-      return (orders || []).find(o => {
-        if (o.id === item.id) return false;
-        if (withinDays !== null) {
-          const gap = nowMs - (Number(o.timestamp) || 0);
-          if ((twoWay ? Math.abs(gap) : gap) > withinDays * 86400000) return false;
-        }
-        if (orderSignature(o) === sig) return true;
-        return Boolean(orderNo) && String(o.orderNo || '').trim() === orderNo;
-      }) || null;
-    };
-
     const findDuplicateProduct = (item, products) => {
       const key = String(item.name || '').trim().toLowerCase();
       if (!key) return null;
       return (products || []).find(p => p.id !== item.id && String(p.name || '').trim().toLowerCase() === key) || null;
     };
-
-    // [V2.6.3] 單號若只是「日期 + 姓名」（例如 0914王振婷），跟卡片上已有的日期、姓名重複，展開時就不再顯示
-    const isOrderNoRedundant = (order) => {
-      const no = String(order?.orderNo || '');
-      if (!/^\d{4}/.test(no)) return false;
-      const d = new Date(order.timestamp);
-      if (isNaN(d.getTime())) return false;
-      const mm = String(d.getMonth() + 1).padStart(2, '0');
-      const dd = String(d.getDate()).padStart(2, '0');
-      // [v2.14.4] 單號開頭可能是 YYYYMMDD（8碼）、民國 YYYMMDD（7碼）或舊的 MMDD（4碼）；
-      // 開頭日期與訂單日期一致時，單號的日期部分只是重複資訊，卡片上不必再顯示一次
-      if (no.startsWith(`${d.getFullYear()}${mm}${dd}`)) return true;
-      if (no.startsWith(`${d.getFullYear() - 1911}${mm}${dd}`)) return true;
-      return no.slice(0, 4) === `${mm}${dd}`;
-    };
-
-    // [V2.6.2] 訂單卡片上的簡短日期：今年的訂單只顯示「9/16」，其他年份顯示完整日期
-    const formatOrderDateShort = (createdAt) => {
-      const datePart = String(createdAt || '').split(' ')[0];
-      const parts = datePart.split('/');
-      if (parts.length === 3 && Number(parts[0]) === new Date().getFullYear()) return `${parts[1]}/${parts[2]}`;
-      return datePart;
-    };
-
-    // [V2.6] 訂單日期篩選：把時間戳轉成「本地日期」YYYY-MM-DD
-    const toDateKey = (ts) => {
-      const d = new Date(ts);
-      if (isNaN(d.getTime())) return '';
-      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-    };
-
-    const formatDateChipLabel = (key, nowMs = Date.now()) => {
-      if (key === toDateKey(nowMs)) return '今天';
-      if (key === toDateKey(nowMs - 86400000)) return '昨天';
-      const [, m, d] = key.split('-');
-      return `${Number(m)}/${Number(d)}`;
-    };
-
-    // ==========================================
-    // [V2.4] 新增訂單「快速帶入」：近期熱銷自動排序
-    // 不去猜「檔期」，改用時間衰減：越近的訂單權重越高（每過 N 天減半），
-    // 所以這一檔的明星商品會自動浮上來、上一檔的舊明星商品自然沉下去。
-    // ==========================================
-    // （QUICK_PICK_* 常數 已搬到 config.js）
 
     // 尺寸 / 顏色欄位的拆分（逗號、頓號、斜線、空白）
     const splitProductOptions = (s) =>
@@ -1138,144 +1147,6 @@
     // 只有一種尺寸且一種顏色 → 可以「＋」一鍵直接加入，不必再選規格
     const isSingleVariantProduct = (p) =>
       splitProductOptions(p.sizes).length <= 1 && splitProductOptions(p.colors).length <= 1;
-
-    // ==========================================
-    // [v2.14.0] 公版訊息：傳給客人確認訂單用的文字
-    // ==========================================
-    // 整理公版設定：資料庫完全沒有設定(null)時用預設值；已經存過的設定，缺的欄位不再補預設優惠規則
-    // （Firebase 不會存空陣列，若刪光優惠規則後又被補回預設，使用者會以為刪不掉）
-    // [v2.14.7] 優惠活動期間：日期字串皆為 YYYY-MM-DD（本地日期）；空白＝不限。以「訂單自己的日期」判斷，
-    // 所以補登舊單、日後重新產生舊訂單的訊息，結果都跟當時的活動一致。
-    const normalizePromoDate = (v) => /^\d{4}-\d{2}-\d{2}$/.test(String(v || '')) ? String(v) : '';
-    const isDateInPromoRange = (dateStr, startDate, endDate) => {
-      if (startDate && dateStr < startDate) return false;
-      if (endDate && dateStr > endDate) return false;
-      return true;
-    };
-    // 給設定畫面看的狀態說明（相對於 todayStr）
-    const describePromoPeriod = (startDate, endDate, todayStr) => {
-      if (startDate && endDate && startDate > endDate) return { state: 'invalid', text: '⚠️ 結束日早於開始日，這條永遠不會套用' };
-      if (!startDate && !endDate) return { state: 'always', text: '⚠️ 長期有效（沒有設日期，要靠手動關閉）' };
-      if (startDate && todayStr < startDate) return { state: 'upcoming', text: `尚未開始（${startDate} 起）` };
-      if (endDate && todayStr > endDate) return { state: 'ended', text: `已結束（${endDate} 止）` };
-      return { state: 'active', text: `套用中${endDate ? `（到 ${endDate}）` : `（${startDate} 起，沒有結束日）`}` };
-    };
-
-    const sanitizeMessageTemplate = (raw) => {
-      const def = DEFAULT_MESSAGE_TEMPLATE;
-      if (!raw || typeof raw !== 'object') {
-        return JSON.parse(JSON.stringify(def));
-      }
-      const toArray = (v) => Array.isArray(v) ? v : (v && typeof v === 'object' ? Object.values(v) : []);
-      const discounts = toArray(raw.discounts)
-        .filter(d => d && typeof d === 'object')
-        .map((d, i) => ({
-          id: String(d.id || `d_${i}_${Date.now()}`),
-          enabled: d.enabled !== false,
-          minQty: Math.max(1, Math.floor(Number(d.minQty) || 1)),
-          percent: Math.min(100, Math.max(0, Number(d.percent) || 0)),
-          label: String(d.label || ''),
-          startDate: normalizePromoDate(d.startDate), // [v2.14.7]
-          endDate: normalizePromoDate(d.endDate)
-        }));
-      return {
-        prefix: typeof raw.prefix === 'string' ? raw.prefix : def.prefix,
-        suffix: typeof raw.suffix === 'string' ? raw.suffix : def.suffix,
-        discounts,
-        customLines: toArray(raw.customLines).map(x => String(x || '')).filter(x => x.trim()),
-        customLinesStartDate: normalizePromoDate(raw.customLinesStartDate), // [v2.14.7]
-        customLinesEndDate: normalizePromoDate(raw.customLinesEndDate),
-        showSubtotalWhenNoDiscount: raw.showSubtotalWhenNoDiscount !== false
-      };
-    };
-
-    // 依訂單內容＋公版設定，產生要傳給客人的確認訊息。格式：
-    //   前綴 / 1.品名-顏色尺寸$單價（數量>1 加 x數量）/ 空行 / 優惠金額行 / 自訂優惠行 / 運費行 / 空行 / 後綴
-    // 優惠規則若有多條同時符合，只套用「金額最低」的那一條（對客人最有利），不疊加。
-    const buildOrderMessage = (order, template) => {
-      const t = sanitizeMessageTemplate(template);
-      const customerName = String(order?.customerName || '');
-      const fill = (str) => String(str || '').replace(/\{顧客姓名\}/g, customerName);
-
-      const allItems = order?.items || [];
-      const goodsItems = allItems.filter(i => !isAdjustmentItem(i));
-      const adjustItems = allItems.filter(i => isAdjustmentItem(i));
-
-      const itemLines = goodsItems.map((it, idx) => {
-        const size = it.size && it.size !== 'F' ? String(it.size) : '';
-        const spec = `${it.color || ''}${size}`;
-        const qty = Number(it.qty) || 1;
-        return `${idx + 1}.${it.name}${spec ? '-' + spec : ''}$${Number(it.price) || 0}${qty > 1 ? ` x${qty}` : ''}`;
-      });
-
-      const goodsSubtotal = goodsItems.reduce((s, it) => s + (Number(it.price) || 0) * (Number(it.qty) || 1), 0);
-      const totalQty = goodsItems.reduce((s, it) => s + (Number(it.qty) || 1), 0);
-      const adjustSum = adjustItems.reduce((s, it) => s + (Number(it.price) || 0) * (Number(it.qty) || 1), 0);
-
-      // [v2.14.7] 優惠依「訂單日期」自動套用：不在活動期間內的規則視同沒有
-      const orderDateStr = toDateInputValue(order?.timestamp) || toDateInputValue(Date.now());
-
-      // 找出符合條件、折後金額最低的那條優惠規則
-      let bestRule = null;
-      let bestAmount = goodsSubtotal;
-      t.discounts.forEach(d => {
-        if (!d.enabled || d.percent <= 0 || d.percent >= 100) return;
-        if (!isDateInPromoRange(orderDateStr, d.startDate, d.endDate)) return;
-        if (totalQty < d.minQty) return;
-        const amount = Math.round(goodsSubtotal * d.percent / 100);
-        if (amount < bestAmount) { bestAmount = amount; bestRule = d; }
-      });
-
-      const middle = [];
-      if (bestRule) {
-        middle.push(`${bestRule.label || `滿${bestRule.minQty}件${bestRule.percent}折`}優惠金額${bestAmount}`);
-      } else if (t.showSubtotalWhenNoDiscount && goodsItems.length > 0) {
-        middle.push(`商品金額${goodsSubtotal}`);
-      }
-      if (adjustSum !== 0) middle.push(`其他調整${adjustSum}`);
-      if (isDateInPromoRange(orderDateStr, t.customLinesStartDate, t.customLinesEndDate)) {
-        t.customLines.forEach(line => middle.push(fill(line)));
-      }
-
-      const fee = Number(order?.shippingFee) || 0;
-      const feeLabel = order?.deliveryMethod === '宅配到府' ? '宅配運費' : '賣貨便運費';
-      middle.push(fee === 0 ? '免運' : `${feeLabel}${fee}`);
-
-      const out = [];
-      const prefix = fill(t.prefix);
-      if (prefix.trim()) out.push(prefix);
-      out.push(...itemLines);
-      out.push('');
-      out.push(...middle);
-      const suffix = fill(t.suffix);
-      if (suffix.trim()) { out.push(''); out.push(suffix); }
-      return out.join('\n');
-    };
-
-    // 複製文字到剪貼簿：優先用新API，LINE 內建瀏覽器等不支援時退回舊方法。回傳 true/false。
-    const copyTextToClipboard = async (text) => {
-      try {
-        if (navigator.clipboard && window.isSecureContext) {
-          await navigator.clipboard.writeText(text);
-          return true;
-        }
-      } catch (err) { /* 往下走舊方法 */ }
-      try {
-        const ta = document.createElement('textarea');
-        ta.value = text;
-        ta.setAttribute('readonly', '');
-        ta.style.position = 'fixed';
-        ta.style.top = '-1000px';
-        document.body.appendChild(ta);
-        ta.select();
-        ta.setSelectionRange(0, text.length);
-        const ok = document.execCommand('copy');
-        document.body.removeChild(ta);
-        return ok;
-      } catch (err) {
-        return false;
-      }
-    };
 
     // ---- [v2.13.4／原對話v2.12.11起] 新增訂單手動輸入商品名稱時的相似商品比對 ----
     // 純字元層級比對(Levenshtein編輯距離)，抓的是「打錯字/打一半」這種情境，不是語意理解
@@ -1425,6 +1296,85 @@
       const fresh = quick.length === 0 ? byNewest.slice(0, 6) : recentNew;
 
       return { quick, fresh, allSorted };
+    };
+  </script>
+  <script type="text/babel">
+    // ==========================================
+    // utils-import.js  (v2.14.9 Phase 3，由 utils.js 原樣搬出)
+    // 訂單 Excel 匯入解析：分頁名日期（含年份）、姓名裡的 IG／LINE 拆分、整份活頁簿解析
+    // 只搬位置，不改內容；各檔案共用全域（見 index.html 的載入順序）
+    // ==========================================
+
+    // [v2.14.5] 從檔名猜年份：檔名開頭或數字以外的字元之後，出現「20xx＋月份(01~12)」（例：202507訂購單.xlsx → 2025）
+    const suggestYearFromFileName = (fileName) => {
+      const m = /(?:^|[^0-9])(20\d{2})(?:0[1-9]|1[0-2])(?![0-9])/.exec(String(fileName || ''));
+      return m ? Number(m[1]) : null;
+    };
+
+    // [v2.14.6] 顧客姓名欄裡的 (IG:帳號)、(line:帳號) 拆成獨立欄位。
+    // 回傳 { name, ig, line, status }；status：
+    //   none（沒有標記，原樣）／split（正常拆出）／split_space（帳號含空白，視為 IG 顯示名稱，整段保留）／
+    //   split_nick（帳號含 / 或 ;，依「稱呼／帳號」規則拆出）／platform_only（只有標記沒帳號，標記拆掉）／
+    //   account_only（只有帳號沒有姓名）／ambiguous（寫法不明確，整欄原樣不拆）
+    const sheetNicknameOf = (sheetName) =>
+      String(sheetName || '').trim().replace(/^(?:20\d{2}\d{4}|1\d{2}\d{4}|\d{4})/, '').trim();
+
+    const splitCustomerNameAccounts = (rawName, sheetName = '') => {
+      const raw = String(rawName || '').trim();
+      const whole = (status) => ({ name: raw, ig: '', line: '', status });
+      if (!raw) return whole('none');
+      // [v2.14.7] 真實的「姓名＋標記」不會很長；過長的內容（例如誤貼大段文字）直接不處理，避免正規表示式變慢
+      if (raw.length > 200) return whole('none');
+      // [v2.14.7] 括號不成對（半形全形合計）→ 不處理，免得拆出殘缺的括號
+      const opens = (raw.match(/[(（]/g) || []).length;
+      const closes = (raw.match(/[)）]/g) || []).length;
+      if (opens !== closes) return whole(/[(（]\s*[:：]?\s*(?:ig|line)/i.test(raw) ? 'ambiguous' : 'none');
+      const GROUP = /[(（]\s*(ig|line)\s*(?:[:：]\s*([^()（）]*))?\s*[)）]/gi;
+      const groups = [...raw.matchAll(GROUP)];
+      const looksLikeMarker = /[(（]\s*[:：]?\s*(?:ig|line)/i.test(raw);
+      if (groups.length === 0) {
+        // 整格只有「IG:帳號」「line:帳號」（沒有括號、沒有姓名）→ 視為只有帳號
+        const bare = /^(ig|line)\s*[:：]\s*([^\s()（）:：][^()（）:：]*)$/i.exec(raw);
+        if (bare && !/[\/;；]/.test(bare[2])) {
+          const acct = bare[2].trim();
+          return bare[1].toLowerCase() === 'ig'
+            ? { name: '', ig: acct, line: '', status: 'account_only' }
+            : { name: '', ig: '', line: acct, status: 'account_only' };
+        }
+        return whole(looksLikeMarker ? 'ambiguous' : 'none'); // (line帳號) 沒冒號、括號不成對…
+      }
+      // 同一平台出現兩次 → 不拆
+      const platforms = groups.map(g => g[1].toLowerCase());
+      if (new Set(platforms).size !== platforms.length) return whole('ambiguous');
+      // 第一個標記之前＝姓名；標記之後除了其他標記與空白，不可再有文字（例如「棄單」「取消」）
+      const first = groups[0].index;
+      const tail = raw.slice(first).replace(GROUP, '').trim();
+      if (tail) return whole('ambiguous');
+      const nick = sheetNicknameOf(sheetName).toLowerCase().replace(/\s+/g, '');
+      const norm = (t) => String(t || '').toLowerCase().replace(/\s+/g, '');
+      let ig = '', line = '', status = 'split';
+      for (const g of groups) {
+        let acct = (g[2] || '').trim();
+        if (!acct) { if (status === 'split') status = 'platform_only'; continue; }
+        if (/[:：]/.test(acct)) return whole('ambiguous');                    // 冒號重複、前置冒號
+        if (/[\/;；]/.test(acct)) {                                            // 稱呼／帳號（B 類）
+          const parts = acct.split(/[\/;；]/);
+          const left = parts[0].trim();
+          const right = parts.slice(1).join('/').trim();
+          if (!nick) return whole('ambiguous');
+          if (norm(left) === nick) acct = right;
+          else if (norm(right) === nick) acct = left;
+          else return whole('ambiguous');
+          if (!acct || /[\/;；]/.test(acct)) return whole('ambiguous');
+          status = 'split_nick';
+        } else if (/\s/.test(acct) && status === 'split') {
+          status = 'split_space';                                              // 帳號含空白＝IG 顯示名稱，整段保留
+        }
+        if (g[1].toLowerCase() === 'ig') ig = acct; else line = acct;
+      }
+      const name = raw.slice(0, first).trim();
+      if (!name && !ig && !line) return whole('ambiguous');
+      return { name, ig, line, status: !name ? 'account_only' : status };
     };
 
     // ==========================================
@@ -1719,6 +1669,135 @@
     // ==========================================
     // [黑名單] 標準化 / 比對 / 整理（純函式，無副作用，不碰資料庫）
     // ==========================================
+  </script>
+  <script type="text/babel">
+    // ==========================================
+    // utils-message.js  (v2.14.9 Phase 3，由 utils.js 原樣搬出)
+    // 公版訊息：優惠活動期間判斷、公版設定整理、訂單訊息組合
+    // 只搬位置，不改內容；各檔案共用全域（見 index.html 的載入順序）
+    // ==========================================
+
+    // ==========================================
+    // [v2.14.0] 公版訊息：傳給客人確認訂單用的文字
+    // ==========================================
+    // 整理公版設定：資料庫完全沒有設定(null)時用預設值；已經存過的設定，缺的欄位不再補預設優惠規則
+    // （Firebase 不會存空陣列，若刪光優惠規則後又被補回預設，使用者會以為刪不掉）
+    // [v2.14.7] 優惠活動期間：日期字串皆為 YYYY-MM-DD（本地日期）；空白＝不限。以「訂單自己的日期」判斷，
+    // 所以補登舊單、日後重新產生舊訂單的訊息，結果都跟當時的活動一致。
+    const normalizePromoDate = (v) => /^\d{4}-\d{2}-\d{2}$/.test(String(v || '')) ? String(v) : '';
+
+    const isDateInPromoRange = (dateStr, startDate, endDate) => {
+      if (startDate && dateStr < startDate) return false;
+      if (endDate && dateStr > endDate) return false;
+      return true;
+    };
+
+    // 給設定畫面看的狀態說明（相對於 todayStr）
+    const describePromoPeriod = (startDate, endDate, todayStr) => {
+      if (startDate && endDate && startDate > endDate) return { state: 'invalid', text: '⚠️ 結束日早於開始日，這條永遠不會套用' };
+      if (!startDate && !endDate) return { state: 'always', text: '⚠️ 長期有效（沒有設日期，要靠手動關閉）' };
+      if (startDate && todayStr < startDate) return { state: 'upcoming', text: `尚未開始（${startDate} 起）` };
+      if (endDate && todayStr > endDate) return { state: 'ended', text: `已結束（${endDate} 止）` };
+      return { state: 'active', text: `套用中${endDate ? `（到 ${endDate}）` : `（${startDate} 起，沒有結束日）`}` };
+    };
+
+    const sanitizeMessageTemplate = (raw) => {
+      const def = DEFAULT_MESSAGE_TEMPLATE;
+      if (!raw || typeof raw !== 'object') {
+        return JSON.parse(JSON.stringify(def));
+      }
+      const toArray = (v) => Array.isArray(v) ? v : (v && typeof v === 'object' ? Object.values(v) : []);
+      const discounts = toArray(raw.discounts)
+        .filter(d => d && typeof d === 'object')
+        .map((d, i) => ({
+          id: String(d.id || `d_${i}_${Date.now()}`),
+          enabled: d.enabled !== false,
+          minQty: Math.max(1, Math.floor(Number(d.minQty) || 1)),
+          percent: Math.min(100, Math.max(0, Number(d.percent) || 0)),
+          label: String(d.label || ''),
+          startDate: normalizePromoDate(d.startDate), // [v2.14.7]
+          endDate: normalizePromoDate(d.endDate)
+        }));
+      return {
+        prefix: typeof raw.prefix === 'string' ? raw.prefix : def.prefix,
+        suffix: typeof raw.suffix === 'string' ? raw.suffix : def.suffix,
+        discounts,
+        customLines: toArray(raw.customLines).map(x => String(x || '')).filter(x => x.trim()),
+        customLinesStartDate: normalizePromoDate(raw.customLinesStartDate), // [v2.14.7]
+        customLinesEndDate: normalizePromoDate(raw.customLinesEndDate),
+        showSubtotalWhenNoDiscount: raw.showSubtotalWhenNoDiscount !== false
+      };
+    };
+
+    // 依訂單內容＋公版設定，產生要傳給客人的確認訊息。格式：
+    //   前綴 / 1.品名-顏色尺寸$單價（數量>1 加 x數量）/ 空行 / 優惠金額行 / 自訂優惠行 / 運費行 / 空行 / 後綴
+    // 優惠規則若有多條同時符合，只套用「金額最低」的那一條（對客人最有利），不疊加。
+    const buildOrderMessage = (order, template) => {
+      const t = sanitizeMessageTemplate(template);
+      const customerName = String(order?.customerName || '');
+      const fill = (str) => String(str || '').replace(/\{顧客姓名\}/g, customerName);
+
+      const allItems = order?.items || [];
+      const goodsItems = allItems.filter(i => !isAdjustmentItem(i));
+      const adjustItems = allItems.filter(i => isAdjustmentItem(i));
+
+      const itemLines = goodsItems.map((it, idx) => {
+        const size = it.size && it.size !== 'F' ? String(it.size) : '';
+        const spec = `${it.color || ''}${size}`;
+        const qty = Number(it.qty) || 1;
+        return `${idx + 1}.${it.name}${spec ? '-' + spec : ''}$${Number(it.price) || 0}${qty > 1 ? ` x${qty}` : ''}`;
+      });
+
+      const goodsSubtotal = goodsItems.reduce((s, it) => s + (Number(it.price) || 0) * (Number(it.qty) || 1), 0);
+      const totalQty = goodsItems.reduce((s, it) => s + (Number(it.qty) || 1), 0);
+      const adjustSum = adjustItems.reduce((s, it) => s + (Number(it.price) || 0) * (Number(it.qty) || 1), 0);
+
+      // [v2.14.7] 優惠依「訂單日期」自動套用：不在活動期間內的規則視同沒有
+      const orderDateStr = toDateInputValue(order?.timestamp) || toDateInputValue(Date.now());
+
+      // 找出符合條件、折後金額最低的那條優惠規則
+      let bestRule = null;
+      let bestAmount = goodsSubtotal;
+      t.discounts.forEach(d => {
+        if (!d.enabled || d.percent <= 0 || d.percent >= 100) return;
+        if (!isDateInPromoRange(orderDateStr, d.startDate, d.endDate)) return;
+        if (totalQty < d.minQty) return;
+        const amount = Math.round(goodsSubtotal * d.percent / 100);
+        if (amount < bestAmount) { bestAmount = amount; bestRule = d; }
+      });
+
+      const middle = [];
+      if (bestRule) {
+        middle.push(`${bestRule.label || `滿${bestRule.minQty}件${bestRule.percent}折`}優惠金額${bestAmount}`);
+      } else if (t.showSubtotalWhenNoDiscount && goodsItems.length > 0) {
+        middle.push(`商品金額${goodsSubtotal}`);
+      }
+      if (adjustSum !== 0) middle.push(`其他調整${adjustSum}`);
+      if (isDateInPromoRange(orderDateStr, t.customLinesStartDate, t.customLinesEndDate)) {
+        t.customLines.forEach(line => middle.push(fill(line)));
+      }
+
+      const fee = Number(order?.shippingFee) || 0;
+      const feeLabel = order?.deliveryMethod === '宅配到府' ? '宅配運費' : '賣貨便運費';
+      middle.push(fee === 0 ? '免運' : `${feeLabel}${fee}`);
+
+      const out = [];
+      const prefix = fill(t.prefix);
+      if (prefix.trim()) out.push(prefix);
+      out.push(...itemLines);
+      out.push('');
+      out.push(...middle);
+      const suffix = fill(t.suffix);
+      if (suffix.trim()) { out.push(''); out.push(suffix); }
+      return out.join('\n');
+    };
+  </script>
+  <script type="text/babel">
+    // ==========================================
+    // utils-blacklist.js  (v2.14.9 Phase 3，由 utils.js 原樣搬出)
+    // 黑名單：電話／帳號／姓名正規化、比對、重複判斷、由訂單建立黑名單草稿
+    // 只搬位置，不改內容；各檔案共用全域（見 index.html 的載入順序）
+    // ==========================================
 
     // 電話標準化：去除非數字字元，把 +886/886 開頭轉回 0 開頭，方便跨格式比對
     const normalizePhone = (v) => {
@@ -1727,6 +1806,7 @@
       else if (digits.startsWith('886')) digits = '0' + digits.slice(3);
       return digits.replace(/\D/g, '');
     };
+
     const BLACKLIST_PHONE_MIN_LEN = 8; // 標準化後電話號碼要 >= 這個長度才納入比對，避免打一半的號碼誤中
 
     // LINE/IG 帳號標準化：去除開頭@、前後空白、轉小寫，方便跨大小寫/有無@比對
@@ -1798,43 +1878,6 @@
       reason: '',
       sourceOrderNo: order?.orderNo || '',
     });
-
-    // ==========================================
-    // [商品圖片 v2.12.9] 上傳前壓縮（純函式，用Canvas等比例縮小+轉JPEG，不依賴任何外部狀態）
-    // ==========================================
-    const compressImageFile = (file, maxDimension = PRODUCT_IMAGE_MAX_DIMENSION, quality = PRODUCT_IMAGE_JPEG_QUALITY) => {
-      return new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = (e) => {
-          const img = new Image();
-          img.onload = () => {
-            let { width, height } = img;
-            if (width > maxDimension || height > maxDimension) {
-              if (width > height) {
-                height = Math.round(height * (maxDimension / width));
-                width = maxDimension;
-              } else {
-                width = Math.round(width * (maxDimension / height));
-                height = maxDimension;
-              }
-            }
-            const canvas = document.createElement('canvas');
-            canvas.width = width;
-            canvas.height = height;
-            const ctx = canvas.getContext('2d');
-            ctx.drawImage(img, 0, 0, width, height);
-            canvas.toBlob((blob) => {
-              if (blob) resolve(blob);
-              else reject(new Error('圖片壓縮失敗，請換一張圖片再試一次'));
-            }, 'image/jpeg', quality);
-          };
-          img.onerror = () => reject(new Error('圖片讀取失敗，請確認檔案格式是否正確'));
-          img.src = e.target.result;
-        };
-        reader.onerror = () => reject(new Error('檔案讀取失敗'));
-        reader.readAsDataURL(file);
-      });
-    };
   </script>
   <script type="text/babel">
     // ==========================================
@@ -2012,26 +2055,10 @@
   </script>
   <script type="text/babel">
     // ==========================================
-    // [V2.1] 訂單列表升級：小元件
+    // modal-order.js  (v2.14.9 Phase 3，由 ui-shared.js 原樣搬出)
+    // 訂單相關彈窗：編輯訂單、Excel 匯入預覽、客人確認訊息
+    // 只搬位置，不改內容；各檔案共用全域（見 index.html 的載入順序）
     // ==========================================
-    function FilterPills({ value, onChange, options }) {
-      return (
-        <div className="bg-slate-100 p-1 rounded-xl flex items-center gap-1">
-          {options.map(opt => (
-            <button
-              key={opt.key}
-              type="button"
-              onClick={() => onChange(opt.key)}
-              className={`px-2.5 sm:px-3 py-1.5 rounded-lg text-xs font-medium transition whitespace-nowrap ${
-                value === opt.key ? 'bg-white text-slate-800 font-bold shadow-sm' : 'text-slate-600 hover:text-slate-900'
-              }`}
-            >
-              {opt.label}
-            </button>
-          ))}
-        </div>
-      );
-    }
 
     // 編輯訂單 Modal（欄位對應主程式資料結構）
     function OrderEditModal({ order, onClose, onSave }) {
@@ -2557,126 +2584,105 @@
     }
 
     // ==========================================
-    // [V2.4] 快速帶入：商品晶片（可選取 / 單一規格可一鍵＋）
+    // [v2.14.0] 公版訊息：傳給客人確認訂單用
+    // OrderMessageModal：顯示依訂單產生的訊息，可微調後一鍵複製（複製一定要在使用者點按鈕的當下，手機/LINE瀏覽器才不會被擋）
+    // MessageTemplateModal：維護前綴、後綴、優惠規則、自訂優惠行，並有即時預覽
     // ==========================================
-    // ==========================================
-    // [V2.12] 運費與折扣設定視窗（老婆可以自己改，不用透過開發者）
-    // ==========================================
-    function ShippingSettingsModal({ config, isSaving, onSave, onClose }) {
-      const [form, setForm] = React.useState(() => ({ ...config, fees: { ...config.fees } }));
-      const [error, setError] = React.useState('');
+    function OrderMessageModal({ order, template, onClose, showToast }) {
+      const [text, setText] = React.useState(() => buildOrderMessage(order, template));
+      const [copied, setCopied] = React.useState(false);
+      // [v2.14.8] 這則訊息若帶出了「沒設活動期間」的長期優惠，提醒使用者（避免活動結束後忘了關，一直帶優惠）
+      const undatedPromoNames = React.useMemo(() => {
+        const t = sanitizeMessageTemplate(template);
+        const base = buildOrderMessage(order, template);
+        const names = t.discounts
+          .filter(d => d.enabled && d.percent > 0 && d.percent < 100 && !d.startDate && !d.endDate && d.label && base.includes(d.label))
+          .map(d => d.label);
+        const lines = t.customLines.map(x => String(x).trim()).filter(x => x && !x.includes('{') && !t.customLinesStartDate && !t.customLinesEndDate && base.includes(x));
+        return [...names, ...lines.map(x => `自訂行「${x.length > 12 ? x.slice(0, 12) + '…' : x}」`)];
+      }, [order, template]);
 
-      const setFee = (key, val) => setForm(prev => ({ ...prev, fees: { ...prev.fees, [key]: val } }));
-
-      const handleSubmit = (e) => {
-        e.preventDefault();
-        setError('');
-        for (const { key, short } of DELIVERY_METHODS) {
-          const v = Number(form.fees[key]);
-          if (!Number.isFinite(v) || v < 0) { setError(`「${short}」的運費請輸入 0 以上的數字`); return; }
+      const handleCopy = async () => {
+        const ok = await copyTextToClipboard(text);
+        if (ok) {
+          setCopied(true);
+          showToast('📋 已複製，可以貼到 LINE / IG 給客人了');
+        } else {
+          showToast('❌ 這個瀏覽器不允許自動複製，請長按文字框手動全選複製');
         }
-        if (form.freeShippingEnabled) {
-          const t = Number(form.freeShippingThreshold);
-          if (!Number.isFinite(t) || t < 0) { setError('免運門檻請輸入 0 以上的數字'); return; }
-        }
-        onSave({
-          fees: Object.fromEntries(DELIVERY_METHODS.map(({ key }) => [key, Math.round(Number(form.fees[key]))])),
-          freeShippingEnabled: Boolean(form.freeShippingEnabled),
-          freeShippingThreshold: Math.round(Number(form.freeShippingThreshold) || 0)
-        });
       };
-
-      const inputCls = "w-full text-sm px-3 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:border-emerald-500 bg-white";
 
       return (
         <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-sm flex items-end sm:items-center justify-center" onClick={onClose}>
-          <div
-            className="bg-white w-full sm:max-w-md rounded-t-3xl sm:rounded-2xl shadow-2xl flex flex-col max-h-[88vh]"
-            onClick={(e) => e.stopPropagation()}
-          >
+          <div className="bg-white w-full sm:max-w-lg rounded-t-3xl sm:rounded-2xl shadow-2xl flex flex-col max-h-[90vh]" onClick={(e) => e.stopPropagation()}>
             <div className="px-5 pt-4 pb-3 flex items-center justify-between border-b border-slate-100">
               <div>
-                <h3 className="font-bold text-base text-slate-800">⚙️ 運費與折扣設定</h3>
-                <p className="text-[11px] text-slate-400">新增訂單時會依物流方式自動帶入，之後仍可手動修改</p>
+                <h3 className="font-bold text-base text-slate-800">💬 給客人的確認訊息</h3>
+                <p className="text-[11px] text-slate-400">{order.customerName} · 可直接修改文字後再複製</p>
               </div>
               <button type="button" onClick={onClose} className="p-1.5 text-slate-400 hover:text-slate-700 rounded-lg hover:bg-slate-100">
                 <IconX size={22} />
               </button>
             </div>
-
-            <form onSubmit={handleSubmit} className="p-5 space-y-4 overflow-y-auto">
-              <div className="space-y-2.5">
-                <label className="text-xs font-bold text-slate-600 block">各物流方式的運費</label>
-                {DELIVERY_METHODS.map(({ key, short }) => (
-                  <div key={key} className="flex items-center gap-3">
-                    <span className="w-14 flex-shrink-0 text-sm font-semibold text-slate-700">{short}</span>
-                    <div className="relative flex-1">
-                      <span className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 text-sm">$</span>
-                      <input
-                        type="number"
-                        min="0"
-                        value={form.fees[key]}
-                        onChange={(e) => setFee(key, e.target.value)}
-                        className={inputCls + ' pl-7'}
-                      />
-                    </div>
-                  </div>
-                ))}
-              </div>
-
-              <div className="border-t border-slate-100 pt-3.5 space-y-2.5">
-                <label className="flex items-center gap-2 cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={form.freeShippingEnabled}
-                    onChange={(e) => setForm(prev => ({ ...prev, freeShippingEnabled: e.target.checked }))}
-                    className="w-4 h-4 accent-emerald-600"
-                  />
-                  <span className="text-xs font-bold text-slate-600">滿額免運</span>
-                </label>
-                {form.freeShippingEnabled && (
-                  <div className="flex items-center gap-3">
-                    <span className="text-sm text-slate-600 flex-shrink-0">訂單小計滿</span>
-                    <div className="relative flex-1">
-                      <span className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 text-sm">$</span>
-                      <input
-                        type="number"
-                        min="0"
-                        value={form.freeShippingThreshold}
-                        onChange={(e) => setForm(prev => ({ ...prev, freeShippingThreshold: e.target.value }))}
-                        className={inputCls + ' pl-7'}
-                      />
-                    </div>
-                    <span className="text-sm text-slate-600 flex-shrink-0">免運費</span>
-                  </div>
-                )}
-                <p className="text-[11px] text-slate-400">
-                  免運不含商品折抵金額；以商品小計（不含運費）判斷。
-                </p>
-              </div>
-
-              {error && (
-                <div className="text-xs text-red-600 bg-red-50 border border-red-200 rounded-lg px-3 py-2 flex items-center gap-2">
-                  <IconAlertTriangle size={16} />
-                  {error}
+            <div className="flex-1 overflow-y-auto p-5 space-y-3">
+              {undatedPromoNames.length > 0 && (
+                <div className="text-[12px] leading-snug text-amber-800 bg-amber-50 border border-amber-200 rounded-xl px-3 py-2">
+                  ⚠️ 這則訊息帶出了沒設活動期間的長期優惠：{undatedPromoNames.join('、')}。如果活動已經結束，請到「更多 → 編輯公版訊息」設定日期或關閉，才不會之後的訊息一直帶優惠。
                 </div>
               )}
-
-              <div className="flex gap-2 pt-1">
-                <button type="button" onClick={onClose} className="flex-1 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold rounded-xl text-sm transition">
-                  取消
+              <textarea
+                value={text}
+                onChange={(e) => { setText(e.target.value); setCopied(false); }}
+                rows={14}
+                className="w-full text-sm leading-relaxed p-3 rounded-xl border border-slate-200 focus:outline-none focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500 bg-slate-50"
+              />
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  onClick={() => { setText(buildOrderMessage(order, template)); setCopied(false); }}
+                  className="px-4 py-3 bg-slate-100 hover:bg-slate-200 text-slate-600 font-bold text-sm rounded-xl whitespace-nowrap"
+                >
+                  還原預設
                 </button>
                 <button
-                  type="submit"
-                  disabled={isSaving}
-                  className="flex-1 py-2.5 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white font-semibold rounded-xl text-sm transition shadow-md flex items-center justify-center gap-1"
+                  type="button"
+                  onClick={handleCopy}
+                  className={`flex-1 py-3 font-bold text-sm rounded-xl text-white ${copied ? 'bg-emerald-500' : 'bg-emerald-600 hover:bg-emerald-700'}`}
                 >
-                  <IconCheck size={18} />
-                  {isSaving ? '儲存中...' : '儲存設定'}
+                  {copied ? '✓ 已複製（可再複製一次）' : '📋 複製訊息'}
                 </button>
               </div>
-            </form>
+            </div>
           </div>
+        </div>
+      );
+    }
+  </script>
+  <script type="text/babel">
+    // ==========================================
+    // ui-product-pick.js  (v2.14.9 Phase 3，由 ui-shared.js 原樣搬出)
+    // 商品挑選元件：篩選膠囊、快速挑選晶片、商品挑選面板（新增訂單與編輯訂單共用）
+    // 只搬位置，不改內容；各檔案共用全域（見 index.html 的載入順序）
+    // ==========================================
+
+    // ==========================================
+    // [V2.1] 訂單列表升級：小元件
+    // ==========================================
+    function FilterPills({ value, onChange, options }) {
+      return (
+        <div className="bg-slate-100 p-1 rounded-xl flex items-center gap-1">
+          {options.map(opt => (
+            <button
+              key={opt.key}
+              type="button"
+              onClick={() => onChange(opt.key)}
+              className={`px-2.5 sm:px-3 py-1.5 rounded-lg text-xs font-medium transition whitespace-nowrap ${
+                value === opt.key ? 'bg-white text-slate-800 font-bold shadow-sm' : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              {opt.label}
+            </button>
+          ))}
         </div>
       );
     }
@@ -2827,7 +2833,286 @@
         </div>
       );
     }
+  </script>
+  <script type="text/babel">
+    // ==========================================
+    // modal-settings.js  (v2.14.9 Phase 3，由 ui-shared.js 原樣搬出)
+    // 設定類彈窗：運費與物流設定、公版訊息設定
+    // 只搬位置，不改內容；各檔案共用全域（見 index.html 的載入順序）
+    // ==========================================
 
+    // ==========================================
+    // [V2.4] 快速帶入：商品晶片（可選取 / 單一規格可一鍵＋）
+    // ==========================================
+    // ==========================================
+    // [V2.12] 運費與折扣設定視窗（老婆可以自己改，不用透過開發者）
+    // ==========================================
+    function ShippingSettingsModal({ config, isSaving, onSave, onClose }) {
+      const [form, setForm] = React.useState(() => ({ ...config, fees: { ...config.fees } }));
+      const [error, setError] = React.useState('');
+
+      const setFee = (key, val) => setForm(prev => ({ ...prev, fees: { ...prev.fees, [key]: val } }));
+
+      const handleSubmit = (e) => {
+        e.preventDefault();
+        setError('');
+        for (const { key, short } of DELIVERY_METHODS) {
+          const v = Number(form.fees[key]);
+          if (!Number.isFinite(v) || v < 0) { setError(`「${short}」的運費請輸入 0 以上的數字`); return; }
+        }
+        if (form.freeShippingEnabled) {
+          const t = Number(form.freeShippingThreshold);
+          if (!Number.isFinite(t) || t < 0) { setError('免運門檻請輸入 0 以上的數字'); return; }
+        }
+        onSave({
+          fees: Object.fromEntries(DELIVERY_METHODS.map(({ key }) => [key, Math.round(Number(form.fees[key]))])),
+          freeShippingEnabled: Boolean(form.freeShippingEnabled),
+          freeShippingThreshold: Math.round(Number(form.freeShippingThreshold) || 0)
+        });
+      };
+
+      const inputCls = "w-full text-sm px-3 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:border-emerald-500 bg-white";
+
+      return (
+        <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-sm flex items-end sm:items-center justify-center" onClick={onClose}>
+          <div
+            className="bg-white w-full sm:max-w-md rounded-t-3xl sm:rounded-2xl shadow-2xl flex flex-col max-h-[88vh]"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="px-5 pt-4 pb-3 flex items-center justify-between border-b border-slate-100">
+              <div>
+                <h3 className="font-bold text-base text-slate-800">⚙️ 運費與折扣設定</h3>
+                <p className="text-[11px] text-slate-400">新增訂單時會依物流方式自動帶入，之後仍可手動修改</p>
+              </div>
+              <button type="button" onClick={onClose} className="p-1.5 text-slate-400 hover:text-slate-700 rounded-lg hover:bg-slate-100">
+                <IconX size={22} />
+              </button>
+            </div>
+
+            <form onSubmit={handleSubmit} className="p-5 space-y-4 overflow-y-auto">
+              <div className="space-y-2.5">
+                <label className="text-xs font-bold text-slate-600 block">各物流方式的運費</label>
+                {DELIVERY_METHODS.map(({ key, short }) => (
+                  <div key={key} className="flex items-center gap-3">
+                    <span className="w-14 flex-shrink-0 text-sm font-semibold text-slate-700">{short}</span>
+                    <div className="relative flex-1">
+                      <span className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 text-sm">$</span>
+                      <input
+                        type="number"
+                        min="0"
+                        value={form.fees[key]}
+                        onChange={(e) => setFee(key, e.target.value)}
+                        className={inputCls + ' pl-7'}
+                      />
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              <div className="border-t border-slate-100 pt-3.5 space-y-2.5">
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={form.freeShippingEnabled}
+                    onChange={(e) => setForm(prev => ({ ...prev, freeShippingEnabled: e.target.checked }))}
+                    className="w-4 h-4 accent-emerald-600"
+                  />
+                  <span className="text-xs font-bold text-slate-600">滿額免運</span>
+                </label>
+                {form.freeShippingEnabled && (
+                  <div className="flex items-center gap-3">
+                    <span className="text-sm text-slate-600 flex-shrink-0">訂單小計滿</span>
+                    <div className="relative flex-1">
+                      <span className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 text-sm">$</span>
+                      <input
+                        type="number"
+                        min="0"
+                        value={form.freeShippingThreshold}
+                        onChange={(e) => setForm(prev => ({ ...prev, freeShippingThreshold: e.target.value }))}
+                        className={inputCls + ' pl-7'}
+                      />
+                    </div>
+                    <span className="text-sm text-slate-600 flex-shrink-0">免運費</span>
+                  </div>
+                )}
+                <p className="text-[11px] text-slate-400">
+                  免運不含商品折抵金額；以商品小計（不含運費）判斷。
+                </p>
+              </div>
+
+              {error && (
+                <div className="text-xs text-red-600 bg-red-50 border border-red-200 rounded-lg px-3 py-2 flex items-center gap-2">
+                  <IconAlertTriangle size={16} />
+                  {error}
+                </div>
+              )}
+
+              <div className="flex gap-2 pt-1">
+                <button type="button" onClick={onClose} className="flex-1 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold rounded-xl text-sm transition">
+                  取消
+                </button>
+                <button
+                  type="submit"
+                  disabled={isSaving}
+                  className="flex-1 py-2.5 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white font-semibold rounded-xl text-sm transition shadow-md flex items-center justify-center gap-1"
+                >
+                  <IconCheck size={18} />
+                  {isSaving ? '儲存中...' : '儲存設定'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      );
+    }
+
+    function MessageTemplateModal({ template, onSave, onClose, isSaving }) {
+      const [form, setForm] = React.useState(() => sanitizeMessageTemplate(template));
+      const todayStr = toDateInputValue(Date.now());
+      const [previewDate, setPreviewDate] = React.useState(todayStr); // [v2.14.7] 預覽用的「訂單日期」（可選未來，看活動還沒開始時的樣子）
+
+      // 預覽用的範例訂單（不是真的訂單）
+      const sampleOrder = {
+        timestamp: new Date(`${previewDate || todayStr}T12:00:00`).getTime(),
+        customerName: '王小美',
+        deliveryMethod: '7-11 取貨付款',
+        shippingFee: 38,
+        items: [
+          { name: '手繪小熊條紋百搭外套', color: '卡其色', size: '90', price: 550, qty: 1 },
+          { name: '手繪小熊長袖大學T恤', color: '米色', size: '90', price: 365, qty: 1 }
+        ]
+      };
+
+      const setField = (k, v) => setForm(prev => ({ ...prev, [k]: v }));
+      const updateRule = (id, patch) => setForm(prev => ({
+        ...prev, discounts: prev.discounts.map(d => d.id === id ? { ...d, ...patch } : d)
+      }));
+      const addRule = () => setForm(prev => ({
+        ...prev,
+        discounts: [...prev.discounts, { id: `d_${Date.now()}`, enabled: true, minQty: 2, percent: 95, label: '滿2件95折', startDate: '', endDate: '' }]
+      }));
+      const removeRule = (id) => setForm(prev => ({ ...prev, discounts: prev.discounts.filter(d => d.id !== id) }));
+
+      const inputCls = "w-full text-sm px-3 py-2 rounded-lg border border-slate-200 focus:outline-none focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500 bg-white";
+
+      return (
+        <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-sm flex items-end sm:items-center justify-center" onClick={onClose}>
+          <div className="bg-white w-full sm:max-w-lg rounded-t-3xl sm:rounded-2xl shadow-2xl flex flex-col max-h-[92vh]" onClick={(e) => e.stopPropagation()}>
+            <div className="px-5 pt-4 pb-3 flex items-center justify-between border-b border-slate-100">
+              <div>
+                <h3 className="font-bold text-base text-slate-800">💬 公版訊息設定</h3>
+                <p className="text-[11px] text-slate-400">商品清單與運費會依每張訂單自動產生</p>
+              </div>
+              <button type="button" onClick={onClose} className="p-1.5 text-slate-400 hover:text-slate-700 rounded-lg hover:bg-slate-100">
+                <IconX size={22} />
+              </button>
+            </div>
+
+            <div className="flex-1 overflow-y-auto p-5 space-y-5">
+              <div>
+                <label className="text-xs font-semibold text-slate-600 mb-1 block">前綴（訊息第一行）</label>
+                <input type="text" value={form.prefix} onChange={(e) => setField('prefix', e.target.value)} className={inputCls} placeholder="例如：訂購單" />
+              </div>
+
+              <div>
+                <div className="flex items-center justify-between mb-1">
+                  <label className="text-xs font-semibold text-slate-600">優惠規則（用來計算訊息裡的優惠金額）</label>
+                  <button type="button" onClick={addRule} className="text-xs font-bold text-emerald-700">＋ 新增</button>
+                </div>
+                <div className="space-y-2">
+                  {form.discounts.length === 0 && (
+                    <p className="text-[11px] text-slate-400 bg-slate-50 rounded-lg px-3 py-2">目前沒有優惠規則</p>
+                  )}
+                  {form.discounts.map(d => (
+                    <div key={d.id} className="border border-slate-200 rounded-xl p-2.5 space-y-2">
+                      <div className="flex items-center gap-2 text-xs text-slate-600">
+                        <input type="checkbox" checked={d.enabled} onChange={(e) => updateRule(d.id, { enabled: e.target.checked })} className="w-4 h-4 accent-emerald-600" />
+                        <span>滿</span>
+                        <input type="number" min="1" value={d.minQty} onChange={(e) => updateRule(d.id, { minQty: Number(e.target.value) })} className="w-14 text-sm px-2 py-1 rounded-lg border border-slate-200" />
+                        <span>件，</span>
+                        <input type="number" min="1" max="99" value={d.percent} onChange={(e) => updateRule(d.id, { percent: Number(e.target.value) })} className="w-14 text-sm px-2 py-1 rounded-lg border border-slate-200" />
+                        <span>折</span>
+                        <button type="button" onClick={() => removeRule(d.id)} className="ml-auto text-slate-400 hover:text-red-600 p-1"><IconTrash2 size={15} /></button>
+                      </div>
+                      <input type="text" value={d.label} onChange={(e) => updateRule(d.id, { label: e.target.value })} className={inputCls} placeholder="訊息顯示文字，例如：滿兩件95折" />
+                      <div className="flex items-center gap-1.5 text-[11px] text-slate-500">
+                        <span className="shrink-0">活動期間</span>
+                        <input type="date" value={d.startDate || ''} onChange={(e) => updateRule(d.id, { startDate: e.target.value })} className="flex-1 min-w-0 text-xs px-2 py-1 rounded-lg border border-slate-200" />
+                        <span>～</span>
+                        <input type="date" value={d.endDate || ''} onChange={(e) => updateRule(d.id, { endDate: e.target.value })} className="flex-1 min-w-0 text-xs px-2 py-1 rounded-lg border border-slate-200" />
+                      </div>
+                      {(() => {
+                        const info = describePromoPeriod(d.startDate, d.endDate, todayStr);
+                        // [v2.14.8] 停用的規則一律灰色只顯示「已停用」，避免與「套用中」並列的矛盾文字
+                        if (!d.enabled) return <p className="text-[11px] text-slate-400">已停用（不會套用）</p>;
+                        const cls = info.state === 'active' ? 'text-emerald-700' : info.state === 'upcoming' ? 'text-sky-700' : info.state === 'ended' ? 'text-slate-400' : 'text-amber-700';
+                        return <p className={`text-[11px] ${cls}`}>{info.text}</p>;
+                      })()}
+                    </div>
+                  ))}
+                </div>
+                <p className="text-[11px] text-slate-400 mt-1.5">折數填 95 代表 95 折（原價 ×0.95）。多條規則同時符合時，只套用折後最便宜的那一條。優惠只影響訊息顯示，不會改動訂單本身的金額。<b>優惠依「訂單日期」判斷：訂單日期落在活動期間內才會套用</b>，不用再手動關閉；日期都留空＝長期有效。</p>
+              </div>
+
+              <div>
+                <label className="text-xs font-semibold text-slate-600 mb-1 block">自訂優惠／備註行（每行一句，會加在運費上方）</label>
+                <textarea
+                  rows={3}
+                  value={form.customLines.join('\n')}
+                  onChange={(e) => setField('customLines', e.target.value.split('\n'))}
+                  className={inputCls}
+                  placeholder="例如：本週加購小物85折"
+                />
+                <div className="flex items-center gap-1.5 text-[11px] text-slate-500 mt-1.5">
+                  <span className="shrink-0">這幾行的活動期間</span>
+                  <input type="date" value={form.customLinesStartDate || ''} onChange={(e) => setField('customLinesStartDate', e.target.value)} className="flex-1 min-w-0 text-xs px-2 py-1 rounded-lg border border-slate-200" />
+                  <span>～</span>
+                  <input type="date" value={form.customLinesEndDate || ''} onChange={(e) => setField('customLinesEndDate', e.target.value)} className="flex-1 min-w-0 text-xs px-2 py-1 rounded-lg border border-slate-200" />
+                </div>
+                {form.customLines.some(x => String(x).trim()) && (() => {
+                  const info = describePromoPeriod(form.customLinesStartDate, form.customLinesEndDate, todayStr);
+                  const cls = info.state === 'active' ? 'text-emerald-700' : info.state === 'upcoming' ? 'text-sky-700' : info.state === 'ended' ? 'text-slate-400' : 'text-amber-700';
+                  return <p className={`text-[11px] mt-1 ${cls}`}>{info.text}</p>;
+                })()}
+                <label className="flex items-center gap-2 mt-2 text-xs text-slate-600">
+                  <input type="checkbox" checked={form.showSubtotalWhenNoDiscount} onChange={(e) => setField('showSubtotalWhenNoDiscount', e.target.checked)} className="w-4 h-4 accent-emerald-600" />
+                  沒有符合優惠時，仍顯示「商品金額」一行
+                </label>
+              </div>
+
+              <div>
+                <label className="text-xs font-semibold text-slate-600 mb-1 block">後綴（訊息最後一段）</label>
+                <textarea rows={3} value={form.suffix} onChange={(e) => setField('suffix', e.target.value)} className={inputCls} />
+                <p className="text-[11px] text-slate-400 mt-1">輸入 {'{顧客姓名}'} 會自動換成該訂單的客人名字（前綴、自訂行也可使用）。</p>
+              </div>
+
+              <div>
+                <label className="text-xs font-semibold text-slate-600 mb-1 block">預覽（範例訂單）</label>
+                <div className="flex items-center gap-2 mb-1.5 text-[11px] text-slate-500">
+                  <span className="shrink-0">假設訂單日期</span>
+                  <input type="date" value={previewDate} onChange={(e) => setPreviewDate(e.target.value)} className="flex-1 min-w-0 text-xs px-2 py-1 rounded-lg border border-slate-200" />
+                </div>
+                <pre className="text-xs leading-relaxed whitespace-pre-wrap bg-slate-50 border border-slate-200 rounded-xl p-3 text-slate-700">{buildOrderMessage(sampleOrder, form)}</pre>
+              </div>
+            </div>
+
+            <div className="p-4 border-t border-slate-100 flex gap-2">
+              <button type="button" onClick={() => setForm(sanitizeMessageTemplate(null))} className="px-4 py-3 bg-slate-100 hover:bg-slate-200 text-slate-600 font-bold text-sm rounded-xl whitespace-nowrap">還原預設</button>
+              <button type="button" disabled={isSaving} onClick={() => onSave(sanitizeMessageTemplate(form))} className="flex-1 py-3 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white font-bold text-sm rounded-xl">
+                {isSaving ? '儲存中…' : '儲存設定'}
+              </button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+  </script>
+  <script type="text/babel">
+    // ==========================================
+    // modal-maintenance.js  (v2.14.9 Phase 3，由 ui-shared.js 原樣搬出)
+    // 維運類彈窗：回收桶、還原備份、操作日誌、黑名單
+    // 只搬位置，不改內容；各檔案共用全域（見 index.html 的載入順序）
+    // ==========================================
 
     // ==========================================
     // [V2.7] 回收桶視窗：還原 / 永久刪除
@@ -3343,223 +3628,6 @@
                   </button>
                 </>
               )}
-            </div>
-          </div>
-        </div>
-      );
-    }
-
-
-    // ==========================================
-    // [v2.14.0] 公版訊息：傳給客人確認訂單用
-    // OrderMessageModal：顯示依訂單產生的訊息，可微調後一鍵複製（複製一定要在使用者點按鈕的當下，手機/LINE瀏覽器才不會被擋）
-    // MessageTemplateModal：維護前綴、後綴、優惠規則、自訂優惠行，並有即時預覽
-    // ==========================================
-    function OrderMessageModal({ order, template, onClose, showToast }) {
-      const [text, setText] = React.useState(() => buildOrderMessage(order, template));
-      const [copied, setCopied] = React.useState(false);
-      // [v2.14.8] 這則訊息若帶出了「沒設活動期間」的長期優惠，提醒使用者（避免活動結束後忘了關，一直帶優惠）
-      const undatedPromoNames = React.useMemo(() => {
-        const t = sanitizeMessageTemplate(template);
-        const base = buildOrderMessage(order, template);
-        const names = t.discounts
-          .filter(d => d.enabled && d.percent > 0 && d.percent < 100 && !d.startDate && !d.endDate && d.label && base.includes(d.label))
-          .map(d => d.label);
-        const lines = t.customLines.map(x => String(x).trim()).filter(x => x && !x.includes('{') && !t.customLinesStartDate && !t.customLinesEndDate && base.includes(x));
-        return [...names, ...lines.map(x => `自訂行「${x.length > 12 ? x.slice(0, 12) + '…' : x}」`)];
-      }, [order, template]);
-
-      const handleCopy = async () => {
-        const ok = await copyTextToClipboard(text);
-        if (ok) {
-          setCopied(true);
-          showToast('📋 已複製，可以貼到 LINE / IG 給客人了');
-        } else {
-          showToast('❌ 這個瀏覽器不允許自動複製，請長按文字框手動全選複製');
-        }
-      };
-
-      return (
-        <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-sm flex items-end sm:items-center justify-center" onClick={onClose}>
-          <div className="bg-white w-full sm:max-w-lg rounded-t-3xl sm:rounded-2xl shadow-2xl flex flex-col max-h-[90vh]" onClick={(e) => e.stopPropagation()}>
-            <div className="px-5 pt-4 pb-3 flex items-center justify-between border-b border-slate-100">
-              <div>
-                <h3 className="font-bold text-base text-slate-800">💬 給客人的確認訊息</h3>
-                <p className="text-[11px] text-slate-400">{order.customerName} · 可直接修改文字後再複製</p>
-              </div>
-              <button type="button" onClick={onClose} className="p-1.5 text-slate-400 hover:text-slate-700 rounded-lg hover:bg-slate-100">
-                <IconX size={22} />
-              </button>
-            </div>
-            <div className="flex-1 overflow-y-auto p-5 space-y-3">
-              {undatedPromoNames.length > 0 && (
-                <div className="text-[12px] leading-snug text-amber-800 bg-amber-50 border border-amber-200 rounded-xl px-3 py-2">
-                  ⚠️ 這則訊息帶出了沒設活動期間的長期優惠：{undatedPromoNames.join('、')}。如果活動已經結束，請到「更多 → 編輯公版訊息」設定日期或關閉，才不會之後的訊息一直帶優惠。
-                </div>
-              )}
-              <textarea
-                value={text}
-                onChange={(e) => { setText(e.target.value); setCopied(false); }}
-                rows={14}
-                className="w-full text-sm leading-relaxed p-3 rounded-xl border border-slate-200 focus:outline-none focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500 bg-slate-50"
-              />
-              <div className="flex gap-2">
-                <button
-                  type="button"
-                  onClick={() => { setText(buildOrderMessage(order, template)); setCopied(false); }}
-                  className="px-4 py-3 bg-slate-100 hover:bg-slate-200 text-slate-600 font-bold text-sm rounded-xl whitespace-nowrap"
-                >
-                  還原預設
-                </button>
-                <button
-                  type="button"
-                  onClick={handleCopy}
-                  className={`flex-1 py-3 font-bold text-sm rounded-xl text-white ${copied ? 'bg-emerald-500' : 'bg-emerald-600 hover:bg-emerald-700'}`}
-                >
-                  {copied ? '✓ 已複製（可再複製一次）' : '📋 複製訊息'}
-                </button>
-              </div>
-            </div>
-          </div>
-        </div>
-      );
-    }
-
-    function MessageTemplateModal({ template, onSave, onClose, isSaving }) {
-      const [form, setForm] = React.useState(() => sanitizeMessageTemplate(template));
-      const todayStr = toDateInputValue(Date.now());
-      const [previewDate, setPreviewDate] = React.useState(todayStr); // [v2.14.7] 預覽用的「訂單日期」（可選未來，看活動還沒開始時的樣子）
-
-      // 預覽用的範例訂單（不是真的訂單）
-      const sampleOrder = {
-        timestamp: new Date(`${previewDate || todayStr}T12:00:00`).getTime(),
-        customerName: '王小美',
-        deliveryMethod: '7-11 取貨付款',
-        shippingFee: 38,
-        items: [
-          { name: '手繪小熊條紋百搭外套', color: '卡其色', size: '90', price: 550, qty: 1 },
-          { name: '手繪小熊長袖大學T恤', color: '米色', size: '90', price: 365, qty: 1 }
-        ]
-      };
-
-      const setField = (k, v) => setForm(prev => ({ ...prev, [k]: v }));
-      const updateRule = (id, patch) => setForm(prev => ({
-        ...prev, discounts: prev.discounts.map(d => d.id === id ? { ...d, ...patch } : d)
-      }));
-      const addRule = () => setForm(prev => ({
-        ...prev,
-        discounts: [...prev.discounts, { id: `d_${Date.now()}`, enabled: true, minQty: 2, percent: 95, label: '滿2件95折', startDate: '', endDate: '' }]
-      }));
-      const removeRule = (id) => setForm(prev => ({ ...prev, discounts: prev.discounts.filter(d => d.id !== id) }));
-
-      const inputCls = "w-full text-sm px-3 py-2 rounded-lg border border-slate-200 focus:outline-none focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500 bg-white";
-
-      return (
-        <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-sm flex items-end sm:items-center justify-center" onClick={onClose}>
-          <div className="bg-white w-full sm:max-w-lg rounded-t-3xl sm:rounded-2xl shadow-2xl flex flex-col max-h-[92vh]" onClick={(e) => e.stopPropagation()}>
-            <div className="px-5 pt-4 pb-3 flex items-center justify-between border-b border-slate-100">
-              <div>
-                <h3 className="font-bold text-base text-slate-800">💬 公版訊息設定</h3>
-                <p className="text-[11px] text-slate-400">商品清單與運費會依每張訂單自動產生</p>
-              </div>
-              <button type="button" onClick={onClose} className="p-1.5 text-slate-400 hover:text-slate-700 rounded-lg hover:bg-slate-100">
-                <IconX size={22} />
-              </button>
-            </div>
-
-            <div className="flex-1 overflow-y-auto p-5 space-y-5">
-              <div>
-                <label className="text-xs font-semibold text-slate-600 mb-1 block">前綴（訊息第一行）</label>
-                <input type="text" value={form.prefix} onChange={(e) => setField('prefix', e.target.value)} className={inputCls} placeholder="例如：訂購單" />
-              </div>
-
-              <div>
-                <div className="flex items-center justify-between mb-1">
-                  <label className="text-xs font-semibold text-slate-600">優惠規則（用來計算訊息裡的優惠金額）</label>
-                  <button type="button" onClick={addRule} className="text-xs font-bold text-emerald-700">＋ 新增</button>
-                </div>
-                <div className="space-y-2">
-                  {form.discounts.length === 0 && (
-                    <p className="text-[11px] text-slate-400 bg-slate-50 rounded-lg px-3 py-2">目前沒有優惠規則</p>
-                  )}
-                  {form.discounts.map(d => (
-                    <div key={d.id} className="border border-slate-200 rounded-xl p-2.5 space-y-2">
-                      <div className="flex items-center gap-2 text-xs text-slate-600">
-                        <input type="checkbox" checked={d.enabled} onChange={(e) => updateRule(d.id, { enabled: e.target.checked })} className="w-4 h-4 accent-emerald-600" />
-                        <span>滿</span>
-                        <input type="number" min="1" value={d.minQty} onChange={(e) => updateRule(d.id, { minQty: Number(e.target.value) })} className="w-14 text-sm px-2 py-1 rounded-lg border border-slate-200" />
-                        <span>件，</span>
-                        <input type="number" min="1" max="99" value={d.percent} onChange={(e) => updateRule(d.id, { percent: Number(e.target.value) })} className="w-14 text-sm px-2 py-1 rounded-lg border border-slate-200" />
-                        <span>折</span>
-                        <button type="button" onClick={() => removeRule(d.id)} className="ml-auto text-slate-400 hover:text-red-600 p-1"><IconTrash2 size={15} /></button>
-                      </div>
-                      <input type="text" value={d.label} onChange={(e) => updateRule(d.id, { label: e.target.value })} className={inputCls} placeholder="訊息顯示文字，例如：滿兩件95折" />
-                      <div className="flex items-center gap-1.5 text-[11px] text-slate-500">
-                        <span className="shrink-0">活動期間</span>
-                        <input type="date" value={d.startDate || ''} onChange={(e) => updateRule(d.id, { startDate: e.target.value })} className="flex-1 min-w-0 text-xs px-2 py-1 rounded-lg border border-slate-200" />
-                        <span>～</span>
-                        <input type="date" value={d.endDate || ''} onChange={(e) => updateRule(d.id, { endDate: e.target.value })} className="flex-1 min-w-0 text-xs px-2 py-1 rounded-lg border border-slate-200" />
-                      </div>
-                      {(() => {
-                        const info = describePromoPeriod(d.startDate, d.endDate, todayStr);
-                        // [v2.14.8] 停用的規則一律灰色只顯示「已停用」，避免與「套用中」並列的矛盾文字
-                        if (!d.enabled) return <p className="text-[11px] text-slate-400">已停用（不會套用）</p>;
-                        const cls = info.state === 'active' ? 'text-emerald-700' : info.state === 'upcoming' ? 'text-sky-700' : info.state === 'ended' ? 'text-slate-400' : 'text-amber-700';
-                        return <p className={`text-[11px] ${cls}`}>{info.text}</p>;
-                      })()}
-                    </div>
-                  ))}
-                </div>
-                <p className="text-[11px] text-slate-400 mt-1.5">折數填 95 代表 95 折（原價 ×0.95）。多條規則同時符合時，只套用折後最便宜的那一條。優惠只影響訊息顯示，不會改動訂單本身的金額。<b>優惠依「訂單日期」判斷：訂單日期落在活動期間內才會套用</b>，不用再手動關閉；日期都留空＝長期有效。</p>
-              </div>
-
-              <div>
-                <label className="text-xs font-semibold text-slate-600 mb-1 block">自訂優惠／備註行（每行一句，會加在運費上方）</label>
-                <textarea
-                  rows={3}
-                  value={form.customLines.join('\n')}
-                  onChange={(e) => setField('customLines', e.target.value.split('\n'))}
-                  className={inputCls}
-                  placeholder="例如：本週加購小物85折"
-                />
-                <div className="flex items-center gap-1.5 text-[11px] text-slate-500 mt-1.5">
-                  <span className="shrink-0">這幾行的活動期間</span>
-                  <input type="date" value={form.customLinesStartDate || ''} onChange={(e) => setField('customLinesStartDate', e.target.value)} className="flex-1 min-w-0 text-xs px-2 py-1 rounded-lg border border-slate-200" />
-                  <span>～</span>
-                  <input type="date" value={form.customLinesEndDate || ''} onChange={(e) => setField('customLinesEndDate', e.target.value)} className="flex-1 min-w-0 text-xs px-2 py-1 rounded-lg border border-slate-200" />
-                </div>
-                {form.customLines.some(x => String(x).trim()) && (() => {
-                  const info = describePromoPeriod(form.customLinesStartDate, form.customLinesEndDate, todayStr);
-                  const cls = info.state === 'active' ? 'text-emerald-700' : info.state === 'upcoming' ? 'text-sky-700' : info.state === 'ended' ? 'text-slate-400' : 'text-amber-700';
-                  return <p className={`text-[11px] mt-1 ${cls}`}>{info.text}</p>;
-                })()}
-                <label className="flex items-center gap-2 mt-2 text-xs text-slate-600">
-                  <input type="checkbox" checked={form.showSubtotalWhenNoDiscount} onChange={(e) => setField('showSubtotalWhenNoDiscount', e.target.checked)} className="w-4 h-4 accent-emerald-600" />
-                  沒有符合優惠時，仍顯示「商品金額」一行
-                </label>
-              </div>
-
-              <div>
-                <label className="text-xs font-semibold text-slate-600 mb-1 block">後綴（訊息最後一段）</label>
-                <textarea rows={3} value={form.suffix} onChange={(e) => setField('suffix', e.target.value)} className={inputCls} />
-                <p className="text-[11px] text-slate-400 mt-1">輸入 {'{顧客姓名}'} 會自動換成該訂單的客人名字（前綴、自訂行也可使用）。</p>
-              </div>
-
-              <div>
-                <label className="text-xs font-semibold text-slate-600 mb-1 block">預覽（範例訂單）</label>
-                <div className="flex items-center gap-2 mb-1.5 text-[11px] text-slate-500">
-                  <span className="shrink-0">假設訂單日期</span>
-                  <input type="date" value={previewDate} onChange={(e) => setPreviewDate(e.target.value)} className="flex-1 min-w-0 text-xs px-2 py-1 rounded-lg border border-slate-200" />
-                </div>
-                <pre className="text-xs leading-relaxed whitespace-pre-wrap bg-slate-50 border border-slate-200 rounded-xl p-3 text-slate-700">{buildOrderMessage(sampleOrder, form)}</pre>
-              </div>
-            </div>
-
-            <div className="p-4 border-t border-slate-100 flex gap-2">
-              <button type="button" onClick={() => setForm(sanitizeMessageTemplate(null))} className="px-4 py-3 bg-slate-100 hover:bg-slate-200 text-slate-600 font-bold text-sm rounded-xl whitespace-nowrap">還原預設</button>
-              <button type="button" disabled={isSaving} onClick={() => onSave(sanitizeMessageTemplate(form))} className="flex-1 py-3 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white font-bold text-sm rounded-xl">
-                {isSaving ? '儲存中…' : '儲存設定'}
-              </button>
             </div>
           </div>
         </div>
