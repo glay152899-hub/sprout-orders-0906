@@ -59,7 +59,7 @@
     // ==========================================
     // config.js — 版本號 / Firebase設定 / 常數設定值
     // ==========================================
-    const APP_VERSION = '2.14.11';
+    const APP_VERSION = '2.14.12';
     document.title = `Sprout 📱 小豆苗訂單助手 V${APP_VERSION} (Firebase RTDB 實時同步版)`;
 
     const firebaseConfig = {
@@ -607,6 +607,10 @@
       shippingFee: Number(order?.shippingFee) ?? 60,
       paymentStatus: Boolean(order?.paymentStatus),
       shipmentStatus: order?.shipmentStatus || 'unshipped',
+      // [v2.14.12] paymentStatus 的畫面名稱改為「已領貨／未領貨」（取貨付款：領貨＝款項入帳；轉帳：收到款就算）。
+      // paidDate＝領貨（入帳）日 YYYY-MM-DD，空白＝舊資料沒記，收支報表退回用訂單日期；closeStatus＝'abandoned' 代表棄單（不計營收）
+      paidDate: /^\d{4}-\d{2}-\d{2}$/.test(String(order?.paidDate || '')) ? order.paidDate : '',
+      closeStatus: order?.closeStatus === 'abandoned' ? 'abandoned' : '',
       items: Array.isArray(order?.items) ? order.items.map(sanitizeItem) : [],
       note: order?.note || '',
       createdAt: order?.createdAt || new Date().toLocaleString('zh-TW', { hour12: false }),
@@ -686,7 +690,9 @@
       storeName: '門市名稱',
       storeAddress: '地址', // [v2.13.0新增]
       shippingFee: '運費',
-      paymentStatus: '付款狀態',
+      paymentStatus: '領貨狀態',
+      paidDate: '領貨日',
+      closeStatus: '棄單',
       shipmentStatus: '出貨狀態',
       note: '備註',
       items: '商品明細'
@@ -703,7 +709,8 @@
 
     const formatLogValue = (key, value) => {
       if (key === 'timestamp') return toDateInputValue(value) || String(value);
-      if (key === 'paymentStatus') return value ? '已付款' : '未付款';
+      if (key === 'paymentStatus') return value ? '已領貨' : '未領貨';
+      if (key === 'closeStatus') return value === 'abandoned' ? '棄單' : '正常';
       if (key === 'shipmentStatus') return value === 'shipped' ? '已出貨' : '待出貨';
       if (value === '' || value === null || value === undefined) return '（空）';
       return String(value);
@@ -1900,7 +1907,7 @@
         '配送方式': o.deliveryMethod,
         '門市名稱': deriveStoreDisplay(o).name,
         '地址': deriveStoreDisplay(o).address,
-        '付款狀態': o.paymentStatus ? '已付款' : '未付款',
+        '領貨狀態': o.closeStatus === 'abandoned' ? '棄單' : (o.paymentStatus ? '已領貨' : '未領貨'),
         '出貨狀態': o.shipmentStatus === 'shipped' ? '已出貨' : '待出貨',
         '商品明細': o.items.map(i =>
           isAdjustmentItem(i)
@@ -1937,7 +1944,7 @@
     // 訂單 CSV 全文（含 BOM）（handleExportCSV 用）
     const buildOrdersCsv = (orders) => {
       let csvContent = '\uFEFF';
-      csvContent += '訂單編號,顧客姓名,電話,LINE,IG,配送方式,門市名稱,地址,購買品項細項,商品小計,運費,訂單總金額,付款狀態,出貨狀態,備註事項,建立時間\n';
+      csvContent += '訂單編號,顧客姓名,電話,LINE,IG,配送方式,門市名稱,地址,購買品項細項,商品小計,運費,訂單總金額,領貨狀態,出貨狀態,備註事項,建立時間\n';
 
       orders.forEach(o => {
         const itemsDetail = o.items.map(i => `[${i.sku}]${i.name}-${i.color}/${i.size} x${i.qty}`).join('; ');
@@ -1958,7 +1965,7 @@
           subtotal,
           o.shippingFee,
           total,
-          o.paymentStatus ? '已付款' : '未付款',
+          o.closeStatus === 'abandoned' ? '棄單' : (o.paymentStatus ? '已領貨' : '未領貨'),
           o.shipmentStatus === 'shipped' ? '已出貨' : '待出貨',
           `"${(o.note || '').replace(/"/g, '""')}"`,
           `"${o.createdAt}"`
@@ -2011,9 +2018,17 @@
       let receivedRevenue = 0;
       let pendingRevenue = 0;
 
+      let abandonedCount = 0;
+      let abandonedAmount = 0;
+      let paidCount = 0;
+
       orders.forEach(o => {
         const total = calcOrderTotal(o);
-        if (o.paymentStatus) {
+        if (o.closeStatus === 'abandoned') { // [v2.14.12] 棄單：不算未領貨、不算待收
+          abandonedCount += 1;
+          abandonedAmount += total;
+        } else if (o.paymentStatus) {
+          paidCount += 1;
           receivedRevenue += total;
         } else {
           unpaidCount += 1;
@@ -2027,8 +2042,10 @@
 
       return {
         total: orders.length,
-        paidCount: orders.length - unpaidCount,
+        paidCount,
         unpaidCount,
+        abandonedCount,
+        abandonedAmount,
         unshippedCount,
         readyToShipCount,
         receivedRevenue,
@@ -2044,7 +2061,7 @@
         // [V2.1] 折抵項目不算「賣出商品件數」
         return sum + o.items.reduce((s, i) => s + (isAdjustmentItem(i) ? 0 : i.qty), 0);
       }, 0);
-      const unpaidCount = orders.filter(o => !o.paymentStatus).length;
+      const unpaidCount = orders.filter(o => !o.paymentStatus && o.closeStatus !== 'abandoned').length;
       const unshippedCount = orders.filter(o => o.shipmentStatus !== 'shipped').length;
 
       const stagnantAlertCount = enrichedProducts.filter(p => {
@@ -2161,7 +2178,8 @@
     // ---------- [v2.14.11] 訂單營收（自動） ----------
     // 她的算法（用 2025/11～2026/7 的真實收支表逐筆驗證過）：商品金額（含折扣後調整行）、不含運費、棄單／取消不算
     const FINANCE_ABANDON_RE = /棄單|取消/;
-    const isAbandonedOrder = (o) => FINANCE_ABANDON_RE.test(`${o?.customerName || ''} ${o?.note || ''} ${o?.orderNo || ''}`);
+    // [v2.14.12] 有 closeStatus（棄單狀態）就以它為準；歷史封存沒有這個欄位，才退回看姓名／備註／單號的字樣
+    const isAbandonedOrder = (o) => o?.closeStatus === 'abandoned' || FINANCE_ABANDON_RE.test(`${o?.customerName || ''} ${o?.note || ''} ${o?.orderNo || ''}`);
 
     // liveOrders：App 即時訂單（只取切換日當天以後）；archiveOrders：歷史封存（只取切換日之前）
     // 回傳 { entries: 每日一筆的唯讀「訂單營收」, excluded: 被排除的棄單 [{id,date,amount}] }
@@ -2285,6 +2303,8 @@
         storeAddress: storeParts.address, // [v2.13.0新增] 若是舊資料，這裡已經用括號規則拆過一次，存檔時就會變成新格式
         shippingFee: order.shippingFee,
         paymentStatus: Boolean(order.paymentStatus),
+        paidDate: order.paidDate || '', // [v2.14.12] 領貨（入帳）日；空白＝舊資料沒記
+        closeStatus: order.closeStatus === 'abandoned' ? 'abandoned' : '',
         shipmentStatus: order.shipmentStatus || 'unshipped',
         note: order.note || '',
         items: (order.items || []).map(i => ({ ...i }))
@@ -2331,6 +2351,7 @@
         if (form.items.some(i => !String(i.name || '').trim())) { setError('商品名稱不可空白'); return; }
         // [v2.14.7] 只在日期「被改動」時才檢查，原本就是未來日期的舊訂單仍可只改其他欄位
         if (form.orderDate && form.orderDate !== initialOrderDate.current && form.orderDate > todayStr) { setError('訂單日期不能是未來的日期'); return; }
+        if (form.paymentStatus && form.paidDate && form.paidDate > todayStr) { setError('領貨日不能是未來的日期'); return; }
 
         const edited = {
           orderNo: form.orderNo.trim(),
@@ -2343,6 +2364,8 @@
           storeAddress: form.storeAddress.trim(),
           shippingFee: Number(form.shippingFee) || 0,
           paymentStatus: Boolean(form.paymentStatus),
+          paidDate: form.paymentStatus ? (form.paidDate || '') : '',
+          closeStatus: form.paymentStatus ? '' : form.closeStatus,
           shipmentStatus: form.shipmentStatus,
           note: form.note.trim(),
           items: form.items.map(sanitizeItem)
@@ -2516,8 +2539,13 @@
 
               <div className="flex items-center gap-6 py-1">
                 <label className="flex items-center gap-2 cursor-pointer text-xs sm:text-sm font-semibold text-slate-700">
-                  <input type="checkbox" checked={form.paymentStatus} onChange={(e) => setField('paymentStatus', e.target.checked)} className="w-4 h-4 accent-emerald-600" />
-                  已付款
+                  <input
+                    type="checkbox"
+                    checked={form.paymentStatus}
+                    onChange={(e) => setForm(prev => ({ ...prev, paymentStatus: e.target.checked, closeStatus: e.target.checked ? '' : prev.closeStatus, paidDate: e.target.checked ? (prev.paidDate || todayStr) : '' }))}
+                    className="w-4 h-4 accent-emerald-600"
+                  />
+                  已領貨
                 </label>
                 <label className="flex items-center gap-2 cursor-pointer text-xs sm:text-sm font-semibold text-slate-700">
                   <input
@@ -2528,7 +2556,23 @@
                   />
                   已出貨
                 </label>
+                <label className="flex items-center gap-2 cursor-pointer text-xs sm:text-sm font-semibold text-slate-700">
+                  <input
+                    type="checkbox"
+                    checked={form.closeStatus === 'abandoned'}
+                    onChange={(e) => setForm(prev => ({ ...prev, closeStatus: e.target.checked ? 'abandoned' : '', paymentStatus: e.target.checked ? false : prev.paymentStatus, paidDate: e.target.checked ? '' : prev.paidDate }))}
+                    className="w-4 h-4 accent-red-600"
+                  />
+                  棄單
+                </label>
               </div>
+              {form.paymentStatus && (
+                <div>
+                  <label className="text-xs font-semibold text-slate-600 mb-1 block">領貨日（款項入帳日）</label>
+                  <input type="date" value={form.paidDate} max={todayStr} onChange={(e) => setField('paidDate', e.target.value)} className={inputCls} />
+                  {!form.paidDate && <p className="text-[11px] text-slate-400 mt-1">舊訂單沒有記錄領貨日，收支報表會暫用訂單日期；想校正可在這裡選日期。</p>}
+                </div>
+              )}
 
               <div>
                 <label className="text-xs font-semibold text-slate-600 mb-1 block">訂單備註</label>
@@ -2559,9 +2603,9 @@
 
     // [V2.8] 匯入的訂單要用什麼狀態？（Excel 裡沒有付款、出貨資訊，由使用者在預覽時指定）
     const ORDER_IMPORT_STATUS = {
-      pending: { key: 'pending', label: '待處理', desc: '未付款、待出貨（新的訂單）', paymentStatus: false, shipmentStatus: 'unshipped' },
-      shipped: { key: 'shipped', label: '已出貨', desc: '未付款（等客人取貨）', paymentStatus: false, shipmentStatus: 'shipped' },
-      done: { key: 'done', label: '已完成', desc: '已付款、已出貨（舊訂單歸檔）', paymentStatus: true, shipmentStatus: 'shipped' }
+      pending: { key: 'pending', label: '待處理', desc: '未領貨、待出貨（新的訂單）', paymentStatus: false, shipmentStatus: 'unshipped' },
+      shipped: { key: 'shipped', label: '已出貨', desc: '未領貨（已出貨，等客人取貨）', paymentStatus: false, shipmentStatus: 'shipped' },
+      done: { key: 'done', label: '已完成', desc: '已領貨、已出貨（舊訂單歸檔）', paymentStatus: true, shipmentStatus: 'shipped' }
     };
 
     // 訂單 Excel 匯入預覽 Modal（可勾選、標示重複單號 / 已對齊 Excel 總計）
@@ -4157,6 +4201,7 @@
         handleSelectExcelImported,
         handleTogglePayment,
         handleToggleShipment,
+        handleToggleAbandon,
       } = list;
 
       return (
@@ -4217,7 +4262,7 @@
                     onClick={() => setFilterPayment(filterPayment === 'unpaid' ? 'all' : 'unpaid')}
                     className={`flex flex-col items-start justify-start text-left bg-white px-2 py-2 sm:p-4 rounded-xl sm:rounded-2xl border shadow-sm transition min-w-0 ${filterPayment === 'unpaid' ? 'border-amber-400 ring-1 ring-amber-300' : 'border-slate-200/80'}`}
                   >
-                    <span className="text-xs sm:text-sm font-semibold text-amber-600 leading-4 truncate w-full">未付款</span>
+                    <span className="text-xs sm:text-sm font-semibold text-amber-600 leading-4 truncate w-full">未領貨</span>
                     <span className="text-lg sm:text-2xl font-bold text-amber-600 leading-7">{orderListStats.unpaidCount}</span>
                     <span className="text-[10px] text-slate-400 leading-4 truncate w-full">待收 ${orderListStats.pendingRevenue.toLocaleString()}</span>
                   </button>
@@ -4228,12 +4273,12 @@
                   >
                     <span className="text-xs sm:text-sm font-semibold text-blue-600 leading-4 truncate w-full">待出貨</span>
                     <span className="text-lg sm:text-2xl font-bold text-blue-600 leading-7">{orderListStats.unshippedCount}</span>
-                    <span className="text-[10px] text-slate-400 leading-4 truncate w-full">已付 {orderListStats.readyToShipCount} 筆</span>
+                    <span className="text-[10px] text-slate-400 leading-4 truncate w-full">已領貨 {orderListStats.readyToShipCount} 筆</span>
                   </button>
                   <div className="flex flex-col items-start justify-start bg-white px-2 py-2 sm:p-4 rounded-xl sm:rounded-2xl border border-slate-200/80 shadow-sm min-w-0">
                     <span className="text-xs sm:text-sm font-semibold text-emerald-700 leading-4 truncate w-full">已實收</span>
                     <span className="text-lg sm:text-2xl font-bold text-emerald-700 leading-7 truncate w-full tracking-tight">${orderListStats.receivedRevenue.toLocaleString()}</span>
-                    <span className="text-[10px] text-slate-400 leading-4 truncate w-full">{orderListStats.paidCount} 筆已付</span>
+                    <span className="text-[10px] text-slate-400 leading-4 truncate w-full">{orderListStats.paidCount} 筆已領貨</span>
                   </div>
                 </div>
 
@@ -4265,9 +4310,10 @@
                         value={filterPayment}
                         onChange={setFilterPayment}
                         options={[
-                          { key: 'all', label: '全部付款' },
-                          { key: 'unpaid', label: '未付款' },
-                          { key: 'paid', label: '已付款' }
+                          { key: 'all', label: '全部領貨' },
+                          { key: 'unpaid', label: '未領貨' },
+                          { key: 'paid', label: '已領貨' },
+                          { key: 'abandoned', label: '棄單' }
                         ]}
                       />
                     </div>
@@ -4433,16 +4479,26 @@
                             </div>
 
                             <div className="flex items-center gap-1.5 flex-shrink-0">
-                              <button
-                                onClick={() => handleTogglePayment(order.id, order.paymentStatus)}
-                                className={`px-2 py-1 rounded-full text-[11px] sm:text-xs font-bold transition whitespace-nowrap ${
-                                  order.paymentStatus
-                                    ? 'bg-green-100 text-green-700'
-                                    : 'bg-amber-100 text-amber-700'
-                                }`}
-                              >
-                                {order.paymentStatus ? '✓ 已付款' : '✕ 未付款'}
-                              </button>
+                              {order.closeStatus === 'abandoned' ? (
+                                <button
+                                  onClick={() => handleToggleAbandon(order.id, true)}
+                                  className="px-2 py-1 rounded-full text-[11px] sm:text-xs font-bold transition whitespace-nowrap bg-slate-200 text-slate-500"
+                                  title="點一下可還原成未領貨"
+                                >
+                                  🚫 棄單
+                                </button>
+                              ) : (
+                                <button
+                                  onClick={() => handleTogglePayment(order.id, order.paymentStatus)}
+                                  className={`px-2 py-1 rounded-full text-[11px] sm:text-xs font-bold transition whitespace-nowrap ${
+                                    order.paymentStatus
+                                      ? 'bg-green-100 text-green-700'
+                                      : 'bg-amber-100 text-amber-700'
+                                  }`}
+                                >
+                                  {order.paymentStatus ? '✓ 已領貨' : '✕ 未領貨'}
+                                </button>
+                              )}
 
                               <button
                                 onClick={() => handleToggleShipment(order.id, order.shipmentStatus)}
@@ -4460,7 +4516,7 @@
                           {/* 第 2 行（收合時也顯示）：金額 + 日期，右邊是操作 */}
                           <div className="px-3.5 pb-2.5 pt-1 sm:px-4 sm:pb-3 flex items-center justify-between gap-2">
                             <div className="flex items-baseline gap-2 min-w-0">
-                              <span className="font-bold text-base sm:text-lg text-emerald-600">${totalAmount}</span>
+                              <span className={`font-bold text-base sm:text-lg ${order.closeStatus === 'abandoned' ? 'text-slate-400 line-through' : 'text-emerald-600'}`}>${totalAmount}</span>
                               <span className="text-sm font-medium text-slate-500 whitespace-nowrap">{dateShort}</span>
                             </div>
 
@@ -4473,6 +4529,15 @@
                                 {isExpanded ? '收合' : '明細'}
                                 {isExpanded ? <IconChevronUp size={16} /> : <IconChevronDown size={16} />}
                               </button>
+                              {!order.paymentStatus && order.closeStatus !== 'abandoned' && (
+                                <button
+                                  onClick={() => handleToggleAbandon(order.id, false)}
+                                  className="px-1.5 py-1.5 text-[11px] font-semibold text-slate-400 hover:text-red-500 rounded-lg hover:bg-red-50 transition whitespace-nowrap"
+                                  title="客人沒領貨：標記為棄單（不計營收）"
+                                >
+                                  棄單
+                                </button>
+                              )}
                               <button
                                 onClick={() => setMessageOrder(order)}
                                 className="p-1.5 text-slate-400 hover:text-sky-600 rounded-lg hover:bg-sky-50 transition"
@@ -6445,6 +6510,7 @@
       const [shippingFeeAuto, setShippingFeeAuto] = React.useState(true); // 運費是否跟著物流方式/滿額自動帶入
       const [orderNote, setOrderNote] = React.useState('');
       const [orderDate, setOrderDate] = React.useState(''); // [v2.14.5] 新增訂單的日期（YYYY-MM-DD）；空白＝今天
+      const [isPrepaidNew, setIsPrepaidNew] = React.useState(false); // [v2.14.12] 客人已全額轉帳：建單即「已領貨（入帳）」
       
       const [orderItems, setOrderItems] = React.useState([]);
 
@@ -6546,6 +6612,7 @@
         setStoreAddress('');
         setOrderNote('');
         setOrderDate('');
+        setIsPrepaidNew(false);
         setOrderItems([]);
         setSelectedProductRef(null);
         setDraftRestored(false);
@@ -6977,7 +7044,9 @@
           storeName,
           storeAddress: storeAddress.trim(),
           shippingFee: Number(shippingFee),
-          paymentStatus: false,
+          paymentStatus: isPrepaidNew, // [v2.14.12] 已全額轉帳＝建單即入帳；其餘為「未領貨」，客人領貨後再按已領貨
+          paidDate: isPrepaidNew ? toDateInputValue(orderStamp.timestamp) : '',
+          closeStatus: '',
           shipmentStatus: 'unshipped',
           items: orderItems,
           note: orderNote,
@@ -7035,6 +7104,7 @@
           setStoreAddress(''); // [v2.13.4修正] 之前拆分門市名稱/地址時漏了這行，地址欄位送出後不會清空
           setOrderNote('');
           setOrderDate('');
+          setIsPrepaidNew(false);
           setOrderItems([]);
           setLineText('');
           setSelectedProductRef(null);
@@ -7056,16 +7126,40 @@
         }
       };
 
+      // [v2.14.12] 「已付款」改稱「已領貨」：標記時記下領貨日（今天，可在編輯訂單修改）；取消時清掉；同時解除棄單
       const handleTogglePayment = async (orderId, currentStatus) => {
         try {
           await withSyncTracking(dbRef(`orders/${orderId}`).update({
-            paymentStatus: !currentStatus
+            paymentStatus: !currentStatus,
+            paidDate: currentStatus ? '' : toDateInputValue(Date.now()),
+            closeStatus: ''
           }));
           const target = orders.find(o => o.id === orderId);
-          logAction('order_payment', 'order', orderId, `付款狀態：${target?.customerName || ''}　${currentStatus ? '已付款' : '未付款'} → ${currentStatus ? '未付款' : '已付款'}`);
-          showToast('更新付款狀態成功');
+          logAction('order_payment', 'order', orderId, `領貨狀態：${target?.customerName || ''}　${currentStatus ? '已領貨' : '未領貨'} → ${currentStatus ? '未領貨' : '已領貨'}`);
+          showToast(currentStatus ? '已改回未領貨' : '✅ 已標記為已領貨（款項入帳）');
         } catch (err) {
           console.error("Toggle payment error:", err);
+          showToast('❌ 更新領貨狀態失敗，請檢查網路後再試');
+        }
+      };
+
+      // [v2.14.12] 棄單：客人沒去領貨、沒收到款。棄單不計營收；再按一次可還原成未領貨
+      const handleToggleAbandon = async (orderId, isAbandoned) => {
+        const target = orders.find(o => o.id === orderId);
+        const name = target?.customerName || '';
+        const ok = window.confirm(isAbandoned
+          ? `把「${name}」的棄單還原成「未領貨」？`
+          : `把「${name}」標記為「棄單」？\n\n棄單的訂單不會計入營收，之後可以再還原。`);
+        if (!ok) return;
+        try {
+          await withSyncTracking(dbRef(`orders/${orderId}`).update(isAbandoned
+            ? { closeStatus: '' }
+            : { closeStatus: 'abandoned', paymentStatus: false, paidDate: '' }));
+          logAction('order_payment', 'order', orderId, `領貨狀態：${name}　${isAbandoned ? '棄單 → 未領貨' : '標記為棄單'}`);
+          showToast(isAbandoned ? '已還原為未領貨' : '已標記為棄單');
+        } catch (err) {
+          console.error("Toggle abandon error:", err);
+          showToast('❌ 更新失敗，請檢查網路後再試');
         }
       };
 
@@ -7221,7 +7315,10 @@
             });
             updates[newKey] = {
               ...orderData,
-              paymentStatus: importStatus.paymentStatus,     // [V2.8] 由使用者在預覽視窗指定
+              // [v2.14.12] 姓名／單號／備註含「棄單」「取消」（她 Excel 的慣例）→ 匯入時直接標成棄單，不算已領貨
+              ...(/棄單|取消/.test(`${orderData.customerName || ''} ${orderData.orderNo || ''} ${orderData.note || ''}`)
+                ? { paymentStatus: false, closeStatus: 'abandoned' }
+                : { paymentStatus: importStatus.paymentStatus }),     // [V2.8] 由使用者在預覽視窗指定
               shipmentStatus: importStatus.shipmentStatus,
               items: linkedItems,
               createdAt: new Date(baseTs).toLocaleString('zh-TW', { hour12: false }),
@@ -7986,9 +8083,11 @@
             o.items.some(i => i.name.toLowerCase().includes(q) || i.sku.toLowerCase().includes(q))
           );
 
+          const isAbandoned = o.closeStatus === 'abandoned';
           const matchPayment = 
             filterPayment === 'all' ? true :
-            filterPayment === 'paid' ? o.paymentStatus : !o.paymentStatus;
+            filterPayment === 'abandoned' ? isAbandoned :
+            filterPayment === 'paid' ? (o.paymentStatus && !isAbandoned) : (!o.paymentStatus && !isAbandoned);
 
           const matchShipment = 
             filterShipment === 'all' ? true :
@@ -8673,6 +8772,11 @@
                       {orderDate && <p className="text-[11px] text-amber-700 mt-1">⚠️ 這張訂單的日期不是今天，會記成 {orderDate}。</p>}
                     </div>
 
+                    <label className="flex items-start gap-2 cursor-pointer text-xs sm:text-sm text-slate-700">
+                      <input type="checkbox" checked={isPrepaidNew} onChange={(e) => setIsPrepaidNew(e.target.checked)} className="w-4 h-4 mt-0.5 accent-emerald-600" />
+                      <span><span className="font-semibold">客人已全額轉帳</span>（建單就算已領貨、款項入帳）</span>
+                    </label>
+
                     <div>
                       <label className="text-xs sm:text-sm font-medium text-slate-600 mb-1 block">訂單備註</label>
                       <input
@@ -9087,6 +9191,7 @@
                   handleSelectExcelImported,
                   handleTogglePayment,
                   handleToggleShipment,
+                  handleToggleAbandon,
                 }}
               />
             )}
