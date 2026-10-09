@@ -59,7 +59,7 @@
     // ==========================================
     // config.js — 版本號 / Firebase設定 / 常數設定值
     // ==========================================
-    const APP_VERSION = '2.14.9';
+    const APP_VERSION = '2.14.10';
     document.title = `Sprout 📱 小豆苗訂單助手 V${APP_VERSION} (Firebase RTDB 實時同步版)`;
 
     const firebaseConfig = {
@@ -132,7 +132,8 @@
       { key: 'blacklist', label: '黑名單', filename: 'blacklist.json' },
       { key: 'settings', label: '設定（運費/折扣等）', filename: 'settings.json' },
       { key: 'trash', label: '回收桶', filename: 'trash.json' },
-      { key: 'logs', label: '操作日誌', filename: 'logs.json' }
+      { key: 'logs', label: '操作日誌', filename: 'logs.json' },
+      { key: 'finance', label: '收支報表', filename: 'finance.json' } // [v2.14.10]
     ];
 
     const QUICK_PICK_HALF_LIFE_DAYS = 7;   // 權重減半所需天數
@@ -2055,6 +2056,152 @@
   </script>
   <script type="text/babel">
     // ==========================================
+    // utils-finance.js  (v2.14.10 新增，收支報表)
+    // 收支資料整理與彙總：純函式，資料進、結果出，不碰 state／Firebase／畫面
+    // 相依：無（只用瀏覽器內建）。資料節點見 finance-data.js
+    // ==========================================
+
+    const FINANCE_INCOME_CATEGORIES = ['現貨銷售', '團購', '預購', '其他收入'];
+    const FINANCE_EXPENSE_CATEGORIES = ['進貨', '運費／物流', '包材', '廣告', '其他支出'];
+
+    const financeCategoriesOf = (type) => (type === 'in' ? FINANCE_INCOME_CATEGORIES : FINANCE_EXPENSE_CATEGORIES);
+
+    // 本地今天 YYYY-MM-DD
+    const financeToday = (nowMs = Date.now()) => {
+      const d = new Date(nowMs);
+      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    };
+
+    const isValidFinanceDate = (s) => {
+      const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(s || ''));
+      if (!m) return false;
+      const y = Number(m[1]), mo = Number(m[2]), da = Number(m[3]);
+      const d = new Date(y, mo - 1, da);
+      return d.getFullYear() === y && d.getMonth() === mo - 1 && d.getDate() === da;
+    };
+
+    const formatMoney = (n) => `$${Math.round(Number(n) || 0).toLocaleString()}`;
+
+    // 讀進來的收支一律先整理：缺欄位補預設，金額一律是 >= 0 的數字，type 只有 in／out
+    const sanitizeFinanceEntry = (raw) => ({
+      id: raw?.id || '',
+      date: isValidFinanceDate(raw?.date) ? raw.date : '',
+      type: raw?.type === 'in' ? 'in' : 'out',
+      amount: Math.max(0, Number(raw?.amount) || 0),
+      category: String(raw?.category || ''),
+      note: String(raw?.note || ''),
+      createdAt: Number(raw?.createdAt) || 0,
+      createdBy: String(raw?.createdBy || '')
+    });
+
+    // 有資料的月份（新到舊）；一定包含當月，讓空資料時畫面也有可選的月份
+    const listFinanceMonths = (entries, nowMs = Date.now()) => {
+      const set = new Set([financeToday(nowMs).slice(0, 7)]);
+      (entries || []).forEach(e => { if (e.date) set.add(e.date.slice(0, 7)); });
+      return Array.from(set).sort().reverse();
+    };
+
+    const groupByCategory = (list) => {
+      const map = {};
+      list.forEach(e => {
+        const key = e.category || '未分類';
+        map[key] = (map[key] || 0) + e.amount;
+      });
+      return Object.entries(map).map(([category, amount]) => ({ category, amount })).sort((a, b) => b.amount - a.amount);
+    };
+
+    // monthKey：'YYYY-MM' 或 'all'。沒有日期的資料（壞資料）只會出現在 'all' 的總額，不會出現在日期明細
+    const computeFinanceSummary = (entries, monthKey = 'all') => {
+      const inScope = (entries || []).filter(e => monthKey === 'all' || (e.date && e.date.slice(0, 7) === monthKey));
+      const incomes = inScope.filter(e => e.type === 'in');
+      const expenses = inScope.filter(e => e.type === 'out');
+      const income = incomes.reduce((s, e) => s + e.amount, 0);
+      const expense = expenses.reduce((s, e) => s + e.amount, 0);
+      const dayMap = {};
+      inScope.forEach(e => {
+        const key = e.date || '無日期';
+        if (!dayMap[key]) dayMap[key] = { date: key, income: 0, expense: 0, entries: [] };
+        dayMap[key][e.type === 'in' ? 'income' : 'expense'] += e.amount;
+        dayMap[key].entries.push(e);
+      });
+      const days = Object.values(dayMap).sort((a, b) => (a.date < b.date ? 1 : -1));
+      days.forEach(d => d.entries.sort((a, b) => b.createdAt - a.createdAt));
+      return {
+        income, expense, net: income - expense, count: inScope.length,
+        incomeByCategory: groupByCategory(incomes),
+        expenseByCategory: groupByCategory(expenses),
+        days
+      };
+    };
+
+    const FINANCE_WEEKDAYS = ['日', '一', '二', '三', '四', '五', '六'];
+    // '2026-10-09' → { md: '10/09', weekday: '五' }
+    const describeFinanceDay = (dateStr) => {
+      if (!isValidFinanceDate(dateStr)) return { md: dateStr, weekday: '' };
+      const [y, m, d] = dateStr.split('-').map(Number);
+      return { md: `${String(m).padStart(2, '0')}/${String(d).padStart(2, '0')}`, weekday: FINANCE_WEEKDAYS[new Date(y, m - 1, d).getDay()] };
+    };
+  </script>
+  <script type="text/babel">
+    // ==========================================
+    // finance-data.js  (v2.14.10 新增，收支報表)
+    // 收支資料的 Firebase 讀寫。只在收支畫面開著時才監聽，關閉就取消，不增加主畫面載入負擔。
+    // 節點：finance/entries/{pushId}（收支）、trash/finance/{id}（刪除後的收支，可還原）
+    // 規則：一律用 dbRef()／dbRoot()；id 放展開運算子之後（見交接文件第 4 節鐵律）
+    // 相依：config.js（dbRef、dbRoot）、utils-finance.js
+    // ==========================================
+
+    function useFinanceData() {
+      const [entries, setEntries] = React.useState([]);
+      const [trash, setTrash] = React.useState([]);
+      const [loading, setLoading] = React.useState(true);
+      const [error, setError] = React.useState('');
+
+      React.useEffect(() => {
+        const entriesRef = dbRef('finance/entries');
+        const trashRef = dbRef('trash/finance');
+        const onEntries = (snap) => {
+          const val = snap.val() || {};
+          setEntries(Object.entries(val).map(([id, data]) => sanitizeFinanceEntry({ ...data, id })));
+          setLoading(false);
+        };
+        const onTrash = (snap) => {
+          const val = snap.val() || {};
+          setTrash(Object.entries(val)
+            .map(([id, data]) => ({ ...sanitizeFinanceEntry({ ...data, id }), deletedAt: Number(data?.deletedAt) || 0, deletedBy: String(data?.deletedBy || '') }))
+            .sort((a, b) => b.deletedAt - a.deletedAt));
+        };
+        const onErr = (err) => {
+          console.error('RTDB Finance Error:', err);
+          setLoading(false);
+          setError(err && err.code === 'PERMISSION_DENIED' ? '沒有收支資料的讀取權限（請確認 Firebase 規則已加入 finance 與 trash/finance）' : '收支資料同步異常，請檢查網路連線');
+        };
+        entriesRef.on('value', onEntries, onErr);
+        trashRef.on('value', onTrash, onErr);
+        return () => {
+          entriesRef.off('value', onEntries);
+          trashRef.off('value', onTrash);
+        };
+      }, []);
+
+      return { entries, trash, loading, error };
+    }
+
+    // 寫入用的純資料組裝（只回傳要寫的內容，由呼叫端決定怎麼寫、怎麼包 withSyncTracking）
+    const buildFinanceEntryData = (form, userEmail, nowMs = Date.now()) => ({
+      date: form.date,
+      type: form.type === 'in' ? 'in' : 'out',
+      amount: Math.round(Number(form.amount) || 0),
+      category: String(form.category || ''),
+      note: String(form.note || '').trim(),
+      createdAt: nowMs,
+      createdBy: String(userEmail || '')
+    });
+
+    const financeEntryLogSummary = (e) => `${e.type === 'in' ? '收入' : '支出'} ${e.category || '未分類'} ${formatMoney(e.amount)}`; // 日誌不記備註
+  </script>
+  <script type="text/babel">
+    // ==========================================
     // modal-order.js  (v2.14.9 Phase 3，由 ui-shared.js 原樣搬出)
     // 訂單相關彈窗：編輯訂單、Excel 匯入預覽、客人確認訊息
     // 只搬位置，不改內容；各檔案共用全域（見 index.html 的載入順序）
@@ -3455,7 +3602,7 @@
         }
 
         if (nextParsed.length === 0) {
-          setError('沒有辨識出任何可還原的檔案，請確認檔名是否為 orders.json／products.json／blacklist.json／settings.json／trash.json／logs.json 其中之一');
+          setError('沒有辨識出任何可還原的檔案，請確認檔名是否為 orders.json／products.json／blacklist.json／settings.json／trash.json／logs.json／finance.json 其中之一');
           setUnrecognized(nextUnrecognized);
           return;
         }
@@ -3518,7 +3665,7 @@
                 <>
                   <div className="bg-amber-50 border border-amber-200 rounded-xl p-3 text-xs text-amber-800 space-y-1">
                     <p>⚠️ 還原會把備份檔裡的資料寫回資料庫，請確認是正確的備份檔案。</p>
-                    <p>檔名需為：orders.json／products.json／blacklist.json／settings.json／trash.json／logs.json，一次可以選多個檔案。</p>
+                    <p>檔名需為：orders.json／products.json／blacklist.json／settings.json／trash.json／logs.json／finance.json，一次可以選多個檔案。</p>
                   </div>
                   <button
                     type="button"
@@ -4502,6 +4649,7 @@
         setIsMessageTemplateOpen,
         setIsShippingSettingsOpen,
         setIsBlacklistOpen,
+        setIsFinanceOpen,
         handleExportCSV,
         handleExportProductsExcel,
         handleSignOut,
@@ -4537,6 +4685,21 @@
                       下載商品庫與滯銷分析 Excel
                     </button>
                   </div>
+                </div>
+
+                {/* [收支報表 v2.14.10] */}
+                <div className="bg-white rounded-2xl border border-slate-200/80 p-4 sm:p-5 shadow-sm space-y-2.5">
+                  <h3 className="font-bold text-sm sm:text-base text-slate-800">💰 收支報表</h3>
+                  <p className="text-xs sm:text-sm text-slate-500">
+                    手動記錄收入與支出，依月份查看淨收支、類別占比與每日明細。
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => setIsFinanceOpen(true)}
+                    className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs sm:text-sm rounded-xl shadow transition whitespace-nowrap"
+                  >
+                    💰 開啟收支報表
+                  </button>
                 </div>
 
                 {/* [V2.7] Data protection: trash + log */}
@@ -5578,6 +5741,354 @@
   </script>
   <script type="text/babel">
     // ==========================================
+    // screen-finance.js  (v2.14.10 新增，收支報表)
+    // 全螢幕「收支報表」：總覽（淨利／收入／支出／類別長條）、明細（依日摺疊）、已刪除（可還原）。
+    // 這是「獨立模組」，刻意不照規則 B（元件內不放 state）：它的狀態不被其他彈窗共用，
+    // 自己管自己的 state，才不會讓 app-shell.js 變肥。app-shell.js 只負責開關與傳入 4 個共用工具。
+    // 相依：icons.js、utils-finance.js、finance-data.js、config.js（dbRef／dbRoot）
+    // props：user、onClose、showToast、logAction、withSyncTracking
+    // 目前是「手動記帳」：不會自動從訂單算營收（原因見交接文件 7.21）
+    // ==========================================
+    function FinanceScreen({ user, onClose, showToast, logAction, withSyncTracking }) {
+      const { entries, trash, loading, error } = useFinanceData();
+      const [view, setView] = React.useState('overview'); // overview | detail | trash
+      const [month, setMonth] = React.useState(() => financeToday().slice(0, 7)); // 'YYYY-MM' | 'all'
+      const [openDays, setOpenDays] = React.useState(() => new Set());
+      const [form, setForm] = React.useState(null); // null = 不顯示；否則 { id?, type, date, amount, category, note }
+      const [isSaving, setIsSaving] = React.useState(false);
+      const [confirmDelete, setConfirmDelete] = React.useState(false);
+
+      const months = React.useMemo(() => listFinanceMonths(entries), [entries]);
+      const summary = React.useMemo(() => computeFinanceSummary(entries, month), [entries, month]);
+      const maxExpense = summary.expenseByCategory.reduce((m, c) => Math.max(m, c.amount), 0) || 1;
+      const maxIncome = summary.incomeByCategory.reduce((m, c) => Math.max(m, c.amount), 0) || 1;
+      const allOpen = summary.days.length > 0 && summary.days.every(d => openDays.has(d.date));
+
+      const openAdd = (type = 'out', date = financeToday()) => {
+        setConfirmDelete(false);
+        setForm({ type, date, amount: '', category: financeCategoriesOf(type)[0], note: '' });
+      };
+      const openEdit = (e) => {
+        setConfirmDelete(false);
+        setForm({ id: e.id, type: e.type, date: e.date, amount: String(e.amount), category: e.category, note: e.note });
+      };
+      const setField = (k, v) => setForm(f => ({ ...f, [k]: v }));
+      const setType = (t) => setForm(f => ({
+        ...f, type: t,
+        category: financeCategoriesOf(t).includes(f.category) ? f.category : financeCategoriesOf(t)[0]
+      }));
+
+      const toggleDay = (date) => setOpenDays(prev => {
+        const next = new Set(prev);
+        next.has(date) ? next.delete(date) : next.add(date);
+        return next;
+      });
+      const toggleAll = () => setOpenDays(allOpen ? new Set() : new Set(summary.days.map(d => d.date)));
+
+      const handleSave = async (keepOpen) => {
+        if (!form || isSaving) return;
+        const amount = Math.round(Number(form.amount) || 0);
+        if (amount <= 0) { showToast('⚠️ 請輸入大於 0 的金額'); return; }
+        if (!isValidFinanceDate(form.date)) { showToast('⚠️ 請選擇正確的日期'); return; }
+        setIsSaving(true);
+        try {
+          const data = buildFinanceEntryData(form, user?.email);
+          if (form.id) {
+            // 編輯：不動建立時間與建立者
+            const { createdAt, createdBy, ...editable } = data;
+            await withSyncTracking(dbRef(`finance/entries/${form.id}`).update(editable));
+            logAction('finance_edit', 'finance', form.id, financeEntryLogSummary(data));
+          } else {
+            const ref = dbRef('finance/entries').push();
+            await withSyncTracking(ref.set(data));
+            logAction('finance_create', 'finance', ref.key, financeEntryLogSummary(data));
+          }
+          showToast(form.id ? '✅ 已更新' : '✅ 已記一筆');
+          const savedMonth = data.date.slice(0, 7);
+          if (month !== 'all' && month !== savedMonth) setMonth(savedMonth); // 記到別的月份時，跳到那個月才看得到
+          if (keepOpen && !form.id) {
+            setForm({ type: form.type, date: form.date, amount: '', category: form.category, note: '' });
+          } else {
+            setForm(null);
+          }
+        } catch (err) {
+          console.error('Finance save error:', err);
+          showToast('❌ 儲存失敗，請檢查網路或權限後再試一次');
+        } finally {
+          setIsSaving(false);
+        }
+      };
+
+      // 刪除：先進 trash/finance，可在「已刪除」還原（與訂單／商品一致，不直接 remove）
+      const handleDelete = async () => {
+        if (!form?.id || isSaving) return;
+        const target = entries.find(e => e.id === form.id);
+        if (!target) { setForm(null); return; }
+        setIsSaving(true);
+        try {
+          const { id, ...rest } = target;
+          await withSyncTracking(dbRoot().update({
+            [`finance/entries/${id}`]: null,
+            [`trash/finance/${id}`]: { ...rest, deletedAt: Date.now(), deletedBy: user?.email || '' }
+          }));
+          logAction('finance_delete', 'finance', id, financeEntryLogSummary(target));
+          showToast('🗑️ 已刪除，可在「已刪除」還原');
+          setForm(null);
+        } catch (err) {
+          console.error('Finance delete error:', err);
+          showToast('❌ 刪除失敗，請稍後再試');
+        } finally {
+          setIsSaving(false);
+          setConfirmDelete(false);
+        }
+      };
+
+      const handleRestore = async (item) => {
+        try {
+          const { id, deletedAt, deletedBy, ...rest } = item;
+          await withSyncTracking(dbRoot().update({
+            [`finance/entries/${id}`]: rest,
+            [`trash/finance/${id}`]: null
+          }));
+          logAction('finance_restore', 'finance', id, financeEntryLogSummary(item));
+          showToast('✅ 已還原');
+        } catch (err) {
+          console.error('Finance restore error:', err);
+          showToast('❌ 還原失敗，請稍後再試');
+        }
+      };
+
+      const inputCls = 'w-full px-3 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500/40 focus:border-emerald-500';
+      const netNegative = summary.net < 0;
+
+      const renderBars = (list, max, color) => list.length === 0
+        ? <p className="text-xs text-slate-400 py-2">這個範圍還沒有資料</p>
+        : list.map(c => (
+          <div key={c.category} className="grid grid-cols-[76px_1fr_76px] gap-3 items-center py-1.5 text-xs">
+            <span className="text-slate-600 truncate">{c.category}</span>
+            <span className="block h-2 rounded-full bg-slate-100 overflow-hidden">
+              <i className={`block h-full rounded-full ${color}`} style={{ width: `${Math.max(3, (c.amount / max) * 100)}%` }} />
+            </span>
+            <span className="text-right font-semibold tabular-nums text-slate-800">{formatMoney(c.amount)}</span>
+          </div>
+        ));
+
+      return (
+        <div className="fixed inset-0 z-50 bg-slate-50 flex flex-col">
+          {/* Header */}
+          <div className="bg-emerald-600 text-white shadow-md" style={{ paddingTop: 'env(safe-area-inset-top, 0px)' }}>
+            <div className="flex items-center gap-3 px-4 py-3">
+              <button type="button" onClick={onClose} aria-label="返回" className="p-1.5 -ml-1.5 rounded-lg hover:bg-white/15">
+                <IconX size={22} />
+              </button>
+              <h1 className="flex-1 text-base font-bold">💰 收支報表</h1>
+              <select
+                value={month}
+                onChange={(e) => setMonth(e.target.value)}
+                className="bg-white/20 border border-white/30 rounded-lg px-2 py-1 text-sm font-bold text-white"
+              >
+                {months.map(m => <option key={m} value={m} className="text-slate-800">{m.replace('-', ' / ')}</option>)}
+                <option value="all" className="text-slate-800">全部</option>
+              </select>
+            </div>
+            <div className="flex gap-2 px-4 pb-3 overflow-x-auto scrollbar-none">
+              {[['overview', '總覽'], ['detail', '明細'], ['trash', `已刪除 (${trash.length})`]].map(([id, label]) => (
+                <button
+                  key={id}
+                  type="button"
+                  onClick={() => setView(id)}
+                  aria-current={view === id}
+                  className={`flex-none px-4 py-1.5 rounded-full text-xs font-bold transition ${view === id ? 'bg-white text-emerald-700' : 'bg-white/15 text-white'}`}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* Body */}
+          <div className="flex-1 overflow-y-auto">
+            <div className="max-w-3xl mx-auto p-4 space-y-4" style={{ paddingBottom: 'calc(env(safe-area-inset-bottom, 0px) + 96px)' }}>
+              {error && <div className="bg-red-50 border border-red-200 text-red-700 text-xs rounded-xl p-3">{error}</div>}
+              {loading && !error && <div className="text-center text-xs text-slate-400 py-10">載入中…</div>}
+
+              {!loading && view === 'overview' && (
+                <>
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className={`col-span-2 rounded-2xl p-4 text-white shadow ${netNegative ? 'bg-red-600' : 'bg-emerald-600'}`}>
+                      <div className="text-xs opacity-80">{month === 'all' ? '全部期間' : month.replace('-', ' 年 ') + ' 月'} 淨收支</div>
+                      <div className="text-3xl font-extrabold tabular-nums mt-1">{netNegative ? '-' : ''}{formatMoney(Math.abs(summary.net))}</div>
+                    </div>
+                    <div className="bg-white rounded-2xl border border-slate-200/80 p-4">
+                      <div className="text-xs text-slate-500">收入</div>
+                      <div className="text-xl font-extrabold tabular-nums text-green-600">{formatMoney(summary.income)}</div>
+                    </div>
+                    <div className="bg-white rounded-2xl border border-slate-200/80 p-4">
+                      <div className="text-xs text-slate-500">支出</div>
+                      <div className="text-xl font-extrabold tabular-nums text-red-600">{formatMoney(summary.expense)}</div>
+                    </div>
+                  </div>
+
+                  <div className="text-xs text-emerald-800 bg-emerald-50 rounded-xl px-3 py-2.5">
+                    ℹ️ 這裡是手動記帳，不會自動計入訂單營收；共 {summary.count} 筆。
+                  </div>
+
+                  <div className="bg-white rounded-2xl border border-slate-200/80 p-4">
+                    <h3 className="text-sm font-bold text-slate-800 mb-1">支出類別</h3>
+                    {renderBars(summary.expenseByCategory, maxExpense, 'bg-red-400')}
+                  </div>
+                  <div className="bg-white rounded-2xl border border-slate-200/80 p-4">
+                    <h3 className="text-sm font-bold text-slate-800 mb-1">收入類別</h3>
+                    {renderBars(summary.incomeByCategory, maxIncome, 'bg-green-500')}
+                  </div>
+                </>
+              )}
+
+              {!loading && view === 'detail' && (
+                <>
+                  <div className="flex items-center justify-between">
+                    <h2 className="text-sm font-bold text-slate-800">每日明細</h2>
+                    {summary.days.length > 0 && (
+                      <button type="button" onClick={toggleAll} className="px-3 py-1 rounded-full text-xs border border-slate-200 bg-white text-slate-500 hover:text-emerald-700 hover:border-emerald-500">
+                        {allOpen ? '全部收合' : '全部展開'}
+                      </button>
+                    )}
+                  </div>
+                  {summary.days.length === 0 && <div className="text-center text-xs text-slate-400 py-10">這個範圍還沒有紀錄，按右下角「＋」開始記帳</div>}
+                  <div className="space-y-2">
+                    {summary.days.map(day => {
+                      const open = openDays.has(day.date);
+                      const { md, weekday } = describeFinanceDay(day.date);
+                      return (
+                        <div key={day.date} className={`bg-white rounded-xl border overflow-hidden ${open ? 'border-emerald-200 shadow-sm' : 'border-slate-200/80'}`}>
+                          <button type="button" onClick={() => toggleDay(day.date)} className={`w-full flex items-center justify-between px-4 py-3 text-left ${open ? 'bg-emerald-50/60 border-b border-slate-100' : ''}`}>
+                            <span className="flex items-baseline gap-1.5">
+                              <span className="text-sm font-bold text-slate-800">{md}</span>
+                              {weekday && <span className="text-xs text-slate-400">週{weekday}</span>}
+                            </span>
+                            <span className="flex items-center gap-1.5 text-xs font-bold tabular-nums">
+                              {day.income > 0 && <span className="bg-green-50 text-green-700 px-2 py-0.5 rounded-full">+{formatMoney(day.income)}</span>}
+                              {day.expense > 0 && <span className="bg-red-50 text-red-700 px-2 py-0.5 rounded-full">-{formatMoney(day.expense)}</span>}
+                              {open ? <IconChevronUp size={14} className="text-slate-400" /> : <IconChevronDown size={14} className="text-slate-400" />}
+                            </span>
+                          </button>
+                          {open && (
+                            <div className="divide-y divide-slate-100">
+                              {day.entries.map(e => (
+                                <button key={e.id} type="button" onClick={() => openEdit(e)} className="w-full flex items-center gap-3 px-4 py-2.5 text-left hover:bg-slate-50">
+                                  <span className={`flex-none text-[11px] font-bold px-2 py-0.5 rounded-full ${e.type === 'in' ? 'bg-green-50 text-green-700' : 'bg-red-50 text-red-700'}`}>{e.category || '未分類'}</span>
+                                  <span className="flex-1 min-w-0 text-xs text-slate-500 truncate">{e.note}</span>
+                                  <span className={`flex-none text-sm font-bold tabular-nums ${e.type === 'in' ? 'text-green-600' : 'text-red-600'}`}>{e.type === 'in' ? '+' : '-'}{formatMoney(e.amount)}</span>
+                                </button>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </>
+              )}
+
+              {view === 'trash' && (
+                <>
+                  <h2 className="text-sm font-bold text-slate-800">已刪除的收支（可還原）</h2>
+                  {trash.length === 0 && <div className="text-center text-xs text-slate-400 py-10">沒有已刪除的紀錄</div>}
+                  <div className="space-y-2">
+                    {trash.map(t => (
+                      <div key={t.id} className="bg-white rounded-xl border border-slate-200/80 px-4 py-3 flex items-center gap-3">
+                        <div className="flex-1 min-w-0">
+                          <div className="text-xs text-slate-500">{t.date || '無日期'}・{t.category || '未分類'}</div>
+                          <div className={`text-sm font-bold tabular-nums ${t.type === 'in' ? 'text-green-600' : 'text-red-600'}`}>{t.type === 'in' ? '+' : '-'}{formatMoney(t.amount)}</div>
+                          {t.note && <div className="text-xs text-slate-400 truncate">{t.note}</div>}
+                        </div>
+                        <button type="button" onClick={() => handleRestore(t)} className="flex-none px-3 py-1.5 rounded-lg text-xs font-bold bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-200">還原</button>
+                      </div>
+                    ))}
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+
+          {/* 新增按鈕 */}
+          {!form && (
+            <button
+              type="button"
+              onClick={() => openAdd('out')}
+              aria-label="記一筆"
+              className="fixed right-4 w-14 h-14 rounded-full bg-emerald-600 hover:bg-emerald-700 text-white shadow-xl flex items-center justify-center"
+              style={{ bottom: 'calc(env(safe-area-inset-bottom, 0px) + 20px)' }}
+            >
+              <IconPlus size={26} />
+            </button>
+          )}
+
+          {/* 新增／編輯表單（底部抽屜） */}
+          {form && (
+            <div className="absolute inset-0 z-10 bg-slate-900/50 flex items-end sm:items-center justify-center" onClick={() => !isSaving && setForm(null)}>
+              <div
+                className="bg-white w-full sm:max-w-md rounded-t-3xl sm:rounded-3xl shadow-2xl p-5 space-y-3 max-h-full overflow-y-auto"
+                style={{ paddingBottom: 'calc(env(safe-area-inset-bottom, 0px) + 20px)' }}
+                onClick={(e) => e.stopPropagation()}
+              >
+                <div className="flex items-center justify-between">
+                  <h3 className="font-bold text-base text-slate-800">{form.id ? '編輯收支' : '記一筆'}</h3>
+                  <button type="button" onClick={() => setForm(null)} className="p-1.5 text-slate-400 hover:text-slate-600"><IconX size={20} /></button>
+                </div>
+
+                <div className="grid grid-cols-2 gap-2">
+                  {[['out', '支出', 'bg-red-600'], ['in', '收入', 'bg-green-600']].map(([t, label, on]) => (
+                    <button key={t} type="button" onClick={() => setType(t)} className={`py-2.5 rounded-xl text-sm font-bold border transition ${form.type === t ? `${on} text-white border-transparent` : 'bg-slate-50 text-slate-500 border-slate-200'}`}>{label}</button>
+                  ))}
+                </div>
+
+                <div>
+                  <label className="block text-xs font-bold text-slate-500 mb-1">金額</label>
+                  <input type="number" inputMode="numeric" min="0" placeholder="0" value={form.amount} onChange={(e) => setField('amount', e.target.value)} className={inputCls + ' text-lg font-bold tabular-nums'} />
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-xs font-bold text-slate-500 mb-1">日期</label>
+                    <input type="date" value={form.date} onChange={(e) => setField('date', e.target.value)} className={inputCls} />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-bold text-slate-500 mb-1">類別</label>
+                    <select value={form.category} onChange={(e) => setField('category', e.target.value)} className={inputCls}>
+                      {/* 編輯舊資料時，若類別不在清單內仍要能顯示 */}
+                      {!financeCategoriesOf(form.type).includes(form.category) && form.category && <option value={form.category}>{form.category}</option>}
+                      {financeCategoriesOf(form.type).map(c => <option key={c} value={c}>{c}</option>)}
+                    </select>
+                  </div>
+                </div>
+                <div>
+                  <label className="block text-xs font-bold text-slate-500 mb-1">備註（選填）</label>
+                  <input type="text" placeholder="例如：10 月進貨尾款" value={form.note} onChange={(e) => setField('note', e.target.value)} className={inputCls} />
+                </div>
+
+                <div className="flex gap-2 pt-1">
+                  {form.id ? (
+                    confirmDelete ? (
+                      <button type="button" disabled={isSaving} onClick={handleDelete} className="px-4 py-3 rounded-xl text-sm font-bold bg-red-600 text-white">確定刪除</button>
+                    ) : (
+                      <button type="button" disabled={isSaving} onClick={() => setConfirmDelete(true)} className="px-4 py-3 rounded-xl text-sm font-bold bg-red-50 text-red-700 border border-red-200">刪除</button>
+                    )
+                  ) : (
+                    <button type="button" disabled={isSaving} onClick={() => handleSave(true)} className="px-4 py-3 rounded-xl text-sm font-bold bg-slate-100 text-slate-700 border border-slate-200 whitespace-nowrap">儲存再記一筆</button>
+                  )}
+                  <button type="button" disabled={isSaving} onClick={() => handleSave(false)} className="flex-1 py-3 rounded-xl text-sm font-bold bg-emerald-600 hover:bg-emerald-700 text-white disabled:opacity-60">
+                    {isSaving ? '處理中…' : '儲存'}
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    }
+  </script>
+  <script type="text/babel">
+    // ==========================================
     // Main Component: SproutOrderAssistant
     // ==========================================
     function SproutOrderAssistant({ user, onSignOut }) {
@@ -5657,6 +6168,9 @@
       const [isBlacklistOpen, setIsBlacklistOpen] = React.useState(false);
       const [isBlacklistAddOpen, setIsBlacklistAddOpen] = React.useState(false);
       const [isSavingBlacklist, setIsSavingBlacklist] = React.useState(false);
+
+      // ---------- [收支報表 v2.14.10] 狀態全在 screen-finance.js 內部，這裡只管開關 ----------
+      const [isFinanceOpen, setIsFinanceOpen] = React.useState(false);
 
       const showToast = (msg) => {
         setToastMessage(msg);
@@ -7562,6 +8076,17 @@
             />
           )}
 
+          {/* [收支報表 v2.14.10] */}
+          {isFinanceOpen && (
+            <FinanceScreen
+              user={user}
+              onClose={() => setIsFinanceOpen(false)}
+              showToast={showToast}
+              logAction={logAction}
+              withSyncTracking={withSyncTracking}
+            />
+          )}
+
           {/* [V2.12] Shipping Settings Modal */}
           {isShippingSettingsOpen && (
             <ShippingSettingsModal
@@ -8511,6 +9036,7 @@
                   setIsMessageTemplateOpen,
                   setIsShippingSettingsOpen,
                   setIsBlacklistOpen,
+                  setIsFinanceOpen,
                   handleExportCSV,
                   handleExportProductsExcel,
                   handleSignOut,
