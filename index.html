@@ -59,7 +59,7 @@
     // ==========================================
     // config.js — 版本號 / Firebase設定 / 常數設定值
     // ==========================================
-    const APP_VERSION = '2.14.14';
+    const APP_VERSION = '2.14.15';
     document.title = `Sprout 📱 小豆苗訂單助手 V${APP_VERSION} (Firebase RTDB 實時同步版)`;
 
     const firebaseConfig = {
@@ -9084,7 +9084,7 @@
                       <div>
                         <label className="text-[11px] sm:text-xs font-medium text-slate-500 block mb-1">尺寸快捷點選</label>
                         <div className="flex flex-wrap gap-1.5">
-                          {(selectedProductRef ? splitProductOptions(selectedProductRef.sizes) : ['S', 'M', 'L', 'XL', 'F']).map((sz) => {
+                          {(selectedProductRef ? splitProductOptions(selectedProductRef.sizes) : ['80', '90', '100', '110', '120', '130', '140', '150']).map((sz) => {
                             const cleanSz = sz.trim();
                             if (!cleanSz) return null;
                             const isSelected = currentItem.size === cleanSz;
