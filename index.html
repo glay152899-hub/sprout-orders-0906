@@ -59,7 +59,7 @@
     // ==========================================
     // config.js — 版本號 / Firebase設定 / 常數設定值
     // ==========================================
-    const APP_VERSION = '2.14.13';
+    const APP_VERSION = '2.14.14';
     document.title = `Sprout 📱 小豆苗訂單助手 V${APP_VERSION} (Firebase RTDB 實時同步版)`;
 
     const firebaseConfig = {
@@ -2085,11 +2085,11 @@
     const FINANCE_ADJUST_CATEGORIES = ['營收調整']; // type 'adj'：金額可正可負（內退、歷史對帳差額），算進收入
     const FINANCE_ORDER_CATEGORY = '訂單營收';       // 由訂單自動產生，唯讀
     // 營收切換日：此日之前用「歷史封存 salesArchive」，此日起用 App 裡的即時訂單（避免同一張訂單算兩次）
-    // [v2.14.13] 依 orders.json：App 裡最早的訂單是 2026-09-26（之前只在 Excel），所以切換日是 9/26，封存補到 9/25
-    const FINANCE_ORDER_CUTOVER = '2026-09-26';
-    // [v2.14.13] 領貨制啟用日：此日（含）之後「下單」的訂單，要「已領貨」才算營收；之前下單的舊訂單一律視為已領貨。
+    // 使用者規劃：2026/6（含）以前＝歷史資料（salesArchive），2026/7/1 起匯入 App 並手動維護狀態＝即時訂單
+    const FINANCE_ORDER_CUTOVER = '2026-07-01';
+    // 領貨制啟用日：此日（含）之後「下單」的訂單，要「已領貨」才算營收；之前的歷史訂單一律視為已領貨。
     // 記帳日永遠是下單日（老婆的習慣）：領貨只決定有沒有入帳，領貨日在下個月也記回下單那天。
-    const FINANCE_PICKUP_START = '2026-10-10';
+    const FINANCE_PICKUP_START = '2026-07-01';
     const FINANCE_PENDING_WARN_DAYS = 14; // 未領貨超過幾天就標示逾期
 
     const financeCategoriesOf = (type) => (type === 'in' ? FINANCE_INCOME_CATEGORIES : type === 'adj' ? FINANCE_ADJUST_CATEGORIES : FINANCE_EXPENSE_CATEGORIES);
