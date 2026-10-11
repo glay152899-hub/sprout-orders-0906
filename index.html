@@ -59,7 +59,11 @@
     // ==========================================
     // config.js — 版本號 / Firebase設定 / 常數設定值
     // ==========================================
-    const APP_VERSION = '2.14.16';
+    const APP_VERSION = '2.14.17';
+
+    // [v2.14.17] 「更多」裡所有彈窗共用的底部抽屜樣式：固定約九成高、上緣一致（不再依內容縮在底部）。
+    // 內容太多的部分在抽屜內自己捲動；要調整高度只改這一處。
+    const MORE_SHEET_CLASS = 'bg-white w-full sm:max-w-lg rounded-t-3xl sm:rounded-2xl shadow-2xl flex flex-col h-[90vh]';
     document.title = `Sprout 📱 小豆苗訂單助手 V${APP_VERSION} (Firebase RTDB 實時同步版)`;
 
     const firebaseConfig = {
@@ -3144,7 +3148,7 @@
       return (
         <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-sm flex items-end sm:items-center justify-center" onClick={onClose}>
           <div
-            className="bg-white w-full sm:max-w-md rounded-t-3xl sm:rounded-2xl shadow-2xl flex flex-col max-h-[88vh]"
+            className={MORE_SHEET_CLASS}
             onClick={(e) => e.stopPropagation()}
           >
             <div className="px-5 pt-4 pb-3 flex items-center justify-between border-b border-slate-100">
@@ -3157,7 +3161,7 @@
               </button>
             </div>
 
-            <form onSubmit={handleSubmit} className="p-5 space-y-4 overflow-y-auto">
+            <form onSubmit={handleSubmit} className="p-5 space-y-4 overflow-y-auto flex-1">
               <div className="space-y-2.5">
                 <label className="text-xs font-bold text-slate-600 block">各物流方式的運費</label>
                 {DELIVERY_METHODS.map(({ key, short }) => (
@@ -3265,7 +3269,7 @@
 
       return (
         <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-sm flex items-end sm:items-center justify-center" onClick={onClose}>
-          <div className="bg-white w-full sm:max-w-lg rounded-t-3xl sm:rounded-2xl shadow-2xl flex flex-col max-h-[92vh]" onClick={(e) => e.stopPropagation()}>
+          <div className={MORE_SHEET_CLASS} onClick={(e) => e.stopPropagation()}>
             <div className="px-5 pt-4 pb-3 flex items-center justify-between border-b border-slate-100">
               <div>
                 <h3 className="font-bold text-base text-slate-800">💬 公版訊息設定</h3>
@@ -3392,7 +3396,7 @@
       return (
         <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-sm flex items-end sm:items-center justify-center" onClick={onClose}>
           <div
-            className="bg-white w-full sm:max-w-lg rounded-t-3xl sm:rounded-2xl shadow-2xl flex flex-col max-h-[88vh]"
+            className={MORE_SHEET_CLASS}
             onClick={(e) => e.stopPropagation()}
           >
             <div className="px-5 pt-4 pb-3 flex items-center justify-between border-b border-slate-100">
@@ -3535,7 +3539,7 @@
       return (
         <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-sm flex items-end sm:items-center justify-center" onClick={onClose}>
           <div
-            className="bg-white w-full sm:max-w-md rounded-t-3xl sm:rounded-2xl shadow-2xl flex flex-col max-h-[88vh]"
+            className={MORE_SHEET_CLASS}
             onClick={(e) => e.stopPropagation()}
           >
             <div className="px-5 pt-4 pb-3 flex items-center justify-between border-b border-slate-100">
@@ -3548,7 +3552,7 @@
               </button>
             </div>
 
-            <form onSubmit={handleSubmit} className="p-5 space-y-3.5 overflow-y-auto">
+            <form onSubmit={handleSubmit} className="p-5 space-y-3.5 overflow-y-auto flex-1">
               <div>
                 <label className="text-xs font-bold text-slate-600 block mb-1">姓名（選填）</label>
                 <input type="text" placeholder="例如：王小美" value={form.name} onChange={(e) => setField('name', e.target.value)} className={inputCls} />
@@ -3609,7 +3613,7 @@
       return (
         <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-sm flex items-end sm:items-center justify-center" onClick={onClose}>
           <div
-            className="bg-white w-full sm:max-w-lg rounded-t-3xl sm:rounded-2xl shadow-2xl flex flex-col max-h-[88vh]"
+            className={MORE_SHEET_CLASS}
             onClick={(e) => e.stopPropagation()}
           >
             <div className="px-5 pt-4 pb-3 flex items-center justify-between border-b border-slate-100">
@@ -3766,7 +3770,7 @@
       return (
         <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-sm flex items-end sm:items-center justify-center" onClick={step === 'working' ? undefined : onClose}>
           <div
-            className="bg-white w-full sm:max-w-lg rounded-t-3xl sm:rounded-2xl shadow-2xl flex flex-col max-h-[88vh]"
+            className={MORE_SHEET_CLASS}
             onClick={(e) => e.stopPropagation()}
           >
             <div className="px-5 pt-4 pb-3 flex items-center justify-between border-b border-slate-100">
@@ -3943,7 +3947,7 @@
       return (
         <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-sm flex items-end sm:items-center justify-center" onClick={onClose}>
           <div
-            className="bg-white w-full sm:max-w-lg rounded-t-3xl sm:rounded-2xl shadow-2xl flex flex-col max-h-[88vh]"
+            className={MORE_SHEET_CLASS}
             onClick={(e) => e.stopPropagation()}
           >
             <div className="px-5 pt-4 pb-3 flex items-center justify-between border-b border-slate-100">
@@ -4895,47 +4899,68 @@
                   </div>
                 </div>
 
-                {/* 底部小選單：匯出報表／資料保護 */}
+                {/* 底部抽屜：匯出報表／資料保護（樣式與其他「更多」彈窗一致，見 config.js 的 MORE_SHEET_CLASS） */}
                 {sheet && (
                   <div className="fixed inset-0 z-50 bg-slate-900/50 flex items-end sm:items-center justify-center" onClick={() => setSheet(null)}>
-                    <div
-                      className="bg-white w-full sm:max-w-md rounded-t-3xl sm:rounded-3xl shadow-2xl p-5 space-y-3"
-                      style={{ paddingBottom: 'calc(env(safe-area-inset-bottom, 0px) + 20px)' }}
-                      onClick={(e) => e.stopPropagation()}
-                    >
-                      <div className="flex items-center justify-between">
-                        <h3 className="font-bold text-base text-slate-800">{sheet === 'export' ? '📤 匯出報表' : '🛡️ 資料保護'}</h3>
-                        <button type="button" onClick={() => setSheet(null)} aria-label="關閉" className="p-1.5 text-slate-400 hover:text-slate-600">
-                          <IconX size={20} />
+                    <div className={MORE_SHEET_CLASS} onClick={(e) => e.stopPropagation()}>
+                      <div className="px-5 pt-4 pb-3 flex items-center justify-between border-b border-slate-100">
+                        <div>
+                          <h3 className="font-bold text-base text-slate-800">{sheet === 'export' ? '📤 匯出報表' : '🛡️ 資料保護'}</h3>
+                          <p className="text-[11px] text-slate-400">
+                            {sheet === 'export'
+                              ? '內建 UTF-8 防亂碼機制，可直接用 Microsoft Excel 或 Google 試算表開啟'
+                              : '刪除的資料會先放進回收桶，重要操作都會記在日誌裡'}
+                          </p>
+                        </div>
+                        <button type="button" onClick={() => setSheet(null)} aria-label="關閉" className="p-1.5 text-slate-400 hover:text-slate-700 rounded-lg hover:bg-slate-100">
+                          <IconX size={22} />
                         </button>
                       </div>
 
-                      {sheet === 'export' ? (
-                        <>
-                          <p className="text-xs text-slate-500">內建 UTF-8 防亂碼機制，可直接用 Microsoft Excel 或 Google 試算表開啟。</p>
-                          <button type="button" onClick={pick(handleExportCSV)} className={`${sheetBtn} bg-emerald-600 hover:bg-emerald-700 text-white border-emerald-600`}>
-                            <IconFileDown size={18} />
-                            下載訂單 CSV 報表
-                          </button>
-                          <button type="button" onClick={pick(handleExportProductsExcel)} className={`${sheetBtn} bg-slate-100 hover:bg-slate-200 text-slate-700 border-slate-200`}>
-                            <IconFileDown size={18} />
-                            下載商品庫與滯銷分析 Excel
-                          </button>
-                        </>
-                      ) : (
-                        <>
-                          <p className="text-xs text-slate-500">刪除的訂單和商品會先放進回收桶，可以還原；重要操作都會記在日誌裡，改錯的訂單可以還原到修改前。</p>
-                          <button type="button" onClick={pick(() => setIsTrashOpen(true))} className={`${sheetBtn} bg-slate-100 hover:bg-slate-200 text-slate-700 border-slate-200`}>
-                            🗑️ 回收桶 ({trashCount})
-                          </button>
-                          <button type="button" onClick={pick(() => setIsLogOpen(true))} className={`${sheetBtn} bg-slate-100 hover:bg-slate-200 text-slate-700 border-slate-200`}>
-                            📒 操作日誌
-                          </button>
-                          <button type="button" onClick={pick(() => setIsRestoreModalOpen(true))} className={`${sheetBtn} bg-red-50 hover:bg-red-100 text-red-700 border-red-200`}>
-                            📥 還原 JSON 備份
-                          </button>
-                        </>
-                      )}
+                      <div className="flex-1 overflow-y-auto p-5 space-y-3">
+                        {sheet === 'export' ? (
+                          <>
+                            <button type="button" onClick={pick(handleExportCSV)} className={`${sheetBtn} bg-emerald-600 hover:bg-emerald-700 text-white border-emerald-600`}>
+                              <IconFileDown size={20} />
+                              <span className="flex-1">
+                                <span className="block">下載訂單 CSV 報表</span>
+                                <span className="block text-xs font-normal opacity-80">全部訂單明細，下載後可用 Excel 開啟</span>
+                              </span>
+                            </button>
+                            <button type="button" onClick={pick(handleExportProductsExcel)} className={`${sheetBtn} bg-slate-100 hover:bg-slate-200 text-slate-700 border-slate-200`}>
+                              <IconFileDown size={20} />
+                              <span className="flex-1">
+                                <span className="block">下載商品庫與滯銷分析 Excel</span>
+                                <span className="block text-xs font-normal text-slate-500">商品清單與滯銷狀況</span>
+                              </span>
+                            </button>
+                          </>
+                        ) : (
+                          <>
+                            <button type="button" onClick={pick(() => setIsTrashOpen(true))} className={`${sheetBtn} bg-slate-100 hover:bg-slate-200 text-slate-700 border-slate-200`}>
+                              <span className="text-xl">🗑️</span>
+                              <span className="flex-1">
+                                <span className="block">回收桶 ({trashCount})</span>
+                                <span className="block text-xs font-normal text-slate-500">刪除的訂單與商品，可以還原</span>
+                              </span>
+                            </button>
+                            <button type="button" onClick={pick(() => setIsLogOpen(true))} className={`${sheetBtn} bg-slate-100 hover:bg-slate-200 text-slate-700 border-slate-200`}>
+                              <span className="text-xl">📒</span>
+                              <span className="flex-1">
+                                <span className="block">操作日誌</span>
+                                <span className="block text-xs font-normal text-slate-500">重要操作紀錄，改錯的訂單可以還原到修改前</span>
+                              </span>
+                            </button>
+                            <button type="button" onClick={pick(() => setIsRestoreModalOpen(true))} className={`${sheetBtn} bg-red-50 hover:bg-red-100 text-red-700 border-red-200`}>
+                              <span className="text-xl">📥</span>
+                              <span className="flex-1">
+                                <span className="block">還原 JSON 備份</span>
+                                <span className="block text-xs font-normal opacity-80">用備份檔把資料還原回來</span>
+                              </span>
+                            </button>
+                          </>
+                        )}
+                      </div>
                     </div>
                   </div>
                 )}
