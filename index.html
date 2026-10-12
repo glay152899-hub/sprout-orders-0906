@@ -59,7 +59,18 @@
     // ==========================================
     // config.js — 版本號 / Firebase設定 / 常數設定值
     // ==========================================
-    const APP_VERSION = '2.14.17';
+    const APP_VERSION = '2.14.18';
+
+    // [v2.14.18] 尺寸系列：新增訂單與商品庫的尺寸快捷選項。存進資料庫的仍是「80, 90, 100」這種逗號字串，系列只是輸入輔助。
+    // 要增減尺寸只改這裡；統一存大寫（與既有資料、sortSizes 的排序表一致）。
+    const SIZE_SERIES = [
+      { key: 'asia', label: '亞洲尺寸', sizes: ['59', '66', '73', '80', '90', '100', '110', '120', '130', '140', '150', '160'] },
+      { key: 'general', label: '通用尺寸', sizes: ['XS', 'S', 'M', 'L', 'XL', 'F'] },
+      { key: 'euro', label: '歐美尺寸', sizes: ['3M', '6M', '9M', '12M', '18M', '24M'] },
+    ];
+    const SIZE_SERIES_CUSTOM = 'custom';              // 第四個選項：自訂（自己輸入，留空＝F）
+    const SIZE_SERIES_DEFAULT = 'asia';
+    const SIZE_SERIES_STORAGE_KEY = 'sprout_size_series'; // 記住這台裝置上次選的系列
 
     // [v2.14.17] 「更多」裡所有彈窗共用的底部抽屜樣式：固定約九成高、上緣一致（不再依內容縮在底部）。
     // 內容太多的部分在抽屜內自己捲動；要調整高度只改這一處。
@@ -1156,6 +1167,35 @@
     // 尺寸 / 顏色欄位的拆分（逗號、頓號、斜線、空白）
     const splitProductOptions = (s) =>
       String(s || '').split(/[,，、/ ]+/).map(x => x.trim()).filter(Boolean);
+
+    // ---- [v2.14.18] 尺寸系列 ----
+    const loadSizeSeries = () => {
+      try {
+        const v = localStorage.getItem(SIZE_SERIES_STORAGE_KEY);
+        if (v === SIZE_SERIES_CUSTOM || SIZE_SERIES.some(s => s.key === v)) return v;
+      } catch (err) { /* 無痕或被擋時用預設 */ }
+      return SIZE_SERIES_DEFAULT;
+    };
+    const saveSizeSeries = (key) => {
+      try { localStorage.setItem(SIZE_SERIES_STORAGE_KEY, key); } catch (err) { /* ignore */ }
+    };
+    const getSizeSeriesList = (key) => (SIZE_SERIES.find(s => s.key === key)?.sizes || []);
+    const hasProductSize = (sizesStr, size) =>
+      splitProductOptions(sizesStr).some(x => x.toUpperCase() === String(size).toUpperCase());
+    // 勾選／取消勾選一個尺寸：不分大小寫比對，結果排序後用「, 」接起來
+    const toggleProductSize = (sizesStr, size) => {
+      const list = splitProductOptions(sizesStr);
+      const up = String(size).toUpperCase();
+      const has = list.some(x => x.toUpperCase() === up);
+      const next = has ? list.filter(x => x.toUpperCase() !== up) : [...list, size];
+      return sortSizes(next).join(', ');
+    };
+    // 整組全選（on=true）或整組清除（on=false）；只動這個系列內的尺寸，其他已填的保留
+    const setSeriesSizes = (sizesStr, seriesSizes, on) => {
+      const ups = new Set(seriesSizes.map(x => x.toUpperCase()));
+      const rest = splitProductOptions(sizesStr).filter(x => !ups.has(x.toUpperCase()));
+      return sortSizes(on ? [...rest, ...seriesSizes] : rest).join(', ');
+    };
 
     // 只有一種尺寸且一種顏色 → 可以「＋」一鍵直接加入，不必再選規格
     const isSingleVariantProduct = (p) =>
@@ -4978,6 +5018,10 @@
     // [Phase 1] 商品新增/編輯彈窗
     function ProductEditModal({ pe }) {
       const { editingProduct, handleProductImageUpload, handleRemoveProductImage, handleSaveProductModal, isProductModalOpen, isUploadingProductImage, setEditingProduct, setImageLightboxUrl, setIsProductModalOpen } = pe;
+      // [v2.14.18] 尺寸系列：純畫面 state（選哪個系列），不涉及資料，所以直接放在這裡（同 MoreTab 的例外）
+      const [sizeSeries, setSizeSeriesState] = React.useState(loadSizeSeries);
+      const setSizeSeries = (key) => { setSizeSeriesState(key); saveSizeSeries(key); };
+      const seriesSizes = getSizeSeriesList(sizeSeries);
       return (
         <>
           {/* Edit / Add Product Modal */}
@@ -5077,10 +5121,45 @@
                   </div>
 
                   <div>
-                    <label className="text-xs font-semibold text-slate-600 mb-1 block">尺寸選項 (以逗號或斜線隔開)</label>
+                    <div className="flex items-center justify-between gap-2 mb-1.5">
+                      <label className="text-xs font-semibold text-slate-600">尺寸選項</label>
+                      <select
+                        value={sizeSeries}
+                        onChange={(e) => setSizeSeries(e.target.value)}
+                        className="text-xs px-2 py-1 rounded-lg border border-slate-200 bg-white text-slate-700 font-semibold focus:outline-none focus:border-emerald-500"
+                      >
+                        {SIZE_SERIES.map((sr) => <option key={sr.key} value={sr.key}>{sr.label}</option>)}
+                        <option value={SIZE_SERIES_CUSTOM}>自訂</option>
+                      </select>
+                    </div>
+                    {sizeSeries !== SIZE_SERIES_CUSTOM && (
+                      <div className="mb-2">
+                        <div className="flex flex-wrap gap-1.5">
+                          {seriesSizes.map((sz) => {
+                            const on = hasProductSize(editingProduct.sizes, sz);
+                            return (
+                              <button
+                                key={sz}
+                                type="button"
+                                onClick={() => setEditingProduct({ ...editingProduct, sizes: toggleProductSize(editingProduct.sizes, sz) })}
+                                className={`px-3 py-1 text-xs font-bold rounded-lg border transition ${
+                                  on ? 'bg-emerald-600 text-white border-emerald-600' : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-100'
+                                }`}
+                              >
+                                {sz}
+                              </button>
+                            );
+                          })}
+                        </div>
+                        <div className="flex gap-3 mt-1.5">
+                          <button type="button" onClick={() => setEditingProduct({ ...editingProduct, sizes: setSeriesSizes(editingProduct.sizes, seriesSizes, true) })} className="text-[11px] font-semibold text-emerald-700">全選</button>
+                          <button type="button" onClick={() => setEditingProduct({ ...editingProduct, sizes: setSeriesSizes(editingProduct.sizes, seriesSizes, false) })} className="text-[11px] font-semibold text-slate-400">清除這組</button>
+                        </div>
+                      </div>
+                    )}
                     <input
                       type="text"
-                      placeholder="S, M, L, XL 或 F"
+                      placeholder="點上面的尺寸，或自己輸入（以逗號隔開）；單一規格請留空"
                       value={editingProduct.sizes}
                       onChange={(e) => setEditingProduct({ ...editingProduct, sizes: e.target.value })}
                       className="w-full text-xs sm:text-sm px-3 py-2 rounded-xl border border-slate-200 focus:outline-none focus:border-emerald-500"
@@ -6553,6 +6632,8 @@
       const [shippingFeeAuto, setShippingFeeAuto] = React.useState(true); // 運費是否跟著物流方式/滿額自動帶入
       const [orderNote, setOrderNote] = React.useState('');
       const [orderDate, setOrderDate] = React.useState(''); // [v2.14.5] 新增訂單的日期（YYYY-MM-DD）；空白＝今天
+      const [sizeSeries, setSizeSeriesState] = React.useState(loadSizeSeries); // [v2.14.18] 新增訂單手動輸入時的尺寸系列（記住上次選擇）
+      const setSizeSeries = (key) => { setSizeSeriesState(key); saveSizeSeries(key); };
       const [isPrepaidNew, setIsPrepaidNew] = React.useState(false); // [v2.14.12] 客人已全額轉帳：建單即「已領貨（入帳）」
       
       const [orderItems, setOrderItems] = React.useState([]);
@@ -7793,7 +7874,7 @@
           sku: '',
           name: '',
           price: 0,
-          sizes: 'S, M, L, XL',
+          sizes: '', // [v2.14.18] 預設不勾任何尺寸；不選就存成 F（單一規格）
           colors: '黑色, 白色',
           category: '服飾',
           note: '',
@@ -9079,30 +9160,55 @@
                       </div>
 
 
-                      {/* Size Quick Select */}
+                      {/* Size Quick Select（[v2.14.18] 多一個尺寸系列下拉：亞洲／通用／歐美／自訂） */}
                       <div>
-                        <label className="text-[11px] sm:text-xs font-medium text-slate-500 block mb-1">尺寸快捷點選</label>
-                        <div className="flex flex-wrap gap-1.5">
-                          {(selectedProductRef ? splitProductOptions(selectedProductRef.sizes) : ['80', '90', '100', '110', '120', '130', '140', '150']).map((sz) => {
-                            const cleanSz = sz.trim();
-                            if (!cleanSz) return null;
-                            const isSelected = currentItem.size === cleanSz;
-                            return (
-                              <button
-                                key={cleanSz}
-                                type="button"
-                                onClick={() => setCurrentItem({ ...currentItem, size: cleanSz })}
-                                className={`px-3 py-1 text-xs font-bold rounded-lg border transition ${
-                                  isSelected
-                                    ? 'bg-slate-800 text-white border-slate-800'
-                                    : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-100'
-                                }`}
-                              >
-                                {cleanSz}
-                              </button>
-                            );
-                          })}
+                        <div className="flex items-center justify-between gap-2 mb-1">
+                          <label className="text-[11px] sm:text-xs font-medium text-slate-500">{selectedProductRef ? '尺寸（商品庫）' : '尺寸快捷點選'}</label>
+                          {!selectedProductRef && (
+                            <select
+                              value={sizeSeries}
+                              onChange={(e) => setSizeSeries(e.target.value)}
+                              className="text-xs px-2 py-1 rounded-lg border border-slate-200 bg-white text-slate-700 font-semibold focus:outline-none focus:border-emerald-500"
+                            >
+                              {SIZE_SERIES.map((sr) => <option key={sr.key} value={sr.key}>{sr.label}</option>)}
+                              <option value={SIZE_SERIES_CUSTOM}>自訂</option>
+                            </select>
+                          )}
                         </div>
+                        {!selectedProductRef && sizeSeries === SIZE_SERIES_CUSTOM ? (
+                          <div>
+                            <input
+                              type="text"
+                              placeholder="例如：均碼（留空＝F）"
+                              value={currentItem.size === 'F' ? '' : currentItem.size}
+                              onChange={(e) => setCurrentItem({ ...currentItem, size: e.target.value === '' ? 'F' : e.target.value })}
+                              className="w-full text-xs sm:text-sm px-3 py-2 rounded-xl border border-slate-200 focus:outline-none focus:border-emerald-500"
+                            />
+                            <p className="text-[11px] text-slate-400 mt-1">目前尺寸：{currentItem.size}</p>
+                          </div>
+                        ) : (
+                          <div className="flex flex-wrap gap-1.5">
+                            {(selectedProductRef ? splitProductOptions(selectedProductRef.sizes) : getSizeSeriesList(sizeSeries)).map((sz) => {
+                              const cleanSz = sz.trim();
+                              if (!cleanSz) return null;
+                              const isSelected = currentItem.size === cleanSz;
+                              return (
+                                <button
+                                  key={cleanSz}
+                                  type="button"
+                                  onClick={() => setCurrentItem({ ...currentItem, size: cleanSz })}
+                                  className={`px-3 py-1 text-xs font-bold rounded-lg border transition ${
+                                    isSelected
+                                      ? 'bg-slate-800 text-white border-slate-800'
+                                      : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-100'
+                                  }`}
+                                >
+                                  {cleanSz}
+                                </button>
+                              );
+                            })}
+                          </div>
+                        )}
                       </div>
 
                       {/* Quantity Controls */}
