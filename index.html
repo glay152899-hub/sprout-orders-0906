@@ -59,7 +59,22 @@
     // ==========================================
     // config.js — 版本號 / Firebase設定 / 常數設定值
     // ==========================================
-    const APP_VERSION = '2.14.11';
+    const APP_VERSION = '2.14.21';
+
+    // [v2.14.18] 尺寸系列：新增訂單與商品庫的尺寸快捷選項。存進資料庫的仍是「80, 90, 100」這種逗號字串，系列只是輸入輔助。
+    // 要增減尺寸只改這裡；統一存大寫（與既有資料、sortSizes 的排序表一致）。
+    const SIZE_SERIES = [
+      { key: 'asia', label: '亞洲尺寸', sizes: ['59', '66', '73', '80', '90', '100', '110', '120', '130', '140', '150', '160'] },
+      { key: 'general', label: '通用尺寸', sizes: ['XS', 'S', 'M', 'L', 'XL', 'F'] },
+      { key: 'euro', label: '歐美尺寸', sizes: ['3M', '6M', '9M', '12M', '18M', '24M'] },
+    ];
+    const SIZE_SERIES_CUSTOM = 'custom';              // 第四個選項：自訂（自己輸入，留空＝F）
+    const SIZE_SERIES_DEFAULT = 'asia';
+    const SIZE_SERIES_STORAGE_KEY = 'sprout_size_series'; // 記住這台裝置上次選的系列
+
+    // [v2.14.17] 「更多」裡所有彈窗共用的底部抽屜樣式：固定約九成高、上緣一致（不再依內容縮在底部）。
+    // 內容太多的部分在抽屜內自己捲動；要調整高度只改這一處。
+    const MORE_SHEET_CLASS = 'bg-white w-full sm:max-w-lg rounded-t-3xl sm:rounded-2xl shadow-2xl flex flex-col h-[90vh]';
     document.title = `Sprout 📱 小豆苗訂單助手 V${APP_VERSION} (Firebase RTDB 實時同步版)`;
 
     const firebaseConfig = {
@@ -132,7 +147,9 @@
       { key: 'blacklist', label: '黑名單', filename: 'blacklist.json' },
       { key: 'settings', label: '設定（運費/折扣等）', filename: 'settings.json' },
       { key: 'trash', label: '回收桶', filename: 'trash.json' },
-      { key: 'logs', label: '操作日誌', filename: 'logs.json' }
+      { key: 'logs', label: '操作日誌', filename: 'logs.json' },
+      { key: 'finance/entries', label: '收支紀錄', filename: 'finance.json' }, // [v2.14.10] 檔案內容＝{ 收支id: 收支 }；v2.14.11 起寫入 finance/entries，用合併不整包覆蓋
+      { key: 'salesArchive', label: '歷史訂單封存', filename: 'salesArchive.json' } // [v2.14.11] 唯讀歷史訂單，供收支報表使用
     ];
 
     const QUICK_PICK_HALF_LIFE_DAYS = 7;   // 權重減半所需天數
@@ -605,6 +622,10 @@
       shippingFee: Number(order?.shippingFee) ?? 60,
       paymentStatus: Boolean(order?.paymentStatus),
       shipmentStatus: order?.shipmentStatus || 'unshipped',
+      // [v2.14.12] paymentStatus 的畫面名稱改為「已領貨／未領貨」（取貨付款：領貨＝款項入帳；轉帳：收到款就算）。
+      // paidDate＝領貨（入帳）日 YYYY-MM-DD，空白＝舊資料沒記，收支報表退回用訂單日期；closeStatus＝'abandoned' 代表棄單（不計營收）
+      paidDate: /^\d{4}-\d{2}-\d{2}$/.test(String(order?.paidDate || '')) ? order.paidDate : '',
+      closeStatus: order?.closeStatus === 'abandoned' ? 'abandoned' : '',
       items: Array.isArray(order?.items) ? order.items.map(sanitizeItem) : [],
       note: order?.note || '',
       createdAt: order?.createdAt || new Date().toLocaleString('zh-TW', { hour12: false }),
@@ -684,7 +705,9 @@
       storeName: '門市名稱',
       storeAddress: '地址', // [v2.13.0新增]
       shippingFee: '運費',
-      paymentStatus: '付款狀態',
+      paymentStatus: '領貨狀態',
+      paidDate: '領貨日',
+      closeStatus: '棄單',
       shipmentStatus: '出貨狀態',
       note: '備註',
       items: '商品明細'
@@ -701,7 +724,8 @@
 
     const formatLogValue = (key, value) => {
       if (key === 'timestamp') return toDateInputValue(value) || String(value);
-      if (key === 'paymentStatus') return value ? '已付款' : '未付款';
+      if (key === 'paymentStatus') return value ? '已領貨' : '未領貨';
+      if (key === 'closeStatus') return value === 'abandoned' ? '棄單' : '正常';
       if (key === 'shipmentStatus') return value === 'shipped' ? '已出貨' : '待出貨';
       if (value === '' || value === null || value === undefined) return '（空）';
       return String(value);
@@ -1143,6 +1167,35 @@
     // 尺寸 / 顏色欄位的拆分（逗號、頓號、斜線、空白）
     const splitProductOptions = (s) =>
       String(s || '').split(/[,，、/ ]+/).map(x => x.trim()).filter(Boolean);
+
+    // ---- [v2.14.18] 尺寸系列 ----
+    const loadSizeSeries = () => {
+      try {
+        const v = localStorage.getItem(SIZE_SERIES_STORAGE_KEY);
+        if (v === SIZE_SERIES_CUSTOM || SIZE_SERIES.some(s => s.key === v)) return v;
+      } catch (err) { /* 無痕或被擋時用預設 */ }
+      return SIZE_SERIES_DEFAULT;
+    };
+    const saveSizeSeries = (key) => {
+      try { localStorage.setItem(SIZE_SERIES_STORAGE_KEY, key); } catch (err) { /* ignore */ }
+    };
+    const getSizeSeriesList = (key) => (SIZE_SERIES.find(s => s.key === key)?.sizes || []);
+    const hasProductSize = (sizesStr, size) =>
+      splitProductOptions(sizesStr).some(x => x.toUpperCase() === String(size).toUpperCase());
+    // 勾選／取消勾選一個尺寸：不分大小寫比對，結果排序後用「, 」接起來
+    const toggleProductSize = (sizesStr, size) => {
+      const list = splitProductOptions(sizesStr);
+      const up = String(size).toUpperCase();
+      const has = list.some(x => x.toUpperCase() === up);
+      const next = has ? list.filter(x => x.toUpperCase() !== up) : [...list, size];
+      return sortSizes(next).join(', ');
+    };
+    // 整組全選（on=true）或整組清除（on=false）；只動這個系列內的尺寸，其他已填的保留
+    const setSeriesSizes = (sizesStr, seriesSizes, on) => {
+      const ups = new Set(seriesSizes.map(x => x.toUpperCase()));
+      const rest = splitProductOptions(sizesStr).filter(x => !ups.has(x.toUpperCase()));
+      return sortSizes(on ? [...rest, ...seriesSizes] : rest).join(', ');
+    };
 
     // 只有一種尺寸且一種顏色 → 可以「＋」一鍵直接加入，不必再選規格
     const isSingleVariantProduct = (p) =>
@@ -1898,7 +1951,7 @@
         '配送方式': o.deliveryMethod,
         '門市名稱': deriveStoreDisplay(o).name,
         '地址': deriveStoreDisplay(o).address,
-        '付款狀態': o.paymentStatus ? '已付款' : '未付款',
+        '領貨狀態': o.closeStatus === 'abandoned' ? '棄單' : (o.paymentStatus ? '已領貨' : '未領貨'),
         '出貨狀態': o.shipmentStatus === 'shipped' ? '已出貨' : '待出貨',
         '商品明細': o.items.map(i =>
           isAdjustmentItem(i)
@@ -1935,7 +1988,7 @@
     // 訂單 CSV 全文（含 BOM）（handleExportCSV 用）
     const buildOrdersCsv = (orders) => {
       let csvContent = '\uFEFF';
-      csvContent += '訂單編號,顧客姓名,電話,LINE,IG,配送方式,門市名稱,地址,購買品項細項,商品小計,運費,訂單總金額,付款狀態,出貨狀態,備註事項,建立時間\n';
+      csvContent += '訂單編號,顧客姓名,電話,LINE,IG,配送方式,門市名稱,地址,購買品項細項,商品小計,運費,訂單總金額,領貨狀態,出貨狀態,備註事項,建立時間\n';
 
       orders.forEach(o => {
         const itemsDetail = o.items.map(i => `[${i.sku}]${i.name}-${i.color}/${i.size} x${i.qty}`).join('; ');
@@ -1956,7 +2009,7 @@
           subtotal,
           o.shippingFee,
           total,
-          o.paymentStatus ? '已付款' : '未付款',
+          o.closeStatus === 'abandoned' ? '棄單' : (o.paymentStatus ? '已領貨' : '未領貨'),
           o.shipmentStatus === 'shipped' ? '已出貨' : '待出貨',
           `"${(o.note || '').replace(/"/g, '""')}"`,
           `"${o.createdAt}"`
@@ -2009,9 +2062,17 @@
       let receivedRevenue = 0;
       let pendingRevenue = 0;
 
+      let abandonedCount = 0;
+      let abandonedAmount = 0;
+      let paidCount = 0;
+
       orders.forEach(o => {
         const total = calcOrderTotal(o);
-        if (o.paymentStatus) {
+        if (o.closeStatus === 'abandoned') { // [v2.14.12] 棄單：不算未領貨、不算待收
+          abandonedCount += 1;
+          abandonedAmount += total;
+        } else if (o.paymentStatus) {
+          paidCount += 1;
           receivedRevenue += total;
         } else {
           unpaidCount += 1;
@@ -2025,8 +2086,10 @@
 
       return {
         total: orders.length,
-        paidCount: orders.length - unpaidCount,
+        paidCount,
         unpaidCount,
+        abandonedCount,
+        abandonedAmount,
         unshippedCount,
         readyToShipCount,
         receivedRevenue,
@@ -2042,7 +2105,7 @@
         // [V2.1] 折抵項目不算「賣出商品件數」
         return sum + o.items.reduce((s, i) => s + (isAdjustmentItem(i) ? 0 : i.qty), 0);
       }, 0);
-      const unpaidCount = orders.filter(o => !o.paymentStatus).length;
+      const unpaidCount = orders.filter(o => !o.paymentStatus && o.closeStatus !== 'abandoned').length;
       const unshippedCount = orders.filter(o => o.shipmentStatus !== 'shipped').length;
 
       const stagnantAlertCount = enrichedProducts.filter(p => {
@@ -2052,6 +2115,295 @@
 
       return { totalOrders, totalRevenue, totalItemsCount, unpaidCount, unshippedCount, stagnantAlertCount };
     };
+  </script>
+  <script type="text/babel">
+    // ==========================================
+    // utils-finance.js  (v2.14.10 新增，v2.14.11 接上訂單營收)
+    // 收支資料整理與彙總：純函式，資料進、結果出，不碰 state／Firebase／畫面
+    // 相依：utils-core.js（toDateInputValue）、utils-order.js（calcOrderSubtotal）。資料節點見 finance-data.js
+    // ==========================================
+
+    // [v2.14.11] 依她的 Excel 實際分類：支出五類；收入（訂單營收由訂單自動算，這裡只放「訂單以外」的收入）
+    const FINANCE_INCOME_CATEGORIES = ['現貨銷售', '團購', '其他收入'];
+    const FINANCE_EXPENSE_CATEGORIES = ['進貨', '包材', '廣告', '國際運費', '寄送運費', '其他支出'];
+    const FINANCE_ADJUST_CATEGORIES = ['營收調整']; // type 'adj'：金額可正可負（內退、歷史對帳差額），算進收入
+    const FINANCE_ORDER_CATEGORY = '訂單營收';       // 由訂單自動產生，唯讀
+    // 營收切換日：此日之前用「歷史封存 salesArchive」，此日起用 App 裡的即時訂單（避免同一張訂單算兩次）
+    // 使用者規劃：2026/6（含）以前＝歷史資料（salesArchive），2026/7/1 起匯入 App 並手動維護狀態＝即時訂單
+    const FINANCE_ORDER_CUTOVER = '2026-07-01';
+    // 領貨制啟用日：此日（含）之後「下單」的訂單，要「已領貨」才算營收；之前的歷史訂單一律視為已領貨。
+    // 記帳日永遠是下單日（老婆的習慣）：領貨只決定有沒有入帳，領貨日在下個月也記回下單那天。
+    const FINANCE_PICKUP_START = '2026-07-01';
+    const FINANCE_PENDING_WARN_DAYS = 14; // 未領貨超過幾天就標示逾期
+
+    const financeCategoriesOf = (type) => (type === 'in' ? FINANCE_INCOME_CATEGORIES : type === 'adj' ? FINANCE_ADJUST_CATEGORIES : FINANCE_EXPENSE_CATEGORIES);
+
+    // 本地今天 YYYY-MM-DD
+    const financeToday = (nowMs = Date.now()) => {
+      const d = new Date(nowMs);
+      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    };
+
+    const isValidFinanceDate = (s) => {
+      const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(s || ''));
+      if (!m) return false;
+      const y = Number(m[1]), mo = Number(m[2]), da = Number(m[3]);
+      const d = new Date(y, mo - 1, da);
+      return d.getFullYear() === y && d.getMonth() === mo - 1 && d.getDate() === da;
+    };
+
+    const formatMoney = (n) => {
+      const v = Math.round(Number(n) || 0);
+      return `${v < 0 ? '-' : ''}$${Math.abs(v).toLocaleString()}`;
+    };
+
+    // 讀進來的收支一律先整理：缺欄位補預設，金額一律是 >= 0 的數字，type 只有 in／out
+    const sanitizeFinanceEntry = (raw) => ({
+      id: raw?.id || '',
+      date: isValidFinanceDate(raw?.date) ? raw.date : '',
+      type: raw?.type === 'in' ? 'in' : raw?.type === 'adj' ? 'adj' : 'out',
+      amount: raw?.type === 'adj' ? (Number(raw?.amount) || 0) : Math.max(0, Number(raw?.amount) || 0),
+      category: String(raw?.category || ''),
+      note: String(raw?.note || ''),
+      createdAt: Number(raw?.createdAt) || 0,
+      createdBy: String(raw?.createdBy || '')
+    });
+
+    // 有資料的月份（新到舊）；一定包含當月，讓空資料時畫面也有可選的月份
+    const listFinanceMonths = (entries, nowMs = Date.now()) => {
+      const set = new Set([financeToday(nowMs).slice(0, 7)]);
+      (entries || []).forEach(e => { if (e.date) set.add(e.date.slice(0, 7)); });
+      return Array.from(set).sort().reverse();
+    };
+
+    const groupByCategory = (list) => {
+      const map = {};
+      list.forEach(e => {
+        const key = e.category || '未分類';
+        map[key] = (map[key] || 0) + e.amount;
+      });
+      return Object.entries(map).map(([category, amount]) => ({ category, amount })).sort((a, b) => b.amount - a.amount);
+    };
+
+    // monthKey：'YYYY-MM' 或 'all'。沒有日期的資料（壞資料）只會出現在 'all' 的總額，不會出現在日期明細
+    const computeFinanceSummary = (entries, monthKey = 'all') => {
+      const inScope = (entries || []).filter(e => monthKey === 'all' || (e.date && e.date.slice(0, 7) === monthKey));
+      const incomes = inScope.filter(e => e.type === 'in' || e.type === 'adj'); // 營收調整（可為負）算進收入
+      const expenses = inScope.filter(e => e.type === 'out');
+      const income = incomes.reduce((s, e) => s + e.amount, 0);
+      const expense = expenses.reduce((s, e) => s + e.amount, 0);
+      const sumWhere = (fn) => inScope.filter(fn).reduce((s, e) => s + e.amount, 0);
+      const sources = {
+        order: sumWhere(e => e.source === 'order'),
+        manualIn: sumWhere(e => e.type === 'in' && e.source !== 'order'),
+        adjust: sumWhere(e => e.type === 'adj')
+      };
+      const dayMap = {};
+      inScope.forEach(e => {
+        const key = e.date || '無日期';
+        if (!dayMap[key]) dayMap[key] = { date: key, income: 0, expense: 0, entries: [] };
+        dayMap[key][e.type === 'out' ? 'expense' : 'income'] += e.amount;
+        dayMap[key].entries.push(e);
+      });
+      const days = Object.values(dayMap).sort((a, b) => (a.date < b.date ? 1 : -1));
+      days.forEach(d => d.entries.sort((a, b) => b.createdAt - a.createdAt));
+      return {
+        income, expense, net: income - expense, count: inScope.length, sources,
+        incomeByCategory: groupByCategory(incomes),
+        expenseByCategory: groupByCategory(expenses),
+        days
+      };
+    };
+
+    const FINANCE_WEEKDAYS = ['日', '一', '二', '三', '四', '五', '六'];
+    // '2026-10-09' → { md: '10/09', weekday: '五' }
+    const describeFinanceDay = (dateStr) => {
+      if (!isValidFinanceDate(dateStr)) return { md: dateStr, weekday: '' };
+      const [y, m, d] = dateStr.split('-').map(Number);
+      return { md: `${String(m).padStart(2, '0')}/${String(d).padStart(2, '0')}`, weekday: FINANCE_WEEKDAYS[new Date(y, m - 1, d).getDay()] };
+    };
+
+
+    // ---------- [v2.14.11] 訂單營收（自動） ----------
+    // 她的算法（用 2025/11～2026/7 的真實收支表逐筆驗證過）：商品金額（含折扣後調整行）、不含運費、棄單／取消不算
+    const FINANCE_ABANDON_RE = /棄單|取消/;
+    // [v2.14.12] 有 closeStatus（棄單狀態）就以它為準；歷史封存沒有這個欄位，才退回看姓名／備註／單號的字樣
+    const isAbandonedOrder = (o) => o?.closeStatus === 'abandoned' || FINANCE_ABANDON_RE.test(`${o?.customerName || ''} ${o?.note || ''} ${o?.orderNo || ''}`);
+
+    // liveOrders：App 即時訂單（只取切換日當天以後）；archiveOrders：歷史封存（只取切換日之前）
+    // 回傳 { entries: 每日一筆的唯讀「訂單營收」, excluded: 被排除的棄單, pending: 待入帳（啟用日後下單、尚未領貨）[{id,date,amount}] }
+    const buildOrderRevenue = (liveOrders, archiveOrders, cutover = FINANCE_ORDER_CUTOVER, pickupStart = FINANCE_PICKUP_START) => {
+      const days = {};
+      const excluded = [];
+      const pending = [];
+      const take = (o, isLive) => {
+        const date = toDateInputValue(o?.timestamp);
+        if (!date) return;
+        if (isLive ? date < cutover : date >= cutover) return;
+        const amount = Math.round(calcOrderSubtotal(o));
+        if (isAbandonedOrder(o)) { excluded.push({ id: o.id, date, amount }); return; }
+        if (amount === 0) return;
+        if (isLive && date >= pickupStart && !o.paymentStatus) { pending.push({ id: o.id, date, amount }); return; } // 還沒領貨：先不入帳
+        if (!days[date]) days[date] = { amount: 0, count: 0 };
+        days[date].amount += amount;
+        days[date].count += 1;
+      };
+      (liveOrders || []).forEach(o => take(o, true));
+      (archiveOrders || []).forEach(o => take(o, false));
+      const entries = Object.entries(days).map(([date, v]) => ({
+        id: `order:${date}`, date, type: 'in', amount: v.amount, category: FINANCE_ORDER_CATEGORY,
+        note: `${v.count} 張訂單`, createdAt: 0, createdBy: '', source: 'order'
+      }));
+      excluded.sort((a, b) => (a.date < b.date ? 1 : -1));
+      pending.sort((a, b) => (a.date < b.date ? 1 : -1));
+      return { entries, excluded, pending };
+    };
+
+    // 兩個 YYYY-MM-DD 相差幾天（b - a）
+    const financeDaysBetween = (a, b) => {
+      const [y1, m1, d1] = a.split('-').map(Number), [y2, m2, d2] = b.split('-').map(Number);
+      return Math.round((Date.UTC(y2, m2 - 1, d2) - Date.UTC(y1, m1 - 1, d1)) / 86400000);
+    };
+
+    // ---------- [v2.14.20] 年度總表與匯出（純函式） ----------
+    const listFinanceYears = (entries, nowMs = Date.now()) => {
+      const set = new Set([financeToday(nowMs).slice(0, 4)]);
+      (entries || []).forEach(e => { if (e.date) set.add(e.date.slice(0, 4)); });
+      return Array.from(set).sort().reverse();
+    };
+
+    const FINANCE_INCOME_ROW_ORDER = [FINANCE_ORDER_CATEGORY, ...FINANCE_INCOME_CATEGORIES, '營收調整'];
+    const orderedLabels = (found, preferred) => [...preferred.filter(l => found.has(l)), ...Array.from(found).filter(l => !preferred.includes(l)).sort()];
+
+    // 一整年：每月收入／支出／淨收支，以及「分類 × 月份」矩陣（和她 Excel 的年度總表同樣的排法）
+    // 收入列：訂單營收（自動）、現貨銷售、團購、其他收入、營收調整；支出列：進貨、包材、廣告、國際運費、寄送運費、其他支出
+    const computeFinanceYear = (entries, year) => {
+      const y = String(year);
+      const zero = () => Array(12).fill(0);
+      const incomeMap = {}, expenseMap = {};
+      (entries || []).forEach(e => {
+        if (!e.date || e.date.slice(0, 4) !== y) return;
+        const mi = Number(e.date.slice(5, 7)) - 1;
+        if (mi < 0 || mi > 11) return;
+        if (e.type === 'out') {
+          const k = e.category || '未分類';
+          (expenseMap[k] = expenseMap[k] || zero())[mi] += e.amount;
+        } else {
+          const k = e.source === 'order' ? FINANCE_ORDER_CATEGORY : e.type === 'adj' ? '營收調整' : (e.category || '未分類');
+          (incomeMap[k] = incomeMap[k] || zero())[mi] += e.amount;
+        }
+      });
+      const sum = (a) => a.reduce((s, v) => s + v, 0);
+      const toRows = (map, preferred) => orderedLabels(new Set(Object.keys(map)), preferred).map(label => ({ label, values: map[label], total: sum(map[label]) }));
+      const incomeRows = toRows(incomeMap, FINANCE_INCOME_ROW_ORDER);
+      const expenseRows = toRows(expenseMap, FINANCE_EXPENSE_CATEGORIES);
+      const colSum = (rows) => zero().map((_, i) => rows.reduce((s, r) => s + r.values[i], 0));
+      const incomeByMonth = colSum(incomeRows), expenseByMonth = colSum(expenseRows);
+      const netByMonth = incomeByMonth.map((v, i) => v - expenseByMonth[i]);
+      const months = incomeByMonth.map((income, i) => ({
+        m: i + 1, ym: `${y}-${String(i + 1).padStart(2, '0')}`, income, expense: expenseByMonth[i], net: netByMonth[i],
+        hasData: income !== 0 || expenseByMonth[i] !== 0
+      }));
+      return {
+        year: y, months, incomeRows, expenseRows, incomeByMonth, expenseByMonth, netByMonth,
+        totals: { income: sum(incomeByMonth), expense: sum(expenseByMonth), net: sum(netByMonth) }
+      };
+    };
+
+    // 匯出 Excel 用：三張表的資料。entries 要含自動的訂單營收；pending 是待入帳訂單 [{date, amount}]
+    const buildFinanceExport = (entries, pending, year) => {
+      const y = String(year);
+      const data = computeFinanceYear(entries, y);
+      const head = ['項目', ...Array.from({ length: 12 }, (_, i) => `${i + 1}月`), '合計'];
+      const aoa = [[`${y} 年收支總表`], head, ['【收入】']];
+      data.incomeRows.forEach(r => aoa.push([r.label, ...r.values, r.total]));
+      aoa.push(['收入合計', ...data.incomeByMonth, data.totals.income], ['【支出】']);
+      data.expenseRows.forEach(r => aoa.push([r.label, ...r.values, r.total]));
+      aoa.push(['支出合計', ...data.expenseByMonth, data.totals.expense], [], ['淨收支（損益）', ...data.netByMonth, data.totals.net]);
+      const typeLabel = (e) => (e.type === 'in' ? '收入' : e.type === 'adj' ? '營收調整' : '支出');
+      const detail = (entries || [])
+        .filter(e => e.date && e.date.slice(0, 4) === y)
+        .sort((a, b) => (a.date === b.date ? (a.type < b.type ? -1 : 1) : (a.date < b.date ? -1 : 1)))
+        .map(e => ({ '日期': e.date, '類型': typeLabel(e), '類別': e.category || '', '金額': e.amount, '備註': e.note || '', '來源': e.source === 'order' ? '訂單營收（自動）' : '手動記帳' }));
+      const pend = (pending || []).filter(p => p.date.slice(0, 4) === y)
+        .sort((a, b) => (a.date < b.date ? -1 : 1))
+        .map(p => ({ '下單日': p.date, '商品金額（待入帳）': p.amount, '已等天數': financeDaysBetween(p.date, financeToday()) }));
+      return { aoa, detail, pend, data };
+    };
+  </script>
+  <script type="text/babel">
+    // ==========================================
+    // finance-data.js  (v2.14.10 新增，收支報表)
+    // 收支資料的 Firebase 讀寫。只在收支畫面開著時才監聽，關閉就取消，不增加主畫面載入負擔。
+    // 節點：finance/entries/{pushId}（收支）、trash/finance/{id}（刪除後的收支，可還原）、
+    //       salesArchive/{id}（[v2.14.11] 歷史訂單封存，唯讀，格式同 orders；還原 JSON 時檔名 salesArchive.json）
+    // 規則：一律用 dbRef()／dbRoot()；id 放展開運算子之後（見交接文件第 4 節鐵律）
+    // 相依：config.js（dbRef、dbRoot）、utils-finance.js、utils-order.js（sanitizeOrder）
+    // ==========================================
+
+    function useFinanceData() {
+      const [entries, setEntries] = React.useState([]);
+      const [trash, setTrash] = React.useState([]);
+      const [loading, setLoading] = React.useState(true);
+      const [error, setError] = React.useState('');
+      const [archive, setArchive] = React.useState([]);
+      const [archiveStatus, setArchiveStatus] = React.useState('loading'); // loading | ok | empty | denied
+
+      React.useEffect(() => {
+        const entriesRef = dbRef('finance/entries');
+        const trashRef = dbRef('trash/finance');
+        const onEntries = (snap) => {
+          const val = snap.val() || {};
+          setEntries(Object.entries(val).map(([id, data]) => sanitizeFinanceEntry({ ...data, id })));
+          setLoading(false);
+        };
+        const onTrash = (snap) => {
+          const val = snap.val() || {};
+          setTrash(Object.entries(val)
+            .map(([id, data]) => ({ ...sanitizeFinanceEntry({ ...data, id }), deletedAt: Number(data?.deletedAt) || 0, deletedBy: String(data?.deletedBy || '') }))
+            .sort((a, b) => b.deletedAt - a.deletedAt));
+        };
+        const onErr = (err) => {
+          console.error('RTDB Finance Error:', err);
+          setLoading(false);
+          setError(err && err.code === 'PERMISSION_DENIED' ? '沒有收支資料的讀取權限（請確認 Firebase 規則已加入 finance 與 trash/finance）' : '收支資料同步異常，請檢查網路連線');
+        };
+        const archiveRef = dbRef('salesArchive');
+        const onArchive = (snap) => {
+          const val = snap.val() || {};
+          const list = Object.entries(val).map(([id, data]) => sanitizeOrder({ ...data, id })); // id 放最後
+          setArchive(list);
+          setArchiveStatus(list.length ? 'ok' : 'empty');
+        };
+        const onArchiveErr = (err) => {
+          console.error('RTDB salesArchive Error:', err);
+          setArchiveStatus('denied'); // 不影響收支本身，只是看不到歷史封存
+        };
+        archiveRef.on('value', onArchive, onArchiveErr);
+        entriesRef.on('value', onEntries, onErr);
+        trashRef.on('value', onTrash, onErr);
+        return () => {
+          entriesRef.off('value', onEntries);
+          trashRef.off('value', onTrash);
+          archiveRef.off('value', onArchive);
+        };
+      }, []);
+
+      return { entries, trash, loading, error, archive, archiveStatus };
+    }
+
+    // 寫入用的純資料組裝（只回傳要寫的內容，由呼叫端決定怎麼寫、怎麼包 withSyncTracking）
+    const buildFinanceEntryData = (form, userEmail, nowMs = Date.now()) => ({
+      date: form.date,
+      type: form.type === 'in' ? 'in' : form.type === 'adj' ? 'adj' : 'out',
+      amount: Math.round(Number(form.amount) || 0), // 營收調整可為負
+      category: String(form.category || ''),
+      note: String(form.note || '').trim(),
+      createdAt: nowMs,
+      createdBy: String(userEmail || '')
+    });
+
+    const financeEntryLogSummary = (e) => `${e.type === 'in' ? '收入' : e.type === 'adj' ? '調整' : '支出'} ${e.category || '未分類'} ${formatMoney(e.amount)}`; // 日誌不記備註
   </script>
   <script type="text/babel">
     // ==========================================
@@ -2075,6 +2427,8 @@
         storeAddress: storeParts.address, // [v2.13.0新增] 若是舊資料，這裡已經用括號規則拆過一次，存檔時就會變成新格式
         shippingFee: order.shippingFee,
         paymentStatus: Boolean(order.paymentStatus),
+        paidDate: order.paidDate || '', // [v2.14.12] 領貨（入帳）日；空白＝舊資料沒記
+        closeStatus: order.closeStatus === 'abandoned' ? 'abandoned' : '',
         shipmentStatus: order.shipmentStatus || 'unshipped',
         note: order.note || '',
         items: (order.items || []).map(i => ({ ...i }))
@@ -2121,6 +2475,7 @@
         if (form.items.some(i => !String(i.name || '').trim())) { setError('商品名稱不可空白'); return; }
         // [v2.14.7] 只在日期「被改動」時才檢查，原本就是未來日期的舊訂單仍可只改其他欄位
         if (form.orderDate && form.orderDate !== initialOrderDate.current && form.orderDate > todayStr) { setError('訂單日期不能是未來的日期'); return; }
+        if (form.paymentStatus && form.paidDate && form.paidDate > todayStr) { setError('領貨日不能是未來的日期'); return; }
 
         const edited = {
           orderNo: form.orderNo.trim(),
@@ -2133,6 +2488,8 @@
           storeAddress: form.storeAddress.trim(),
           shippingFee: Number(form.shippingFee) || 0,
           paymentStatus: Boolean(form.paymentStatus),
+          paidDate: form.paymentStatus ? (form.paidDate || '') : '',
+          closeStatus: form.paymentStatus ? '' : form.closeStatus,
           shipmentStatus: form.shipmentStatus,
           note: form.note.trim(),
           items: form.items.map(sanitizeItem)
@@ -2306,8 +2663,13 @@
 
               <div className="flex items-center gap-6 py-1">
                 <label className="flex items-center gap-2 cursor-pointer text-xs sm:text-sm font-semibold text-slate-700">
-                  <input type="checkbox" checked={form.paymentStatus} onChange={(e) => setField('paymentStatus', e.target.checked)} className="w-4 h-4 accent-emerald-600" />
-                  已付款
+                  <input
+                    type="checkbox"
+                    checked={form.paymentStatus}
+                    onChange={(e) => setForm(prev => ({ ...prev, paymentStatus: e.target.checked, closeStatus: e.target.checked ? '' : prev.closeStatus, paidDate: e.target.checked ? (prev.paidDate || todayStr) : '' }))}
+                    className="w-4 h-4 accent-emerald-600"
+                  />
+                  已領貨
                 </label>
                 <label className="flex items-center gap-2 cursor-pointer text-xs sm:text-sm font-semibold text-slate-700">
                   <input
@@ -2318,7 +2680,23 @@
                   />
                   已出貨
                 </label>
+                <label className="flex items-center gap-2 cursor-pointer text-xs sm:text-sm font-semibold text-slate-700">
+                  <input
+                    type="checkbox"
+                    checked={form.closeStatus === 'abandoned'}
+                    onChange={(e) => setForm(prev => ({ ...prev, closeStatus: e.target.checked ? 'abandoned' : '', paymentStatus: e.target.checked ? false : prev.paymentStatus, paidDate: e.target.checked ? '' : prev.paidDate }))}
+                    className="w-4 h-4 accent-red-600"
+                  />
+                  棄單
+                </label>
               </div>
+              {form.paymentStatus && (
+                <div>
+                  <label className="text-xs font-semibold text-slate-600 mb-1 block">領貨日（款項入帳日）</label>
+                  <input type="date" value={form.paidDate} max={todayStr} onChange={(e) => setField('paidDate', e.target.value)} className={inputCls} />
+                  {!form.paidDate && <p className="text-[11px] text-slate-400 mt-1">舊訂單沒有記錄領貨日，收支報表會暫用訂單日期；想校正可在這裡選日期。</p>}
+                </div>
+              )}
 
               <div>
                 <label className="text-xs font-semibold text-slate-600 mb-1 block">訂單備註</label>
@@ -2349,9 +2727,9 @@
 
     // [V2.8] 匯入的訂單要用什麼狀態？（Excel 裡沒有付款、出貨資訊，由使用者在預覽時指定）
     const ORDER_IMPORT_STATUS = {
-      pending: { key: 'pending', label: '待處理', desc: '未付款、待出貨（新的訂單）', paymentStatus: false, shipmentStatus: 'unshipped' },
-      shipped: { key: 'shipped', label: '已出貨', desc: '未付款（等客人取貨）', paymentStatus: false, shipmentStatus: 'shipped' },
-      done: { key: 'done', label: '已完成', desc: '已付款、已出貨（舊訂單歸檔）', paymentStatus: true, shipmentStatus: 'shipped' }
+      pending: { key: 'pending', label: '待處理', desc: '未領貨、待出貨（新的訂單）', paymentStatus: false, shipmentStatus: 'unshipped' },
+      shipped: { key: 'shipped', label: '已出貨', desc: '未領貨（已出貨，等客人取貨）', paymentStatus: false, shipmentStatus: 'shipped' },
+      done: { key: 'done', label: '已完成', desc: '已領貨、已出貨（舊訂單歸檔）', paymentStatus: true, shipmentStatus: 'shipped' }
     };
 
     // 訂單 Excel 匯入預覽 Modal（可勾選、標示重複單號 / 已對齊 Excel 總計）
@@ -2876,7 +3254,7 @@
       return (
         <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-sm flex items-end sm:items-center justify-center" onClick={onClose}>
           <div
-            className="bg-white w-full sm:max-w-md rounded-t-3xl sm:rounded-2xl shadow-2xl flex flex-col max-h-[88vh]"
+            className={MORE_SHEET_CLASS}
             onClick={(e) => e.stopPropagation()}
           >
             <div className="px-5 pt-4 pb-3 flex items-center justify-between border-b border-slate-100">
@@ -2889,7 +3267,7 @@
               </button>
             </div>
 
-            <form onSubmit={handleSubmit} className="p-5 space-y-4 overflow-y-auto">
+            <form onSubmit={handleSubmit} className="p-5 space-y-4 overflow-y-auto flex-1">
               <div className="space-y-2.5">
                 <label className="text-xs font-bold text-slate-600 block">各物流方式的運費</label>
                 {DELIVERY_METHODS.map(({ key, short }) => (
@@ -2997,7 +3375,7 @@
 
       return (
         <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-sm flex items-end sm:items-center justify-center" onClick={onClose}>
-          <div className="bg-white w-full sm:max-w-lg rounded-t-3xl sm:rounded-2xl shadow-2xl flex flex-col max-h-[92vh]" onClick={(e) => e.stopPropagation()}>
+          <div className={MORE_SHEET_CLASS} onClick={(e) => e.stopPropagation()}>
             <div className="px-5 pt-4 pb-3 flex items-center justify-between border-b border-slate-100">
               <div>
                 <h3 className="font-bold text-base text-slate-800">💬 公版訊息設定</h3>
@@ -3124,7 +3502,7 @@
       return (
         <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-sm flex items-end sm:items-center justify-center" onClick={onClose}>
           <div
-            className="bg-white w-full sm:max-w-lg rounded-t-3xl sm:rounded-2xl shadow-2xl flex flex-col max-h-[88vh]"
+            className={MORE_SHEET_CLASS}
             onClick={(e) => e.stopPropagation()}
           >
             <div className="px-5 pt-4 pb-3 flex items-center justify-between border-b border-slate-100">
@@ -3267,7 +3645,7 @@
       return (
         <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-sm flex items-end sm:items-center justify-center" onClick={onClose}>
           <div
-            className="bg-white w-full sm:max-w-md rounded-t-3xl sm:rounded-2xl shadow-2xl flex flex-col max-h-[88vh]"
+            className={MORE_SHEET_CLASS}
             onClick={(e) => e.stopPropagation()}
           >
             <div className="px-5 pt-4 pb-3 flex items-center justify-between border-b border-slate-100">
@@ -3280,7 +3658,7 @@
               </button>
             </div>
 
-            <form onSubmit={handleSubmit} className="p-5 space-y-3.5 overflow-y-auto">
+            <form onSubmit={handleSubmit} className="p-5 space-y-3.5 overflow-y-auto flex-1">
               <div>
                 <label className="text-xs font-bold text-slate-600 block mb-1">姓名（選填）</label>
                 <input type="text" placeholder="例如：王小美" value={form.name} onChange={(e) => setField('name', e.target.value)} className={inputCls} />
@@ -3341,7 +3719,7 @@
       return (
         <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-sm flex items-end sm:items-center justify-center" onClick={onClose}>
           <div
-            className="bg-white w-full sm:max-w-lg rounded-t-3xl sm:rounded-2xl shadow-2xl flex flex-col max-h-[88vh]"
+            className={MORE_SHEET_CLASS}
             onClick={(e) => e.stopPropagation()}
           >
             <div className="px-5 pt-4 pb-3 flex items-center justify-between border-b border-slate-100">
@@ -3455,7 +3833,7 @@
         }
 
         if (nextParsed.length === 0) {
-          setError('沒有辨識出任何可還原的檔案，請確認檔名是否為 orders.json／products.json／blacklist.json／settings.json／trash.json／logs.json 其中之一');
+          setError('沒有辨識出任何可還原的檔案，請確認檔名是否為 orders.json／products.json／blacklist.json／settings.json／trash.json／logs.json／finance.json／salesArchive.json 其中之一');
           setUnrecognized(nextUnrecognized);
           return;
         }
@@ -3498,7 +3876,7 @@
       return (
         <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-sm flex items-end sm:items-center justify-center" onClick={step === 'working' ? undefined : onClose}>
           <div
-            className="bg-white w-full sm:max-w-lg rounded-t-3xl sm:rounded-2xl shadow-2xl flex flex-col max-h-[88vh]"
+            className={MORE_SHEET_CLASS}
             onClick={(e) => e.stopPropagation()}
           >
             <div className="px-5 pt-4 pb-3 flex items-center justify-between border-b border-slate-100">
@@ -3518,7 +3896,7 @@
                 <>
                   <div className="bg-amber-50 border border-amber-200 rounded-xl p-3 text-xs text-amber-800 space-y-1">
                     <p>⚠️ 還原會把備份檔裡的資料寫回資料庫，請確認是正確的備份檔案。</p>
-                    <p>檔名需為：orders.json／products.json／blacklist.json／settings.json／trash.json／logs.json，一次可以選多個檔案。</p>
+                    <p>檔名需為：orders.json／products.json／blacklist.json／settings.json／trash.json／logs.json／finance.json／salesArchive.json，一次可以選多個檔案。</p>
                   </div>
                   <button
                     type="button"
@@ -3675,7 +4053,7 @@
       return (
         <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-sm flex items-end sm:items-center justify-center" onClick={onClose}>
           <div
-            className="bg-white w-full sm:max-w-lg rounded-t-3xl sm:rounded-2xl shadow-2xl flex flex-col max-h-[88vh]"
+            className={MORE_SHEET_CLASS}
             onClick={(e) => e.stopPropagation()}
           >
             <div className="px-5 pt-4 pb-3 flex items-center justify-between border-b border-slate-100">
@@ -3947,6 +4325,7 @@
         handleSelectExcelImported,
         handleTogglePayment,
         handleToggleShipment,
+        handleToggleAbandon,
       } = list;
 
       return (
@@ -4007,7 +4386,7 @@
                     onClick={() => setFilterPayment(filterPayment === 'unpaid' ? 'all' : 'unpaid')}
                     className={`flex flex-col items-start justify-start text-left bg-white px-2 py-2 sm:p-4 rounded-xl sm:rounded-2xl border shadow-sm transition min-w-0 ${filterPayment === 'unpaid' ? 'border-amber-400 ring-1 ring-amber-300' : 'border-slate-200/80'}`}
                   >
-                    <span className="text-xs sm:text-sm font-semibold text-amber-600 leading-4 truncate w-full">未付款</span>
+                    <span className="text-xs sm:text-sm font-semibold text-amber-600 leading-4 truncate w-full">未領貨</span>
                     <span className="text-lg sm:text-2xl font-bold text-amber-600 leading-7">{orderListStats.unpaidCount}</span>
                     <span className="text-[10px] text-slate-400 leading-4 truncate w-full">待收 ${orderListStats.pendingRevenue.toLocaleString()}</span>
                   </button>
@@ -4018,12 +4397,12 @@
                   >
                     <span className="text-xs sm:text-sm font-semibold text-blue-600 leading-4 truncate w-full">待出貨</span>
                     <span className="text-lg sm:text-2xl font-bold text-blue-600 leading-7">{orderListStats.unshippedCount}</span>
-                    <span className="text-[10px] text-slate-400 leading-4 truncate w-full">已付 {orderListStats.readyToShipCount} 筆</span>
+                    <span className="text-[10px] text-slate-400 leading-4 truncate w-full">已領貨 {orderListStats.readyToShipCount} 筆</span>
                   </button>
                   <div className="flex flex-col items-start justify-start bg-white px-2 py-2 sm:p-4 rounded-xl sm:rounded-2xl border border-slate-200/80 shadow-sm min-w-0">
                     <span className="text-xs sm:text-sm font-semibold text-emerald-700 leading-4 truncate w-full">已實收</span>
                     <span className="text-lg sm:text-2xl font-bold text-emerald-700 leading-7 truncate w-full tracking-tight">${orderListStats.receivedRevenue.toLocaleString()}</span>
-                    <span className="text-[10px] text-slate-400 leading-4 truncate w-full">{orderListStats.paidCount} 筆已付</span>
+                    <span className="text-[10px] text-slate-400 leading-4 truncate w-full">{orderListStats.paidCount} 筆已領貨</span>
                   </div>
                 </div>
 
@@ -4055,9 +4434,10 @@
                         value={filterPayment}
                         onChange={setFilterPayment}
                         options={[
-                          { key: 'all', label: '全部付款' },
-                          { key: 'unpaid', label: '未付款' },
-                          { key: 'paid', label: '已付款' }
+                          { key: 'all', label: '全部領貨' },
+                          { key: 'unpaid', label: '未領貨' },
+                          { key: 'paid', label: '已領貨' },
+                          { key: 'abandoned', label: '棄單' }
                         ]}
                       />
                     </div>
@@ -4219,20 +4599,40 @@
                                   className="w-5 h-5 accent-red-600 flex-shrink-0"
                                 />
                               )}
-                              <span className="font-bold text-sm sm:text-base text-slate-800 truncate">{order.customerName}</span>
+                              {/* [v2.14.21] 修正 v2.14.19：不能對姓名用百分比最大寬度（max-w-[60%]）——容器寬度由內容決定時，百分比會算成「自己的 60%」，
+                                  導致沒有 IG／LINE 的卡片姓名被壓成「劉..」。沒有帳號時維持原本寫法；有帳號時才用固定寬度上限（8.5rem）讓姓名優先。 */}
+                              <span className={`font-bold text-sm sm:text-base text-slate-800 truncate ${(order.customerIg || order.customerLine) ? 'flex-shrink-0 max-w-[8.5rem]' : ''}`}>{order.customerName}</span>
+                              {/* [v2.14.19] 有填 IG／LINE 時，姓名旁邊顯示（太長會自己截斷，完整內容在展開後） */}
+                              {(order.customerIg || order.customerLine) && (
+                                <span className="text-xs text-slate-400 truncate min-w-0">
+                                  {order.customerIg && `IG:${order.customerIg}`}
+                                  {order.customerIg && order.customerLine && '　'}
+                                  {order.customerLine && `LINE:${order.customerLine}`}
+                                </span>
+                              )}
                             </div>
 
                             <div className="flex items-center gap-1.5 flex-shrink-0">
-                              <button
-                                onClick={() => handleTogglePayment(order.id, order.paymentStatus)}
-                                className={`px-2 py-1 rounded-full text-[11px] sm:text-xs font-bold transition whitespace-nowrap ${
-                                  order.paymentStatus
-                                    ? 'bg-green-100 text-green-700'
-                                    : 'bg-amber-100 text-amber-700'
-                                }`}
-                              >
-                                {order.paymentStatus ? '✓ 已付款' : '✕ 未付款'}
-                              </button>
+                              {order.closeStatus === 'abandoned' ? (
+                                <button
+                                  onClick={() => handleToggleAbandon(order.id, true)}
+                                  className="px-2 py-1 rounded-full text-[11px] sm:text-xs font-bold transition whitespace-nowrap bg-slate-200 text-slate-500"
+                                  title="點一下可還原成未領貨"
+                                >
+                                  🚫 棄單
+                                </button>
+                              ) : (
+                                <button
+                                  onClick={() => handleTogglePayment(order.id, order.paymentStatus)}
+                                  className={`px-2 py-1 rounded-full text-[11px] sm:text-xs font-bold transition whitespace-nowrap ${
+                                    order.paymentStatus
+                                      ? 'bg-green-100 text-green-700'
+                                      : 'bg-amber-100 text-amber-700'
+                                  }`}
+                                >
+                                  {order.paymentStatus ? '✓ 已領貨' : '✕ 未領貨'}
+                                </button>
+                              )}
 
                               <button
                                 onClick={() => handleToggleShipment(order.id, order.shipmentStatus)}
@@ -4250,7 +4650,7 @@
                           {/* 第 2 行（收合時也顯示）：金額 + 日期，右邊是操作 */}
                           <div className="px-3.5 pb-2.5 pt-1 sm:px-4 sm:pb-3 flex items-center justify-between gap-2">
                             <div className="flex items-baseline gap-2 min-w-0">
-                              <span className="font-bold text-base sm:text-lg text-emerald-600">${totalAmount}</span>
+                              <span className={`font-bold text-base sm:text-lg ${order.closeStatus === 'abandoned' ? 'text-slate-400 line-through' : 'text-emerald-600'}`}>${totalAmount}</span>
                               <span className="text-sm font-medium text-slate-500 whitespace-nowrap">{dateShort}</span>
                             </div>
 
@@ -4263,6 +4663,15 @@
                                 {isExpanded ? '收合' : '明細'}
                                 {isExpanded ? <IconChevronUp size={16} /> : <IconChevronDown size={16} />}
                               </button>
+                              {!order.paymentStatus && order.closeStatus !== 'abandoned' && (
+                                <button
+                                  onClick={() => handleToggleAbandon(order.id, false)}
+                                  className="px-1.5 py-1.5 text-[11px] font-semibold text-slate-400 hover:text-red-500 rounded-lg hover:bg-red-50 transition whitespace-nowrap"
+                                  title="客人沒領貨：標記為棄單（不計營收）"
+                                >
+                                  棄單
+                                </button>
+                              )}
                               <button
                                 onClick={() => setMessageOrder(order)}
                                 className="p-1.5 text-slate-400 hover:text-sky-600 rounded-lg hover:bg-sky-50 transition"
@@ -4488,6 +4897,12 @@
     // tab-more.js — 「更多」分頁（畫面）
     // 從 app-shell.js 抽出，只搬「畫面(JSX)」本身，狀態與商業邏輯仍留在 app-shell.js，
     // 透過單一 `more` 物件把所有需要的資料/狀態/處理函式一次傳入（跟 tab-orderList.js 同一套做法）。
+    // [v2.14.16] 版面改成「三排兩列」六個入口＋帳號／測試模式兩列小項目：
+    //   資料與報表：收支報表、匯出報表（開底部小選單）
+    //   保護與名單：資料保護（開底部小選單）、黑名單管理
+    //   設定：公版訊息、運費與折扣
+    // 唯一的例外：這個元件有一個「底部小選單開哪個」的純畫面 state（sheet），不涉及資料或 Firebase，
+    // 所以直接放在這裡，避免為了它在 app-shell.js 多加 state。
     // ==========================================
     function MoreTab({ more }) {
       const {
@@ -4502,164 +4917,169 @@
         setIsMessageTemplateOpen,
         setIsShippingSettingsOpen,
         setIsBlacklistOpen,
+        setIsFinanceOpen,
         handleExportCSV,
         handleExportProductsExcel,
         handleSignOut,
         handleToggleTestMode,
       } = more;
 
+      const [sheet, setSheet] = React.useState(null); // null | 'export' | 'protect'
+      const pick = (fn) => () => { setSheet(null); fn(); }; // 先關小選單，再執行動作
+
+      const trashCount = trashOrders.length + trashProducts.length;
+
+      // 一個入口格子：accent=true 用主色底（資料與報表那一排），否則中性灰
+      const Tile = ({ icon, title, sub, onClick, accent }) => (
+        <button
+          type="button"
+          onClick={onClick}
+          className="bg-white rounded-2xl border border-slate-200/80 p-3 sm:p-4 shadow-sm text-left min-h-[96px] hover:bg-slate-50 active:scale-[0.98] transition"
+        >
+          <div className={`w-9 h-9 rounded-xl flex items-center justify-center text-xl mb-2 ${accent ? 'bg-emerald-50' : 'bg-slate-100'}`}>{icon}</div>
+          <div className="font-bold text-sm sm:text-base text-slate-800">{title}</div>
+          <div className="text-xs text-slate-500 truncate">{sub}</div>
+        </button>
+      );
+
+      const SectionLabel = ({ children }) => <div className="text-[11px] text-slate-400 px-1 mb-1.5">{children}</div>;
+
+      const sheetBtn = 'w-full px-4 py-3 text-left font-bold text-sm rounded-xl border transition flex items-center gap-2';
+
       return (
-              <div className="space-y-4 sm:space-y-6">
-                {/* Export Card */}
-                <div className="bg-gradient-to-br from-slate-900 to-slate-800 text-white rounded-2xl p-6 sm:p-8 shadow-lg space-y-4">
-                  <div className="flex items-center gap-3">
-                    <IconFileSpreadsheet className="text-emerald-400 w-8 h-8" />
-                    <div>
-                      <h3 className="font-bold text-base sm:text-lg">匯出 Excel / CSV 訂單與商品報表</h3>
-                      <p className="text-xs sm:text-sm text-slate-300">內建 UTF-8 防亂碼機制，可直接用 Microsoft Excel 或 Google 試算表開啟。</p>
+              <div className="space-y-4 sm:space-y-5">
+                <div>
+                  <SectionLabel>資料與報表</SectionLabel>
+                  <div className="grid grid-cols-2 gap-2.5 sm:gap-3">
+                    <Tile accent icon="💰" title="收支報表" sub="收入、支出、待入帳" onClick={() => setIsFinanceOpen(true)} />
+                    <Tile accent icon="📤" title="匯出報表" sub="訂單 CSV・商品 Excel" onClick={() => setSheet('export')} />
+                  </div>
+                </div>
+
+                <div>
+                  <SectionLabel>保護與名單</SectionLabel>
+                  <div className="grid grid-cols-2 gap-2.5 sm:gap-3">
+                    <Tile icon="🛡️" title="資料保護" sub={`回收桶 ${trashCount}・日誌・還原`} onClick={() => setSheet('protect')} />
+                    <Tile icon="🚫" title="黑名單管理" sub={`共 ${blacklist.length} 筆`} onClick={() => setIsBlacklistOpen(true)} />
+                  </div>
+                </div>
+
+                <div>
+                  <SectionLabel>設定</SectionLabel>
+                  <div className="grid grid-cols-2 gap-2.5 sm:gap-3">
+                    <Tile icon="💬" title="公版訊息" sub="訊息與優惠活動" onClick={() => setIsMessageTemplateOpen(true)} />
+                    <Tile
+                      icon="⚙️"
+                      title="運費與折扣"
+                      sub={shippingConfig.freeShippingEnabled ? `滿 $${shippingConfig.freeShippingThreshold.toLocaleString()} 免運` : '運費・滿額免運'}
+                      onClick={() => setIsShippingSettingsOpen(true)}
+                    />
+                  </div>
+                </div>
+
+                {/* [V2.5] Account ＋ [V2.2] Test Mode：低頻率，做成兩列小項目 */}
+                <div className="bg-white rounded-2xl border border-slate-200/80 shadow-sm divide-y divide-slate-100">
+                  <div className="flex items-center gap-3 px-4 py-3">
+                    <span className="text-lg">👤</span>
+                    <div className="flex-1 min-w-0">
+                      <div className="font-bold text-sm text-slate-800">帳號</div>
+                      <div className="text-xs text-slate-500 truncate">{user?.email || '（未知）'}</div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={handleSignOut}
+                      className="px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs rounded-lg border border-slate-200 transition whitespace-nowrap"
+                    >
+                      登出
+                    </button>
+                  </div>
+                  <div className="flex items-center gap-3 px-4 py-3">
+                    <span className="text-lg">🧪</span>
+                    <div className="flex-1 min-w-0">
+                      <div className="font-bold text-sm text-slate-800">測試模式</div>
+                      <div className="text-xs text-slate-500">
+                        {IS_TEST_MODE ? '目前在測試模式，資料不會進正式訂單' : '目前使用正式資料'}
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={handleToggleTestMode}
+                      className={`px-3 py-1.5 font-bold text-xs rounded-lg border transition whitespace-nowrap ${
+                        IS_TEST_MODE
+                          ? 'bg-emerald-600 hover:bg-emerald-700 text-white border-emerald-600'
+                          : 'bg-amber-50 hover:bg-amber-100 text-amber-800 border-amber-300'
+                      }`}
+                    >
+                      {IS_TEST_MODE ? '回到正式資料' : '進入測試'}
+                    </button>
+                  </div>
+                </div>
+
+                {/* 底部抽屜：匯出報表／資料保護（樣式與其他「更多」彈窗一致，見 config.js 的 MORE_SHEET_CLASS） */}
+                {sheet && (
+                  <div className="fixed inset-0 z-50 bg-slate-900/50 flex items-end sm:items-center justify-center" onClick={() => setSheet(null)}>
+                    <div className={MORE_SHEET_CLASS} onClick={(e) => e.stopPropagation()}>
+                      <div className="px-5 pt-4 pb-3 flex items-center justify-between border-b border-slate-100">
+                        <div>
+                          <h3 className="font-bold text-base text-slate-800">{sheet === 'export' ? '📤 匯出報表' : '🛡️ 資料保護'}</h3>
+                          <p className="text-[11px] text-slate-400">
+                            {sheet === 'export'
+                              ? '內建 UTF-8 防亂碼機制，可直接用 Microsoft Excel 或 Google 試算表開啟'
+                              : '刪除的資料會先放進回收桶，重要操作都會記在日誌裡'}
+                          </p>
+                        </div>
+                        <button type="button" onClick={() => setSheet(null)} aria-label="關閉" className="p-1.5 text-slate-400 hover:text-slate-700 rounded-lg hover:bg-slate-100">
+                          <IconX size={22} />
+                        </button>
+                      </div>
+
+                      <div className="flex-1 overflow-y-auto p-5 space-y-3">
+                        {sheet === 'export' ? (
+                          <>
+                            <button type="button" onClick={pick(handleExportCSV)} className={`${sheetBtn} bg-emerald-600 hover:bg-emerald-700 text-white border-emerald-600`}>
+                              <IconFileDown size={20} />
+                              <span className="flex-1">
+                                <span className="block">下載訂單 CSV 報表</span>
+                                <span className="block text-xs font-normal opacity-80">全部訂單明細，下載後可用 Excel 開啟</span>
+                              </span>
+                            </button>
+                            <button type="button" onClick={pick(handleExportProductsExcel)} className={`${sheetBtn} bg-slate-100 hover:bg-slate-200 text-slate-700 border-slate-200`}>
+                              <IconFileDown size={20} />
+                              <span className="flex-1">
+                                <span className="block">下載商品庫與滯銷分析 Excel</span>
+                                <span className="block text-xs font-normal text-slate-500">商品清單與滯銷狀況</span>
+                              </span>
+                            </button>
+                          </>
+                        ) : (
+                          <>
+                            <button type="button" onClick={pick(() => setIsTrashOpen(true))} className={`${sheetBtn} bg-slate-100 hover:bg-slate-200 text-slate-700 border-slate-200`}>
+                              <span className="text-xl">🗑️</span>
+                              <span className="flex-1">
+                                <span className="block">回收桶 ({trashCount})</span>
+                                <span className="block text-xs font-normal text-slate-500">刪除的訂單與商品，可以還原</span>
+                              </span>
+                            </button>
+                            <button type="button" onClick={pick(() => setIsLogOpen(true))} className={`${sheetBtn} bg-slate-100 hover:bg-slate-200 text-slate-700 border-slate-200`}>
+                              <span className="text-xl">📒</span>
+                              <span className="flex-1">
+                                <span className="block">操作日誌</span>
+                                <span className="block text-xs font-normal text-slate-500">重要操作紀錄，改錯的訂單可以還原到修改前</span>
+                              </span>
+                            </button>
+                            <button type="button" onClick={pick(() => setIsRestoreModalOpen(true))} className={`${sheetBtn} bg-red-50 hover:bg-red-100 text-red-700 border-red-200`}>
+                              <span className="text-xl">📥</span>
+                              <span className="flex-1">
+                                <span className="block">還原 JSON 備份</span>
+                                <span className="block text-xs font-normal opacity-80">用備份檔把資料還原回來</span>
+                              </span>
+                            </button>
+                          </>
+                        )}
+                      </div>
                     </div>
                   </div>
-
-                  <div className="flex flex-wrap gap-3">
-                    <button
-                      onClick={handleExportCSV}
-                      className="px-6 py-3 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs sm:text-sm rounded-xl shadow transition flex items-center justify-center gap-2"
-                    >
-                      <IconFileDown size={18} />
-                      下載訂單 CSV 報表
-                    </button>
-
-                    <button
-                      onClick={handleExportProductsExcel}
-                      className="px-6 py-3 bg-slate-700 hover:bg-slate-600 text-white font-bold text-xs sm:text-sm rounded-xl shadow transition flex items-center justify-center gap-2"
-                    >
-                      <IconFileDown size={18} />
-                      下載商品庫與滯銷分析 Excel
-                    </button>
-                  </div>
-                </div>
-
-                {/* [V2.7] Data protection: trash + log */}
-                <div className="bg-white rounded-2xl border border-slate-200/80 p-4 sm:p-5 shadow-sm space-y-2.5">
-                  <h3 className="font-bold text-sm sm:text-base text-slate-800">🛡️ 資料保護</h3>
-                  <p className="text-xs sm:text-sm text-slate-500">
-                    刪除的訂單和商品會先放進回收桶，可以還原；重要操作都會記在日誌裡，改錯的訂單可以還原到修改前。
-                  </p>
-                  <div className="flex flex-wrap gap-2">
-                    <button
-                      type="button"
-                      onClick={() => setIsTrashOpen(true)}
-                      className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs sm:text-sm rounded-xl border border-slate-200 transition whitespace-nowrap"
-                    >
-                      🗑️ 回收桶 ({trashOrders.length + trashProducts.length})
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setIsLogOpen(true)}
-                      className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs sm:text-sm rounded-xl border border-slate-200 transition whitespace-nowrap"
-                    >
-                      📒 操作日誌
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setIsRestoreModalOpen(true)}
-                      className="px-4 py-2 bg-red-50 hover:bg-red-100 text-red-700 font-bold text-xs sm:text-sm rounded-xl border border-red-200 transition whitespace-nowrap"
-                    >
-                      📥 還原 JSON 備份
-                    </button>
-                  </div>
-                </div>
-
-                {/* [黑名單 v2.12.5] */}
-                <div className="bg-white rounded-2xl border border-slate-200/80 p-4 sm:p-5 shadow-sm space-y-2.5">
-                  <h3 className="font-bold text-sm sm:text-base text-slate-800">🚫 黑名單管理</h3>
-                  <p className="text-xs sm:text-sm text-slate-500">
-                    新增訂單時會依電話/IG/LINE/姓名自動比對，命中會跳出提醒（目前共 {blacklist.length} 筆）。
-                  </p>
-                  <button
-                    type="button"
-                    onClick={() => setIsBlacklistOpen(true)}
-                    className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs sm:text-sm rounded-xl border border-slate-200 transition whitespace-nowrap"
-                  >
-                    🚫 管理黑名單 ({blacklist.length})
-                  </button>
-                </div>
-
-                {/* [v2.14.0] 公版訊息設定入口 */}
-                <div className="bg-white rounded-2xl border border-slate-200/80 p-4 sm:p-5 shadow-sm space-y-2.5">
-                  <h3 className="font-bold text-sm sm:text-base text-slate-800">💬 公版訊息</h3>
-                  <p className="text-xs sm:text-sm text-slate-500">
-                    傳給客人確認訂單的訊息格式：可自訂前綴、後綴與優惠規則。建立訂單後會自動帶出，也可以從訂單卡片上的對話框圖示隨時再開。
-                  </p>
-                  <button
-                    type="button"
-                    onClick={() => setIsMessageTemplateOpen(true)}
-                    className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs sm:text-sm rounded-xl border border-slate-200 transition whitespace-nowrap"
-                  >
-                    💬 編輯公版訊息
-                  </button>
-                </div>
-
-                {/* [V2.12] Shipping & Discount Settings entry */}
-                <div className="bg-white rounded-2xl border border-slate-200/80 p-4 sm:p-5 shadow-sm space-y-2.5">
-                  <h3 className="font-bold text-sm sm:text-base text-slate-800">⚙️ 運費與折扣設定</h3>
-                  <p className="text-xs sm:text-sm text-slate-500">
-                    新增訂單時會依物流方式自動帶入運費；滿額可自動免運。這裡的設定隨時可以自己調整。
-                  </p>
-                  <div className="grid grid-cols-3 gap-2 text-xs">
-                    {DELIVERY_METHODS.map(({ key, short }) => (
-                      <div key={key} className="bg-slate-50 rounded-lg px-2.5 py-2 text-center">
-                        <div className="text-slate-500">{short}</div>
-                        <div className="font-bold text-slate-800">${shippingConfig.fees[key]}</div>
-                      </div>
-                    ))}
-                  </div>
-                  <p className="text-[11px] text-slate-400">
-                    {shippingConfig.freeShippingEnabled ? `滿 $${shippingConfig.freeShippingThreshold.toLocaleString()} 免運` : '目前未啟用滿額免運'}
-                  </p>
-                  <button
-                    type="button"
-                    onClick={() => setIsShippingSettingsOpen(true)}
-                    className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs sm:text-sm rounded-xl border border-slate-200 transition whitespace-nowrap"
-                  >
-                    修改設定
-                  </button>
-                </div>
-
-                {/* [V2.5] Account */}
-                <div className="bg-white rounded-2xl border border-slate-200/80 p-4 sm:p-5 shadow-sm space-y-2.5">
-                  <h3 className="font-bold text-sm sm:text-base text-slate-800">👤 帳號</h3>
-                  <p className="text-xs sm:text-sm text-slate-500">
-                    目前登入：<span className="font-semibold text-slate-700">{user?.email || '（未知）'}</span>
-                  </p>
-                  <button
-                    type="button"
-                    onClick={handleSignOut}
-                    className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs sm:text-sm rounded-xl border border-slate-200 transition"
-                  >
-                    登出
-                  </button>
-                </div>
-
-                {/* [V2.2] Test Mode entry */}
-                <div className="bg-white rounded-2xl border border-slate-200/80 p-4 sm:p-5 shadow-sm space-y-2.5">
-                  <h3 className="font-bold text-sm sm:text-base text-slate-800">🧪 測試模式</h3>
-                  <p className="text-xs sm:text-sm text-slate-500">
-                    想試匯入 Excel、試建立訂單時，先切到測試模式。測試資料存放在獨立區域，不會混進正式訂單，測完可一鍵清空。
-                    {IS_TEST_MODE ? '（你現在就在測試模式）' : ''}
-                  </p>
-                  <button
-                    type="button"
-                    onClick={handleToggleTestMode}
-                    className={`px-4 py-2 font-bold text-xs sm:text-sm rounded-xl border transition ${
-                      IS_TEST_MODE
-                        ? 'bg-emerald-600 hover:bg-emerald-700 text-white border-emerald-600'
-                        : 'bg-amber-50 hover:bg-amber-100 text-amber-800 border-amber-300'
-                    }`}
-                  >
-                    {IS_TEST_MODE ? '回到正式資料' : '進入測試模式'}
-                  </button>
-                </div>
+                )}
               </div>
       );
     }
@@ -4674,6 +5094,10 @@
     // [Phase 1] 商品新增/編輯彈窗
     function ProductEditModal({ pe }) {
       const { editingProduct, handleProductImageUpload, handleRemoveProductImage, handleSaveProductModal, isProductModalOpen, isUploadingProductImage, setEditingProduct, setImageLightboxUrl, setIsProductModalOpen } = pe;
+      // [v2.14.18] 尺寸系列：純畫面 state（選哪個系列），不涉及資料，所以直接放在這裡（同 MoreTab 的例外）
+      const [sizeSeries, setSizeSeriesState] = React.useState(loadSizeSeries);
+      const setSizeSeries = (key) => { setSizeSeriesState(key); saveSizeSeries(key); };
+      const seriesSizes = getSizeSeriesList(sizeSeries);
       return (
         <>
           {/* Edit / Add Product Modal */}
@@ -4773,10 +5197,45 @@
                   </div>
 
                   <div>
-                    <label className="text-xs font-semibold text-slate-600 mb-1 block">尺寸選項 (以逗號或斜線隔開)</label>
+                    <div className="flex items-center justify-between gap-2 mb-1.5">
+                      <label className="text-xs font-semibold text-slate-600">尺寸選項</label>
+                      <select
+                        value={sizeSeries}
+                        onChange={(e) => setSizeSeries(e.target.value)}
+                        className="text-xs px-2 py-1 rounded-lg border border-slate-200 bg-white text-slate-700 font-semibold focus:outline-none focus:border-emerald-500"
+                      >
+                        {SIZE_SERIES.map((sr) => <option key={sr.key} value={sr.key}>{sr.label}</option>)}
+                        <option value={SIZE_SERIES_CUSTOM}>自訂</option>
+                      </select>
+                    </div>
+                    {sizeSeries !== SIZE_SERIES_CUSTOM && (
+                      <div className="mb-2">
+                        <div className="flex flex-wrap gap-1.5">
+                          {seriesSizes.map((sz) => {
+                            const on = hasProductSize(editingProduct.sizes, sz);
+                            return (
+                              <button
+                                key={sz}
+                                type="button"
+                                onClick={() => setEditingProduct({ ...editingProduct, sizes: toggleProductSize(editingProduct.sizes, sz) })}
+                                className={`px-3 py-1 text-xs font-bold rounded-lg border transition ${
+                                  on ? 'bg-emerald-600 text-white border-emerald-600' : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-100'
+                                }`}
+                              >
+                                {sz}
+                              </button>
+                            );
+                          })}
+                        </div>
+                        <div className="flex gap-3 mt-1.5">
+                          <button type="button" onClick={() => setEditingProduct({ ...editingProduct, sizes: setSeriesSizes(editingProduct.sizes, seriesSizes, true) })} className="text-[11px] font-semibold text-emerald-700">全選</button>
+                          <button type="button" onClick={() => setEditingProduct({ ...editingProduct, sizes: setSeriesSizes(editingProduct.sizes, seriesSizes, false) })} className="text-[11px] font-semibold text-slate-400">清除這組</button>
+                        </div>
+                      </div>
+                    )}
                     <input
                       type="text"
-                      placeholder="S, M, L, XL 或 F"
+                      placeholder="點上面的尺寸，或自己輸入（以逗號隔開）；單一規格請留空"
                       value={editingProduct.sizes}
                       onChange={(e) => setEditingProduct({ ...editingProduct, sizes: e.target.value })}
                       className="w-full text-xs sm:text-sm px-3 py-2 rounded-xl border border-slate-200 focus:outline-none focus:border-emerald-500"
@@ -5578,6 +6037,542 @@
   </script>
   <script type="text/babel">
     // ==========================================
+    // screen-finance.js  (v2.14.10 新增，收支報表)
+    // 全螢幕「收支報表」：總覽（淨利／收入／支出／類別長條）、明細（依日摺疊）、已刪除（可還原）。
+    // 這是「獨立模組」，刻意不照規則 B（元件內不放 state）：它的狀態不被其他彈窗共用，
+    // 自己管自己的 state，才不會讓 app-shell.js 變肥。app-shell.js 只負責開關與傳入 4 個共用工具。
+    // 相依：icons.js、utils-finance.js、finance-data.js、config.js（dbRef／dbRoot）
+    // props：user、onClose、showToast、logAction、withSyncTracking
+    // [v2.14.11] 收入 = 訂單營收（自動，唯讀）＋手動收入＋營收調整；支出手動。
+    //   訂單營收：切換日（FINANCE_ORDER_CUTOVER）前用 salesArchive、之後用 App 即時訂單 orders；棄單／取消排除
+    // [v2.14.20] 新增「年度」分頁：年度總表（每月收支＋分類×月份矩陣，同她 Excel 的年度總結）與匯出 Excel
+    // [v2.14.13] 記帳日＝下單日。領貨制啟用日（FINANCE_PICKUP_START）之後下單的訂單要「已領貨」才入帳，未領貨列「待入帳」
+    // props 另有 orders（App 即時訂單，唯讀）
+    // ==========================================
+    function FinanceScreen({ user, orders, onClose, showToast, logAction, withSyncTracking }) {
+      const { entries: manualEntries, trash, loading, error, archive, archiveStatus } = useFinanceData();
+      const orderRevenue = React.useMemo(() => buildOrderRevenue(orders, archive), [orders, archive]);
+      const entries = React.useMemo(() => [...manualEntries, ...orderRevenue.entries], [manualEntries, orderRevenue]);
+      const [view, setView] = React.useState('overview'); // overview | detail | year | trash
+      const [year, setYear] = React.useState(() => financeToday().slice(0, 4)); // 年度分頁選的年份
+      const [showMatrix, setShowMatrix] = React.useState(false);
+      const [month, setMonth] = React.useState(() => financeToday().slice(0, 7)); // 'YYYY-MM' | 'all'
+      const [openDays, setOpenDays] = React.useState(() => new Set());
+      const [form, setForm] = React.useState(null); // null = 不顯示；否則 { id?, type, date, amount, category, note }
+      const [isSaving, setIsSaving] = React.useState(false);
+      const [confirmDelete, setConfirmDelete] = React.useState(false);
+
+      const months = React.useMemo(() => listFinanceMonths(entries), [entries]);
+      const years = React.useMemo(() => listFinanceYears(entries), [entries]);
+      const yearData = React.useMemo(() => computeFinanceYear(entries, year), [entries, year]);
+      const yearPending = React.useMemo(() => orderRevenue.pending.filter(x => x.date.slice(0, 4) === year), [orderRevenue, year]);
+      const yearPendingTotal = yearPending.reduce((s, x) => s + x.amount, 0);
+
+      // 匯出該年度：總表（分類×月份）、收支明細、待入帳（有才有）三張工作表
+      const handleExportYear = () => {
+        if (typeof XLSX === 'undefined') { showToast('❌ 匯出元件尚未載入，請稍後再試'); return; }
+        const ex = buildFinanceExport(entries, orderRevenue.pending, year);
+        if (ex.detail.length === 0) { showToast(`${year} 年沒有任何收支可匯出`); return; }
+        const wb = XLSX.utils.book_new();
+        const ws1 = XLSX.utils.aoa_to_sheet(ex.aoa);
+        ws1['!cols'] = [{ wch: 18 }, ...Array(13).fill({ wch: 10 })];
+        XLSX.utils.book_append_sheet(wb, ws1, `${year}年度總表`);
+        const ws2 = XLSX.utils.json_to_sheet(ex.detail);
+        ws2['!cols'] = [{ wch: 12 }, { wch: 10 }, { wch: 12 }, { wch: 10 }, { wch: 28 }, { wch: 18 }];
+        XLSX.utils.book_append_sheet(wb, ws2, `${year}收支明細`);
+        if (ex.pend.length > 0) XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(ex.pend), '待入帳');
+        XLSX.writeFile(wb, `小豆苗收支報表_${year}.xlsx`);
+        showToast(`📊 已匯出 ${year} 年收支 Excel`);
+      };
+      const summary = React.useMemo(() => computeFinanceSummary(entries, month), [entries, month]);
+      const excludedInScope = React.useMemo(
+        () => orderRevenue.excluded.filter(x => month === 'all' || x.date.slice(0, 7) === month),
+        [orderRevenue, month]
+      );
+      const excludedTotal = excludedInScope.reduce((s, x) => s + x.amount, 0);
+      const pendingInScope = React.useMemo(
+        () => orderRevenue.pending.filter(x => month === 'all' || x.date.slice(0, 7) === month),
+        [orderRevenue, month]
+      );
+      const pendingTotal = pendingInScope.reduce((s, x) => s + x.amount, 0);
+      const todayStr = financeToday();
+      const overdueCount = pendingInScope.filter(x => financeDaysBetween(x.date, todayStr) >= FINANCE_PENDING_WARN_DAYS).length;
+      const maxExpense = summary.expenseByCategory.reduce((m, c) => Math.max(m, Math.abs(c.amount)), 0) || 1;
+      const maxIncome = summary.incomeByCategory.reduce((m, c) => Math.max(m, Math.abs(c.amount)), 0) || 1;
+      const allOpen = summary.days.length > 0 && summary.days.every(d => openDays.has(d.date));
+
+      const openAdd = (type = 'out', date = financeToday()) => {
+        setConfirmDelete(false);
+        setForm({ type, date, amount: '', category: financeCategoriesOf(type)[0], note: '' });
+      };
+      const openEdit = (e) => {
+        setConfirmDelete(false);
+        setForm({ id: e.id, type: e.type, date: e.date, amount: String(e.amount), category: e.category, note: e.note });
+      };
+      const setField = (k, v) => setForm(f => ({ ...f, [k]: v }));
+      const setType = (t) => setForm(f => ({
+        ...f, type: t,
+        category: financeCategoriesOf(t).includes(f.category) ? f.category : financeCategoriesOf(t)[0]
+      }));
+
+      const toggleDay = (date) => setOpenDays(prev => {
+        const next = new Set(prev);
+        next.has(date) ? next.delete(date) : next.add(date);
+        return next;
+      });
+      const toggleAll = () => setOpenDays(allOpen ? new Set() : new Set(summary.days.map(d => d.date)));
+
+      const handleSave = async (keepOpen) => {
+        if (!form || isSaving) return;
+        const amount = Math.round(Number(form.amount) || 0);
+        if (form.type === 'adj' ? amount === 0 : amount <= 0) { showToast(form.type === 'adj' ? '⚠️ 請輸入調整金額（可為負數）' : '⚠️ 請輸入大於 0 的金額'); return; }
+        if (!isValidFinanceDate(form.date)) { showToast('⚠️ 請選擇正確的日期'); return; }
+        setIsSaving(true);
+        try {
+          const data = buildFinanceEntryData(form, user?.email);
+          if (form.id) {
+            // 編輯：不動建立時間與建立者
+            const { createdAt, createdBy, ...editable } = data;
+            await withSyncTracking(dbRef(`finance/entries/${form.id}`).update(editable));
+            logAction('finance_edit', 'finance', form.id, financeEntryLogSummary(data));
+          } else {
+            const ref = dbRef('finance/entries').push();
+            await withSyncTracking(ref.set(data));
+            logAction('finance_create', 'finance', ref.key, financeEntryLogSummary(data));
+          }
+          showToast(form.id ? '✅ 已更新' : '✅ 已記一筆');
+          const savedMonth = data.date.slice(0, 7);
+          if (month !== 'all' && month !== savedMonth) setMonth(savedMonth); // 記到別的月份時，跳到那個月才看得到
+          if (keepOpen && !form.id) {
+            setForm({ type: form.type, date: form.date, amount: '', category: form.category, note: '' });
+          } else {
+            setForm(null);
+          }
+        } catch (err) {
+          console.error('Finance save error:', err);
+          showToast('❌ 儲存失敗，請檢查網路或權限後再試一次');
+        } finally {
+          setIsSaving(false);
+        }
+      };
+
+      // 刪除：先進 trash/finance，可在「已刪除」還原（與訂單／商品一致，不直接 remove）
+      const handleDelete = async () => {
+        if (!form?.id || isSaving) return;
+        const target = entries.find(e => e.id === form.id);
+        if (!target) { setForm(null); return; }
+        setIsSaving(true);
+        try {
+          const { id, ...rest } = target;
+          await withSyncTracking(dbRoot().update({
+            [`finance/entries/${id}`]: null,
+            [`trash/finance/${id}`]: { ...rest, deletedAt: Date.now(), deletedBy: user?.email || '' }
+          }));
+          logAction('finance_delete', 'finance', id, financeEntryLogSummary(target));
+          showToast('🗑️ 已刪除，可在「已刪除」還原');
+          setForm(null);
+        } catch (err) {
+          console.error('Finance delete error:', err);
+          showToast('❌ 刪除失敗，請稍後再試');
+        } finally {
+          setIsSaving(false);
+          setConfirmDelete(false);
+        }
+      };
+
+      const handleRestore = async (item) => {
+        try {
+          const { id, deletedAt, deletedBy, ...rest } = item;
+          await withSyncTracking(dbRoot().update({
+            [`finance/entries/${id}`]: rest,
+            [`trash/finance/${id}`]: null
+          }));
+          logAction('finance_restore', 'finance', id, financeEntryLogSummary(item));
+          showToast('✅ 已還原');
+        } catch (err) {
+          console.error('Finance restore error:', err);
+          showToast('❌ 還原失敗，請稍後再試');
+        }
+      };
+
+      const inputCls = 'w-full px-3 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500/40 focus:border-emerald-500';
+      const netNegative = summary.net < 0;
+
+      const renderBars = (list, max, color) => list.length === 0
+        ? <p className="text-xs text-slate-400 py-2">這個範圍還沒有資料</p>
+        : list.map(c => (
+          <div key={c.category} className="grid grid-cols-[76px_1fr_76px] gap-3 items-center py-1.5 text-xs">
+            <span className="text-slate-600 truncate">{c.category}</span>
+            <span className="block h-2 rounded-full bg-slate-100 overflow-hidden">
+              <i className={`block h-full rounded-full ${color}`} style={{ width: `${Math.max(3, (Math.abs(c.amount) / max) * 100)}%` }} />
+            </span>
+            <span className="text-right font-semibold tabular-nums text-slate-800">{formatMoney(c.amount)}</span>
+          </div>
+        ));
+
+      return (
+        <div className="fixed inset-0 z-50 bg-slate-50 flex flex-col">
+          {/* Header */}
+          <div className="bg-emerald-600 text-white shadow-md" style={{ paddingTop: 'env(safe-area-inset-top, 0px)' }}>
+            <div className="flex items-center gap-3 px-4 py-3">
+              <button type="button" onClick={onClose} aria-label="返回" className="p-1.5 -ml-1.5 rounded-lg hover:bg-white/15">
+                <IconX size={22} />
+              </button>
+              <h1 className="flex-1 text-base font-bold">💰 收支報表</h1>
+              {view === 'year' ? (
+                <select
+                  value={year}
+                  onChange={(e) => setYear(e.target.value)}
+                  aria-label="選擇年度"
+                  className="bg-white/20 border border-white/30 rounded-lg px-2 py-1 text-sm font-bold text-white"
+                >
+                  {years.map(y => <option key={y} value={y} className="text-slate-800">{y} 年</option>)}
+                </select>
+              ) : (
+                <select
+                  value={month}
+                  onChange={(e) => setMonth(e.target.value)}
+                  className="bg-white/20 border border-white/30 rounded-lg px-2 py-1 text-sm font-bold text-white"
+                >
+                  {months.map(m => <option key={m} value={m} className="text-slate-800">{m.replace('-', ' / ')}</option>)}
+                  <option value="all" className="text-slate-800">全部</option>
+                </select>
+              )}
+            </div>
+            <div className="flex gap-2 px-4 pb-3 overflow-x-auto scrollbar-none">
+              {[['overview', '總覽'], ['detail', '明細'], ['year', '年度'], ['trash', `已刪除 (${trash.length})`]].map(([id, label]) => (
+                <button
+                  key={id}
+                  type="button"
+                  onClick={() => setView(id)}
+                  aria-current={view === id}
+                  className={`flex-none px-4 py-1.5 rounded-full text-xs font-bold transition ${view === id ? 'bg-white text-emerald-700' : 'bg-white/15 text-white'}`}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* Body */}
+          <div className="flex-1 overflow-y-auto">
+            <div className="max-w-3xl mx-auto p-4 space-y-4" style={{ paddingBottom: 'calc(env(safe-area-inset-bottom, 0px) + 96px)' }}>
+              {error && <div className="bg-red-50 border border-red-200 text-red-700 text-xs rounded-xl p-3">{error}</div>}
+              {loading && !error && <div className="text-center text-xs text-slate-400 py-10">載入中…</div>}
+
+              {!loading && view === 'overview' && (
+                <>
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className={`col-span-2 rounded-2xl p-4 text-white shadow ${netNegative ? 'bg-red-600' : 'bg-emerald-600'}`}>
+                      <div className="text-xs opacity-80">{month === 'all' ? '全部期間' : month.replace('-', ' 年 ') + ' 月'} 淨收支</div>
+                      <div className="text-3xl font-extrabold tabular-nums mt-1">{netNegative ? '-' : ''}{formatMoney(Math.abs(summary.net))}</div>
+                    </div>
+                    <div className="bg-white rounded-2xl border border-slate-200/80 p-4">
+                      <div className="text-xs text-slate-500">收入</div>
+                      <div className="text-xl font-extrabold tabular-nums text-green-600">{formatMoney(summary.income)}</div>
+                    </div>
+                    <div className="bg-white rounded-2xl border border-slate-200/80 p-4">
+                      <div className="text-xs text-slate-500">支出</div>
+                      <div className="text-xl font-extrabold tabular-nums text-red-600">{formatMoney(summary.expense)}</div>
+                    </div>
+                  </div>
+
+                  {archiveStatus === 'empty' && (
+                    <div className="text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded-xl px-3 py-2.5">
+                      ⚠️ 尚未還原「歷史訂單封存」（salesArchive.json），{FINANCE_ORDER_CUTOVER} 之前的訂單營收不會計入。請到「更多 → 還原備份」選擇該檔案。
+                    </div>
+                  )}
+                  {archiveStatus === 'denied' && (
+                    <div className="text-xs text-red-700 bg-red-50 border border-red-200 rounded-xl px-3 py-2.5">
+                      ⚠️ 沒有 salesArchive 的讀取權限，看不到歷史訂單營收。請在 Firebase 規則加入 salesArchive。
+                    </div>
+                  )}
+                  <div className="bg-white rounded-2xl border border-slate-200/80 p-4 space-y-1.5">
+                    <h3 className="text-sm font-bold text-slate-800">收入來源</h3>
+                    {[['🧾 訂單營收（已領貨，自動）', summary.sources.order], ['✍️ 手動收入（現貨／團購等）', summary.sources.manualIn], ['⚖️ 營收調整（內退／對帳差額）', summary.sources.adjust]].map(([label, v]) => (
+                      <div key={label} className="flex justify-between text-xs"><span className="text-slate-600">{label}</span><span className={`font-semibold tabular-nums ${v < 0 ? 'text-red-600' : 'text-slate-800'}`}>{formatMoney(v)}</span></div>
+                    ))}
+                    {excludedInScope.length > 0 && (
+                      <div className="flex justify-between text-xs pt-1.5 border-t border-slate-100"><span className="text-slate-400">已排除棄單／取消 {excludedInScope.length} 張</span><span className="tabular-nums text-slate-400">{formatMoney(excludedTotal)}</span></div>
+                    )}
+                    <p className="text-[11px] text-slate-400 pt-1">訂單營收＝商品金額（折扣後，不含運費），記在「下單日」；棄單不計；{FINANCE_PICKUP_START} 之後下單的要「已領貨」才入帳；共 {summary.count} 筆。</p>
+                  </div>
+
+                  {pendingInScope.length > 0 && (
+                    <div className="bg-amber-50 border border-amber-200 rounded-2xl p-4 space-y-1.5">
+                      <div className="flex justify-between items-baseline">
+                        <h3 className="text-sm font-bold text-amber-900">⏳ 待入帳（未領貨）</h3>
+                        <span className="text-sm font-extrabold tabular-nums text-amber-800">{formatMoney(pendingTotal)}</span>
+                      </div>
+                      <p className="text-[11px] text-amber-800">{pendingInScope.length} 張還沒領貨，領貨後會自動記回下單那天的營收。{overdueCount > 0 && <span className="font-bold text-red-600">　其中 {overdueCount} 張已超過 {FINANCE_PENDING_WARN_DAYS} 天。</span>}</p>
+                      <div className="divide-y divide-amber-100">
+                        {pendingInScope.slice(0, 12).map(x => {
+                          const waited = financeDaysBetween(x.date, todayStr);
+                          return (
+                            <div key={x.id} className="flex justify-between py-1 text-xs">
+                              <span className="text-amber-900">{describeFinanceDay(x.date).md}　<span className={waited >= FINANCE_PENDING_WARN_DAYS ? 'text-red-600 font-bold' : 'text-amber-700'}>已 {waited} 天</span></span>
+                              <span className="tabular-nums font-semibold text-amber-900">{formatMoney(x.amount)}</span>
+                            </div>
+                          );
+                        })}
+                        {pendingInScope.length > 12 && <div className="pt-1 text-[11px] text-amber-700">…另有 {pendingInScope.length - 12} 張（金額已計入上方合計）</div>}
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="bg-white rounded-2xl border border-slate-200/80 p-4">
+                    <h3 className="text-sm font-bold text-slate-800 mb-1">支出類別</h3>
+                    {renderBars(summary.expenseByCategory, maxExpense, 'bg-red-400')}
+                  </div>
+                  <div className="bg-white rounded-2xl border border-slate-200/80 p-4">
+                    <h3 className="text-sm font-bold text-slate-800 mb-1">收入類別</h3>
+                    {renderBars(summary.incomeByCategory, maxIncome, 'bg-green-500')}
+                  </div>
+                </>
+              )}
+
+              {!loading && view === 'detail' && (
+                <>
+                  <div className="flex items-center justify-between">
+                    <h2 className="text-sm font-bold text-slate-800">每日明細</h2>
+                    {summary.days.length > 0 && (
+                      <button type="button" onClick={toggleAll} className="px-3 py-1 rounded-full text-xs border border-slate-200 bg-white text-slate-500 hover:text-emerald-700 hover:border-emerald-500">
+                        {allOpen ? '全部收合' : '全部展開'}
+                      </button>
+                    )}
+                  </div>
+                  {summary.days.length === 0 && <div className="text-center text-xs text-slate-400 py-10">這個範圍還沒有紀錄，按右下角「＋」開始記帳</div>}
+                  <div className="space-y-2">
+                    {summary.days.map(day => {
+                      const open = openDays.has(day.date);
+                      const { md, weekday } = describeFinanceDay(day.date);
+                      return (
+                        <div key={day.date} className={`bg-white rounded-xl border overflow-hidden ${open ? 'border-emerald-200 shadow-sm' : 'border-slate-200/80'}`}>
+                          <button type="button" onClick={() => toggleDay(day.date)} className={`w-full flex items-center justify-between px-4 py-3 text-left ${open ? 'bg-emerald-50/60 border-b border-slate-100' : ''}`}>
+                            <span className="flex items-baseline gap-1.5">
+                              <span className="text-sm font-bold text-slate-800">{md}</span>
+                              {weekday && <span className="text-xs text-slate-400">週{weekday}</span>}
+                            </span>
+                            <span className="flex items-center gap-1.5 text-xs font-bold tabular-nums">
+                              {day.income !== 0 && <span className={`px-2 py-0.5 rounded-full ${day.income > 0 ? 'bg-green-50 text-green-700' : 'bg-red-50 text-red-700'}`}>{day.income > 0 ? '+' : ''}{formatMoney(day.income)}</span>}
+                              {day.expense > 0 && <span className="bg-red-50 text-red-700 px-2 py-0.5 rounded-full">-{formatMoney(day.expense)}</span>}
+                              {open ? <IconChevronUp size={14} className="text-slate-400" /> : <IconChevronDown size={14} className="text-slate-400" />}
+                            </span>
+                          </button>
+                          {open && (
+                            <div className="divide-y divide-slate-100">
+                              {day.entries.map(e => (
+                                <button key={e.id} type="button" onClick={() => e.source !== 'order' && openEdit(e)} className={`w-full flex items-center gap-3 px-4 py-2.5 text-left ${e.source === 'order' ? 'cursor-default bg-slate-50/60' : 'hover:bg-slate-50'}`}>
+                                  <span className={`flex-none text-[11px] font-bold px-2 py-0.5 rounded-full ${e.type === 'out' ? 'bg-red-50 text-red-700' : e.type === 'adj' ? 'bg-slate-100 text-slate-700' : 'bg-green-50 text-green-700'}`}>{e.category || '未分類'}</span>
+                                  <span className="flex-1 min-w-0 text-xs text-slate-500 truncate">{e.source === 'order' ? `🧾 ${e.note}（自動）` : e.note}</span>
+                                  <span className={`flex-none text-sm font-bold tabular-nums ${e.type === 'out' || e.amount < 0 ? 'text-red-600' : 'text-green-600'}`}>{e.type === 'out' ? '-' : e.amount < 0 ? '' : '+'}{formatMoney(e.amount)}</span>
+                                </button>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </>
+              )}
+
+              {!loading && view === 'year' && (
+                <>
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className={`col-span-2 rounded-2xl p-4 text-white shadow ${yearData.totals.net < 0 ? 'bg-red-600' : 'bg-emerald-600'}`}>
+                      <div className="text-xs opacity-80">{year} 年 淨收支</div>
+                      <div className="text-3xl font-extrabold tabular-nums mt-1">{formatMoney(yearData.totals.net)}</div>
+                    </div>
+                    <div className="bg-white rounded-2xl border border-slate-200/80 p-4">
+                      <div className="text-xs text-slate-500">年度收入</div>
+                      <div className="text-xl font-extrabold tabular-nums text-green-600">{formatMoney(yearData.totals.income)}</div>
+                    </div>
+                    <div className="bg-white rounded-2xl border border-slate-200/80 p-4">
+                      <div className="text-xs text-slate-500">年度支出</div>
+                      <div className="text-xl font-extrabold tabular-nums text-red-600">{formatMoney(yearData.totals.expense)}</div>
+                    </div>
+                  </div>
+                  {yearPending.length > 0 && (
+                    <div className="text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded-xl px-3 py-2.5">
+                      ⏳ 另有 {yearPending.length} 張未領貨，待入帳 {formatMoney(yearPendingTotal)}（尚未計入上面的收入）
+                    </div>
+                  )}
+
+                  <button type="button" onClick={handleExportYear} className="w-full py-3 rounded-xl text-sm font-bold bg-emerald-600 hover:bg-emerald-700 text-white shadow">
+                    📥 匯出 {year} 年收支 Excel
+                  </button>
+
+                  <div className="bg-white rounded-2xl border border-slate-200/80 overflow-hidden">
+                    <div className="grid grid-cols-[44px_1fr_1fr_1fr] gap-2 px-4 py-2 text-[11px] font-bold text-slate-400 bg-slate-50 border-b border-slate-100">
+                      <span>月份</span><span className="text-right">收入</span><span className="text-right">支出</span><span className="text-right">淨收支</span>
+                    </div>
+                    {yearData.months.map(m => (
+                      <button
+                        key={m.ym}
+                        type="button"
+                        onClick={() => { setMonth(m.ym); setView('overview'); }}
+                        className={`w-full grid grid-cols-[44px_1fr_1fr_1fr] gap-2 px-4 py-2.5 text-xs tabular-nums text-left border-b border-slate-100 last:border-0 hover:bg-slate-50 ${m.hasData ? '' : 'text-slate-300'}`}
+                      >
+                        <span className="font-bold">{m.m} 月</span>
+                        <span className={`text-right ${m.hasData ? 'text-green-600' : ''}`}>{m.hasData ? formatMoney(m.income) : '—'}</span>
+                        <span className={`text-right ${m.hasData ? 'text-red-600' : ''}`}>{m.hasData ? formatMoney(m.expense) : '—'}</span>
+                        <span className={`text-right font-bold ${m.hasData ? (m.net < 0 ? 'text-red-600' : 'text-slate-800') : ''}`}>{m.hasData ? formatMoney(m.net) : '—'}</span>
+                      </button>
+                    ))}
+                    <div className="grid grid-cols-[44px_1fr_1fr_1fr] gap-2 px-4 py-3 text-xs font-extrabold tabular-nums bg-slate-50 border-t border-slate-200">
+                      <span>合計</span>
+                      <span className="text-right text-green-700">{formatMoney(yearData.totals.income)}</span>
+                      <span className="text-right text-red-700">{formatMoney(yearData.totals.expense)}</span>
+                      <span className={`text-right ${yearData.totals.net < 0 ? 'text-red-700' : ''}`}>{formatMoney(yearData.totals.net)}</span>
+                    </div>
+                  </div>
+                  <p className="text-[11px] text-slate-400 px-1">點任一個月份，可以跳到那個月的總覽。</p>
+
+                  <button type="button" onClick={() => setShowMatrix(v => !v)} className="w-full py-2.5 rounded-xl text-xs font-bold bg-white border border-slate-200 text-slate-600">
+                    {showMatrix ? '收合完整年度總表' : '展開完整年度總表（分類 × 月份，可左右滑動）'}
+                  </button>
+                  {showMatrix && (
+                    <div className="bg-white rounded-2xl border border-slate-200/80 overflow-x-auto">
+                      <table className="text-[11px] tabular-nums border-collapse min-w-max">
+                        <thead>
+                          <tr className="bg-slate-50 text-slate-500">
+                            <th className="sticky left-0 bg-slate-50 text-left px-3 py-2 font-bold">項目</th>
+                            {Array.from({ length: 12 }, (_, i) => <th key={i} className="px-2 py-2 text-right font-bold">{i + 1}月</th>)}
+                            <th className="px-3 py-2 text-right font-extrabold">合計</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {[{ title: '收入', rows: yearData.incomeRows, totalLabel: '收入合計', totalValues: yearData.incomeByMonth, total: yearData.totals.income, tone: 'text-green-700' },
+                            { title: '支出', rows: yearData.expenseRows, totalLabel: '支出合計', totalValues: yearData.expenseByMonth, total: yearData.totals.expense, tone: 'text-red-700' }].map(sec => (
+                            <React.Fragment key={sec.title}>
+                              <tr><td colSpan={14} className="sticky left-0 px-3 py-1.5 font-bold text-slate-500 bg-slate-100">{sec.title}</td></tr>
+                              {sec.rows.map(r => (
+                                <tr key={r.label} className="border-t border-slate-100">
+                                  <td className="sticky left-0 bg-white px-3 py-1.5 font-semibold text-slate-700 whitespace-nowrap">{r.label}</td>
+                                  {r.values.map((v, i) => <td key={i} className={`px-2 py-1.5 text-right ${v === 0 ? 'text-slate-300' : v < 0 ? 'text-red-600' : ''}`}>{v === 0 ? '·' : Math.round(v).toLocaleString()}</td>)}
+                                  <td className="px-3 py-1.5 text-right font-bold">{Math.round(r.total).toLocaleString()}</td>
+                                </tr>
+                              ))}
+                              <tr className="border-t border-slate-200 bg-slate-50 font-extrabold">
+                                <td className={`sticky left-0 bg-slate-50 px-3 py-1.5 whitespace-nowrap ${sec.tone}`}>{sec.totalLabel}</td>
+                                {sec.totalValues.map((v, i) => <td key={i} className="px-2 py-1.5 text-right">{v === 0 ? '·' : Math.round(v).toLocaleString()}</td>)}
+                                <td className="px-3 py-1.5 text-right">{Math.round(sec.total).toLocaleString()}</td>
+                              </tr>
+                            </React.Fragment>
+                          ))}
+                          <tr className="border-t-2 border-slate-300 bg-emerald-50 font-extrabold">
+                            <td className="sticky left-0 bg-emerald-50 px-3 py-2 whitespace-nowrap">淨收支</td>
+                            {yearData.netByMonth.map((v, i) => <td key={i} className={`px-2 py-2 text-right ${v < 0 ? 'text-red-600' : ''}`}>{v === 0 ? '·' : Math.round(v).toLocaleString()}</td>)}
+                            <td className={`px-3 py-2 text-right ${yearData.totals.net < 0 ? 'text-red-600' : ''}`}>{Math.round(yearData.totals.net).toLocaleString()}</td>
+                          </tr>
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </>
+              )}
+
+              {view === 'trash' && (
+                <>
+                  <h2 className="text-sm font-bold text-slate-800">已刪除的收支（可還原）</h2>
+                  {trash.length === 0 && <div className="text-center text-xs text-slate-400 py-10">沒有已刪除的紀錄</div>}
+                  <div className="space-y-2">
+                    {trash.map(t => (
+                      <div key={t.id} className="bg-white rounded-xl border border-slate-200/80 px-4 py-3 flex items-center gap-3">
+                        <div className="flex-1 min-w-0">
+                          <div className="text-xs text-slate-500">{t.date || '無日期'}・{t.category || '未分類'}</div>
+                          <div className={`text-sm font-bold tabular-nums ${t.type === 'out' || t.amount < 0 ? 'text-red-600' : 'text-green-600'}`}>{t.type === 'out' ? '-' : t.amount < 0 ? '' : '+'}{formatMoney(t.amount)}</div>
+                          {t.note && <div className="text-xs text-slate-400 truncate">{t.note}</div>}
+                        </div>
+                        <button type="button" onClick={() => handleRestore(t)} className="flex-none px-3 py-1.5 rounded-lg text-xs font-bold bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-200">還原</button>
+                      </div>
+                    ))}
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+
+          {/* 新增按鈕 */}
+          {!form && (
+            <button
+              type="button"
+              onClick={() => openAdd('out')}
+              aria-label="記一筆"
+              className="fixed right-4 w-14 h-14 rounded-full bg-emerald-600 hover:bg-emerald-700 text-white shadow-xl flex items-center justify-center"
+              style={{ bottom: 'calc(env(safe-area-inset-bottom, 0px) + 20px)' }}
+            >
+              <IconPlus size={26} />
+            </button>
+          )}
+
+          {/* 新增／編輯表單（底部抽屜） */}
+          {form && (
+            <div className="absolute inset-0 z-10 bg-slate-900/50 flex items-end sm:items-center justify-center" onClick={() => !isSaving && setForm(null)}>
+              <div
+                className="bg-white w-full sm:max-w-md rounded-t-3xl sm:rounded-3xl shadow-2xl p-5 space-y-3 max-h-full overflow-y-auto"
+                style={{ paddingBottom: 'calc(env(safe-area-inset-bottom, 0px) + 20px)' }}
+                onClick={(e) => e.stopPropagation()}
+              >
+                <div className="flex items-center justify-between">
+                  <h3 className="font-bold text-base text-slate-800">{form.id ? '編輯收支' : '記一筆'}</h3>
+                  <button type="button" onClick={() => setForm(null)} className="p-1.5 text-slate-400 hover:text-slate-600"><IconX size={20} /></button>
+                </div>
+
+                <div className="grid grid-cols-3 gap-2">
+                  {[['out', '支出', 'bg-red-600'], ['in', '收入', 'bg-green-600'], ['adj', '調整', 'bg-slate-700']].map(([t, label, on]) => (
+                    <button key={t} type="button" onClick={() => setType(t)} className={`py-2.5 rounded-xl text-sm font-bold border transition ${form.type === t ? `${on} text-white border-transparent` : 'bg-slate-50 text-slate-500 border-slate-200'}`}>{label}</button>
+                  ))}
+                </div>
+
+                <div>
+                  <label className="block text-xs font-bold text-slate-500 mb-1">金額</label>
+                  {form.type === 'adj' && <p className="text-[11px] text-slate-400 mb-1">營收調整可輸入負數（例如內退 -180）；會算進收入。</p>}
+                  <input type="number" inputMode="numeric" min={form.type === 'adj' ? undefined : '0'} placeholder="0" value={form.amount} onChange={(e) => setField('amount', e.target.value)} className={inputCls + ' text-lg font-bold tabular-nums'} />
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-xs font-bold text-slate-500 mb-1">日期</label>
+                    <input type="date" value={form.date} onChange={(e) => setField('date', e.target.value)} className={inputCls} />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-bold text-slate-500 mb-1">類別</label>
+                    <select value={form.category} onChange={(e) => setField('category', e.target.value)} className={inputCls}>
+                      {/* 編輯舊資料時，若類別不在清單內仍要能顯示 */}
+                      {!financeCategoriesOf(form.type).includes(form.category) && form.category && <option value={form.category}>{form.category}</option>}
+                      {financeCategoriesOf(form.type).map(c => <option key={c} value={c}>{c}</option>)}
+                    </select>
+                  </div>
+                </div>
+                <div>
+                  <label className="block text-xs font-bold text-slate-500 mb-1">備註（選填）</label>
+                  <input type="text" placeholder="例如：10 月進貨尾款" value={form.note} onChange={(e) => setField('note', e.target.value)} className={inputCls} />
+                </div>
+
+                <div className="flex gap-2 pt-1">
+                  {form.id ? (
+                    confirmDelete ? (
+                      <button type="button" disabled={isSaving} onClick={handleDelete} className="px-4 py-3 rounded-xl text-sm font-bold bg-red-600 text-white">確定刪除</button>
+                    ) : (
+                      <button type="button" disabled={isSaving} onClick={() => setConfirmDelete(true)} className="px-4 py-3 rounded-xl text-sm font-bold bg-red-50 text-red-700 border border-red-200">刪除</button>
+                    )
+                  ) : (
+                    <button type="button" disabled={isSaving} onClick={() => handleSave(true)} className="px-4 py-3 rounded-xl text-sm font-bold bg-slate-100 text-slate-700 border border-slate-200 whitespace-nowrap">儲存再記一筆</button>
+                  )}
+                  <button type="button" disabled={isSaving} onClick={() => handleSave(false)} className="flex-1 py-3 rounded-xl text-sm font-bold bg-emerald-600 hover:bg-emerald-700 text-white disabled:opacity-60">
+                    {isSaving ? '處理中…' : '儲存'}
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    }
+  </script>
+  <script type="text/babel">
+    // ==========================================
     // Main Component: SproutOrderAssistant
     // ==========================================
     function SproutOrderAssistant({ user, onSignOut }) {
@@ -5657,6 +6652,9 @@
       const [isBlacklistOpen, setIsBlacklistOpen] = React.useState(false);
       const [isBlacklistAddOpen, setIsBlacklistAddOpen] = React.useState(false);
       const [isSavingBlacklist, setIsSavingBlacklist] = React.useState(false);
+
+      // ---------- [收支報表 v2.14.10] 狀態全在 screen-finance.js 內部，這裡只管開關 ----------
+      const [isFinanceOpen, setIsFinanceOpen] = React.useState(false);
 
       const showToast = (msg) => {
         setToastMessage(msg);
@@ -5841,6 +6839,9 @@
       const [shippingFeeAuto, setShippingFeeAuto] = React.useState(true); // 運費是否跟著物流方式/滿額自動帶入
       const [orderNote, setOrderNote] = React.useState('');
       const [orderDate, setOrderDate] = React.useState(''); // [v2.14.5] 新增訂單的日期（YYYY-MM-DD）；空白＝今天
+      const [sizeSeries, setSizeSeriesState] = React.useState(loadSizeSeries); // [v2.14.18] 新增訂單手動輸入時的尺寸系列（記住上次選擇）
+      const setSizeSeries = (key) => { setSizeSeriesState(key); saveSizeSeries(key); };
+      const [isPrepaidNew, setIsPrepaidNew] = React.useState(false); // [v2.14.12] 客人已全額轉帳：建單即「已領貨（入帳）」
       
       const [orderItems, setOrderItems] = React.useState([]);
 
@@ -5871,22 +6872,6 @@
       // [V2.4] 快速帶入：搜尋 / 全部商品面板 / 自動捲動到編輯區
       const [pickerSearch, setPickerSearch] = React.useState('');
       const [isPickerPanelOpen, setIsPickerPanelOpen] = React.useState(false);
-      // [v2.14.11] 寬螢幕（≥1536px，與 Tailwind 的 2xl 斷點相同）才用三欄版面：商品輸入表單搬到右側作業欄。
-      // 用 matchMedia 讓「表單只渲染一份」（表單有 ref 與輸入框，不能同時放兩份再用 CSS 藏起來）。
-      // 不支援 matchMedia 時視為窄螢幕，表單仍留在中間卡片內，功能不受影響。
-      const [isWideLayout, setIsWideLayout] = React.useState(() =>
-        typeof window !== 'undefined' && typeof window.matchMedia === 'function' && window.matchMedia('(min-width: 1536px)').matches
-      );
-      React.useEffect(() => {
-        if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return undefined;
-        const mq = window.matchMedia('(min-width: 1536px)');
-        const onChange = (e) => setIsWideLayout(e.matches);
-        setIsWideLayout(mq.matches);
-        if (mq.addEventListener) mq.addEventListener('change', onChange); else mq.addListener(onChange);
-        return () => {
-          if (mq.removeEventListener) mq.removeEventListener('change', onChange); else mq.removeListener(onChange);
-        };
-      }, []);
       const itemEditorRef = React.useRef(null);
 
       // [V2.8] 送出防連點：送出中鎖住按鈕；同一張訂單重試時沿用同一個訂單編號（重送只會覆蓋、不會多一張）
@@ -5958,6 +6943,7 @@
         setStoreAddress('');
         setOrderNote('');
         setOrderDate('');
+        setIsPrepaidNew(false);
         setOrderItems([]);
         setSelectedProductRef(null);
         setDraftRestored(false);
@@ -6389,7 +7375,9 @@
           storeName,
           storeAddress: storeAddress.trim(),
           shippingFee: Number(shippingFee),
-          paymentStatus: false,
+          paymentStatus: isPrepaidNew, // [v2.14.12] 已全額轉帳＝建單即入帳；其餘為「未領貨」，客人領貨後再按已領貨
+          paidDate: isPrepaidNew ? toDateInputValue(orderStamp.timestamp) : '',
+          closeStatus: '',
           shipmentStatus: 'unshipped',
           items: orderItems,
           note: orderNote,
@@ -6447,6 +7435,7 @@
           setStoreAddress(''); // [v2.13.4修正] 之前拆分門市名稱/地址時漏了這行，地址欄位送出後不會清空
           setOrderNote('');
           setOrderDate('');
+          setIsPrepaidNew(false);
           setOrderItems([]);
           setLineText('');
           setSelectedProductRef(null);
@@ -6468,16 +7457,40 @@
         }
       };
 
+      // [v2.14.12] 「已付款」改稱「已領貨」：標記時記下領貨日（今天，可在編輯訂單修改）；取消時清掉；同時解除棄單
       const handleTogglePayment = async (orderId, currentStatus) => {
         try {
           await withSyncTracking(dbRef(`orders/${orderId}`).update({
-            paymentStatus: !currentStatus
+            paymentStatus: !currentStatus,
+            paidDate: currentStatus ? '' : toDateInputValue(Date.now()),
+            closeStatus: ''
           }));
           const target = orders.find(o => o.id === orderId);
-          logAction('order_payment', 'order', orderId, `付款狀態：${target?.customerName || ''}　${currentStatus ? '已付款' : '未付款'} → ${currentStatus ? '未付款' : '已付款'}`);
-          showToast('更新付款狀態成功');
+          logAction('order_payment', 'order', orderId, `領貨狀態：${target?.customerName || ''}　${currentStatus ? '已領貨' : '未領貨'} → ${currentStatus ? '未領貨' : '已領貨'}`);
+          showToast(currentStatus ? '已改回未領貨' : '✅ 已標記為已領貨（款項入帳）');
         } catch (err) {
           console.error("Toggle payment error:", err);
+          showToast('❌ 更新領貨狀態失敗，請檢查網路後再試');
+        }
+      };
+
+      // [v2.14.12] 棄單：客人沒去領貨、沒收到款。棄單不計營收；再按一次可還原成未領貨
+      const handleToggleAbandon = async (orderId, isAbandoned) => {
+        const target = orders.find(o => o.id === orderId);
+        const name = target?.customerName || '';
+        const ok = window.confirm(isAbandoned
+          ? `把「${name}」的棄單還原成「未領貨」？`
+          : `把「${name}」標記為「棄單」？\n\n棄單的訂單不會計入營收，之後可以再還原。`);
+        if (!ok) return;
+        try {
+          await withSyncTracking(dbRef(`orders/${orderId}`).update(isAbandoned
+            ? { closeStatus: '' }
+            : { closeStatus: 'abandoned', paymentStatus: false, paidDate: '' }));
+          logAction('order_payment', 'order', orderId, `領貨狀態：${name}　${isAbandoned ? '棄單 → 未領貨' : '標記為棄單'}`);
+          showToast(isAbandoned ? '已還原為未領貨' : '已標記為棄單');
+        } catch (err) {
+          console.error("Toggle abandon error:", err);
+          showToast('❌ 更新失敗，請檢查網路後再試');
         }
       };
 
@@ -6633,7 +7646,10 @@
             });
             updates[newKey] = {
               ...orderData,
-              paymentStatus: importStatus.paymentStatus,     // [V2.8] 由使用者在預覽視窗指定
+              // [v2.14.12] 姓名／單號／備註含「棄單」「取消」（她 Excel 的慣例）→ 匯入時直接標成棄單，不算已領貨
+              ...(/棄單|取消/.test(`${orderData.customerName || ''} ${orderData.orderNo || ''} ${orderData.note || ''}`)
+                ? { paymentStatus: false, closeStatus: 'abandoned' }
+                : { paymentStatus: importStatus.paymentStatus }),     // [V2.8] 由使用者在預覽視窗指定
               shipmentStatus: importStatus.shipmentStatus,
               items: linkedItems,
               createdAt: new Date(baseTs).toLocaleString('zh-TW', { hour12: false }),
@@ -7065,7 +8081,7 @@
           sku: '',
           name: '',
           price: 0,
-          sizes: 'S, M, L, XL',
+          sizes: '', // [v2.14.18] 預設不勾任何尺寸；不選就存成 F（單一規格）
           colors: '黑色, 白色',
           category: '服飾',
           note: '',
@@ -7398,9 +8414,11 @@
             o.items.some(i => i.name.toLowerCase().includes(q) || i.sku.toLowerCase().includes(q))
           );
 
+          const isAbandoned = o.closeStatus === 'abandoned';
           const matchPayment = 
             filterPayment === 'all' ? true :
-            filterPayment === 'paid' ? o.paymentStatus : !o.paymentStatus;
+            filterPayment === 'abandoned' ? isAbandoned :
+            filterPayment === 'paid' ? (o.paymentStatus && !isAbandoned) : (!o.paymentStatus && !isAbandoned);
 
           const matchShipment = 
             filterShipment === 'all' ? true :
@@ -7481,199 +8499,6 @@
       };
 
       const stats = React.useMemo(() => computeAppStats(orders, enrichedProducts), [orders, enrichedProducts]);
-
-      // [v2.14.10] 已加入商品的每一列：手機/平板放在商品挑選卡片內，2xl 以上放在右側獨立欄，兩處共用同一份
-      const addedItemRows = orderItems.map((item) => (
-        <div key={item.id} className="flex items-center justify-between bg-slate-50 p-2.5 rounded-xl border border-slate-200/60 text-xs sm:text-sm">
-          <div>
-            <span className="font-bold text-slate-800">{item.name}</span>
-            <span className="text-slate-500 ml-2">({item.color || '預設款式'}/{item.size})</span>
-            <div className="text-[11px] sm:text-xs text-slate-400">
-              ${item.price} x {item.qty} = <span className="font-semibold text-emerald-600">${item.price * item.qty}</span>
-            </div>
-          </div>
-          <button
-            type="button"
-            onClick={() => handleRemoveOrderItem(item.id)}
-            className="p-1.5 text-slate-400 hover:text-red-500 rounded-lg hover:bg-red-50 transition"
-          >
-            <IconTrash2 size={16} />
-          </button>
-        </div>
-      ));
-
-      // [v2.14.11] 商品規格輸入表單（款號/名稱/顏色/單價/尺寸/數量/加入鈕）：手機/平板放在商品挑選卡片內，2xl 以上放在右側作業欄，只渲染一份
-      const itemEditorBlock = (
-                    <div ref={itemEditorRef} className="bg-slate-50 p-3.5 sm:p-4 rounded-xl border border-slate-200/60 space-y-3">
-                      {/* [v2.13.4] 上鎖不清空：同商品要連續輸入不同花色/尺寸時使用 */}
-                      <div className="flex justify-end">
-                        <button
-                          type="button"
-                          onClick={() => setIsKeepFieldsLocked(v => !v)}
-                          className={`flex items-center gap-1 text-[11px] font-semibold px-2.5 py-1 rounded-full border ${
-                            isKeepFieldsLocked
-                              ? 'bg-amber-100 border-amber-300 text-amber-800'
-                              : 'bg-white border-slate-200 text-slate-400'
-                          }`}
-                        >
-                          <span>{isKeepFieldsLocked ? '已上鎖不清空' : '上鎖不清空'}</span>
-                          {isKeepFieldsLocked ? <IconLock size={14} /> : <IconUnlock size={14} />}
-                        </button>
-                      </div>
-                      <div className="grid grid-cols-3 gap-2">
-                        <div>
-                          <label className="text-[11px] sm:text-xs font-medium text-slate-500 block">商品款號</label>
-                          <input
-                            type="text"
-                            placeholder="A01"
-                            value={currentItem.sku}
-                            onChange={(e) => setCurrentItem({ ...currentItem, sku: e.target.value })}
-                            className="w-full text-xs sm:text-sm p-2 rounded-md border border-slate-200 bg-white"
-                          />
-                        </div>
-                        <div className="col-span-2">
-                          <label className="text-[11px] sm:text-xs font-medium text-slate-500 block">商品名稱 *</label>
-                          <input
-                            type="text"
-                            placeholder="例如：韓系純棉 T 恤"
-                            value={currentItem.name}
-                            onChange={(e) => setCurrentItem({ ...currentItem, name: e.target.value })}
-                            className="w-full text-xs sm:text-sm p-2 rounded-md border border-slate-200 bg-white"
-                          />
-                        </div>
-                      </div>
-
-                      {/* [v2.13.4] 相似商品建議：手動輸入商品名稱、停頓後跟商品庫比對；點選後完整套用商品庫資料(比照從商品庫選取) */}
-                      {nameSuggestions.length > 0 && (
-                        <div className="bg-amber-50 border border-amber-200 rounded-lg p-2.5 space-y-1.5">
-                          <p className="text-[11px] text-amber-700 font-medium">💡 商品庫有相似商品，點選可帶入完整商品資料：</p>
-                          <div className="flex flex-wrap gap-1.5">
-                            {nameSuggestions.map(({ product, score }) => (
-                              <button
-                                key={product.id}
-                                type="button"
-                                onClick={() => handleApplySuggestedProduct(product)}
-                                className="px-2.5 py-1 text-xs font-medium bg-white border border-amber-300 rounded-lg text-amber-800 hover:bg-amber-100"
-                              >
-                                {product.name}{product.sku ? `（${product.sku}）` : ''} · {Math.round(score * 100)}%
-                              </button>
-                            ))}
-                          </div>
-                        </div>
-                      )}
-
-                      {selectedProductRef && splitProductOptions(selectedProductRef.colors).length > 1 && (
-                        <div>
-                          <label className="text-[11px] sm:text-xs font-medium text-slate-500 block mb-1">顏色快捷點選</label>
-                          <div className="flex flex-wrap gap-1.5">
-                            {splitProductOptions(selectedProductRef.colors).map((clr) => (
-                              <button
-                                key={clr}
-                                type="button"
-                                onClick={() => setCurrentItem({ ...currentItem, color: clr })}
-                                className={`px-3 py-1 text-xs font-bold rounded-lg border transition ${
-                                  currentItem.color === clr
-                                    ? 'bg-slate-800 text-white border-slate-800'
-                                    : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-100'
-                                }`}
-                              >
-                                {clr}
-                              </button>
-                            ))}
-                          </div>
-                        </div>
-                      )}
-
-                      <div className="grid grid-cols-2 gap-2">
-                        <div>
-                          <label className="text-[11px] sm:text-xs font-medium text-slate-500 block">顏色款式</label>
-                          <input
-                            type="text"
-                            placeholder="黑色 / 白色"
-                            value={currentItem.color}
-                            onChange={(e) => setCurrentItem({ ...currentItem, color: e.target.value })}
-                            className="w-full text-xs sm:text-sm p-2 rounded-md border border-slate-200 bg-white"
-                          />
-                        </div>
-                        <div>
-                          <label className="text-[11px] sm:text-xs font-medium text-slate-500 block">單價 ($)</label>
-                          <input
-                            type="number"
-                            value={currentItem.price}
-                            onChange={(e) => setCurrentItem({ ...currentItem, price: Math.max(0, Number(e.target.value)) })}
-                            className="w-full text-xs sm:text-sm p-2 rounded-md border border-slate-200 bg-white"
-                          />
-                          {/* [v2.13.4] 單價比商品庫定價低時即時提醒，避免不小心改低價吃掉利潤 */}
-                          {selectedProductRef && Number(currentItem.price) < Number(selectedProductRef.price || 0) && (
-                            <p className="text-[11px] text-red-600 mt-1">⚠️ 比商品庫定價 ${selectedProductRef.price} 低，請確認金額</p>
-                          )}
-                        </div>
-                      </div>
-
-
-                      {/* Size Quick Select */}
-                      <div>
-                        <label className="text-[11px] sm:text-xs font-medium text-slate-500 block mb-1">尺寸快捷點選</label>
-                        <div className="flex flex-wrap gap-1.5">
-                          {(selectedProductRef ? splitProductOptions(selectedProductRef.sizes) : ['S', 'M', 'L', 'XL', 'F']).map((sz) => {
-                            const cleanSz = sz.trim();
-                            if (!cleanSz) return null;
-                            const isSelected = currentItem.size === cleanSz;
-                            return (
-                              <button
-                                key={cleanSz}
-                                type="button"
-                                onClick={() => setCurrentItem({ ...currentItem, size: cleanSz })}
-                                className={`px-3 py-1 text-xs font-bold rounded-lg border transition ${
-                                  isSelected
-                                    ? 'bg-slate-800 text-white border-slate-800'
-                                    : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-100'
-                                }`}
-                              >
-                                {cleanSz}
-                              </button>
-                            );
-                          })}
-                        </div>
-                      </div>
-
-                      {/* Quantity Controls */}
-                      <div className="flex items-center justify-between pt-1">
-                        <span className="text-xs sm:text-sm font-medium text-slate-600">購買數量</span>
-                        <div className="flex items-center gap-2">
-                          <button
-                            type="button"
-                            onClick={() => setCurrentItem(p => ({ ...p, qty: Math.max(1, p.qty - 1) }))}
-                            className="w-8 h-8 rounded-lg bg-white border border-slate-200 text-slate-600 flex items-center justify-center font-bold active:bg-slate-100"
-                          >
-                            -
-                          </button>
-                          <input
-                            type="number"
-                            value={currentItem.qty}
-                            onChange={(e) => setCurrentItem({ ...currentItem, qty: Math.max(1, Number(e.target.value)) })}
-                            className="w-12 text-center text-xs sm:text-sm font-bold p-1 rounded-md border border-slate-200 bg-white"
-                          />
-                          <button
-                            type="button"
-                            onClick={() => setCurrentItem(p => ({ ...p, qty: p.qty + 1 }))}
-                            className="w-8 h-8 rounded-lg bg-white border border-slate-200 text-slate-600 flex items-center justify-center font-bold active:bg-slate-100"
-                          >
-                            +
-                          </button>
-                        </div>
-                      </div>
-
-                      <button
-                        type="button"
-                        onClick={handleAddItemToOrder}
-                        className="w-full py-2.5 bg-slate-800 hover:bg-slate-900 text-white text-xs sm:text-sm font-bold rounded-lg shadow-sm transition flex items-center justify-center gap-1"
-                      >
-                        <IconPlus size={16} />
-                        加入此訂單品項
-                      </button>
-                    </div>
-      );
 
       const navItems = [
         { id: 'add', label: '新增訂單', icon: IconPlus },
@@ -7768,6 +8593,18 @@
               orders={orders}
               onRevert={handleRevertOrderEdit}
               onClose={() => setIsLogOpen(false)}
+            />
+          )}
+
+          {/* [收支報表 v2.14.10] */}
+          {isFinanceOpen && (
+            <FinanceScreen
+              user={user}
+              orders={orders}
+              onClose={() => setIsFinanceOpen(false)}
+              showToast={showToast}
+              logAction={logAction}
+              withSyncTracking={withSyncTracking}
             />
           )}
 
@@ -7941,7 +8778,7 @@
 
           {/* Header */}
           <header className="bg-emerald-600 text-white sticky top-0 z-40 shadow-md">
-            <div className="max-w-6xl xl:max-w-7xl 2xl:max-w-[1600px] mx-auto px-4 sm:px-6 lg:px-8 py-3 flex items-center justify-between">
+            <div className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 py-3 flex items-center justify-between">
               <div className="flex items-center gap-2.5">
                 <div className="bg-white/20 p-2 rounded-xl backdrop-blur-md">
                   <IconShoppingBag className="w-5 h-5 sm:w-6 sm:h-6 text-white" />
@@ -8001,7 +8838,7 @@
           </header>
 
           {/* Main Container */}
-          <main className="max-w-6xl xl:max-w-7xl 2xl:max-w-[1600px] mx-auto px-4 sm:px-6 lg:px-8 py-4 sm:py-6 flex-1 w-full">
+          <main className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 py-4 sm:py-6 flex-1 w-full">
             
             {/* [V2.2] Test Mode Banner */}
             {IS_TEST_MODE && (
@@ -8098,7 +8935,7 @@
                 )}
 
                 {/* Left Column: Smart Parser & Customer Info */}
-                <div className="md:col-span-5 2xl:col-span-4 space-y-4">
+                <div className="md:col-span-5 space-y-4">
                   {/* Smart Text Parser */}
                   <div className="bg-gradient-to-br from-emerald-50 to-teal-50 border border-emerald-200/60 rounded-2xl p-4 sm:p-5 shadow-sm">
                     <div className="flex items-center justify-between mb-2">
@@ -8266,6 +9103,11 @@
                       {orderDate && <p className="text-[11px] text-amber-700 mt-1">⚠️ 這張訂單的日期不是今天，會記成 {orderDate}。</p>}
                     </div>
 
+                    <label className="flex items-start gap-2 cursor-pointer text-xs sm:text-sm text-slate-700">
+                      <input type="checkbox" checked={isPrepaidNew} onChange={(e) => setIsPrepaidNew(e.target.checked)} className="w-4 h-4 mt-0.5 accent-emerald-600" />
+                      <span><span className="font-semibold">客人已全額轉帳</span>（建單就算已領貨、款項入帳）</span>
+                    </label>
+
                     <div>
                       <label className="text-xs sm:text-sm font-medium text-slate-600 mb-1 block">訂單備註</label>
                       <input
@@ -8280,8 +9122,8 @@
                 </div>
 
                 {/* Right Column: Product Selector & List */}
-                <div className="md:col-span-7 space-y-4 2xl:space-y-0 2xl:contents">
-                  <div className="2xl:col-span-4 bg-white rounded-2xl p-4 sm:p-5 border border-slate-200/80 shadow-sm space-y-3.5">
+                <div className="md:col-span-7 space-y-4">
+                  <div className="bg-white rounded-2xl p-4 sm:p-5 border border-slate-200/80 shadow-sm space-y-3.5">
                     <div className="flex items-center justify-between border-b border-slate-100 pb-2.5">
                       <h2 className="text-xs sm:text-sm font-bold text-slate-700 flex items-center gap-1.5">
                         <IconShoppingBag size={18} className="text-emerald-600" />
@@ -8417,60 +9259,248 @@
                       </div>
                     )}
 
-                    {/* Selected Item Editor（2xl 以上改放右側作業欄，見 itemEditorBlock） */}
-                    {!isWideLayout && itemEditorBlock}
+                    {/* Selected Item Editor */}
+                    <div ref={itemEditorRef} className="bg-slate-50 p-3.5 sm:p-4 rounded-xl border border-slate-200/60 space-y-3">
+                      {/* [v2.13.4] 上鎖不清空：同商品要連續輸入不同花色/尺寸時使用 */}
+                      <div className="flex justify-end">
+                        <button
+                          type="button"
+                          onClick={() => setIsKeepFieldsLocked(v => !v)}
+                          className={`flex items-center gap-1 text-[11px] font-semibold px-2.5 py-1 rounded-full border ${
+                            isKeepFieldsLocked
+                              ? 'bg-amber-100 border-amber-300 text-amber-800'
+                              : 'bg-white border-slate-200 text-slate-400'
+                          }`}
+                        >
+                          <span>{isKeepFieldsLocked ? '已上鎖不清空' : '上鎖不清空'}</span>
+                          {isKeepFieldsLocked ? <IconLock size={14} /> : <IconUnlock size={14} />}
+                        </button>
+                      </div>
+                      <div className="grid grid-cols-3 gap-2">
+                        <div>
+                          <label className="text-[11px] sm:text-xs font-medium text-slate-500 block">商品款號</label>
+                          <input
+                            type="text"
+                            placeholder="A01"
+                            value={currentItem.sku}
+                            onChange={(e) => setCurrentItem({ ...currentItem, sku: e.target.value })}
+                            className="w-full text-xs sm:text-sm p-2 rounded-md border border-slate-200 bg-white"
+                          />
+                        </div>
+                        <div className="col-span-2">
+                          <label className="text-[11px] sm:text-xs font-medium text-slate-500 block">商品名稱 *</label>
+                          <input
+                            type="text"
+                            placeholder="例如：韓系純棉 T 恤"
+                            value={currentItem.name}
+                            onChange={(e) => setCurrentItem({ ...currentItem, name: e.target.value })}
+                            className="w-full text-xs sm:text-sm p-2 rounded-md border border-slate-200 bg-white"
+                          />
+                        </div>
+                      </div>
 
-                    {/* Added Items List（2xl 以上改顯示在右側作業欄） */}
-                    {!isWideLayout && orderItems.length > 0 && (
+                      {/* [v2.13.4] 相似商品建議：手動輸入商品名稱、停頓後跟商品庫比對；點選後完整套用商品庫資料(比照從商品庫選取) */}
+                      {nameSuggestions.length > 0 && (
+                        <div className="bg-amber-50 border border-amber-200 rounded-lg p-2.5 space-y-1.5">
+                          <p className="text-[11px] text-amber-700 font-medium">💡 商品庫有相似商品，點選可帶入完整商品資料：</p>
+                          <div className="flex flex-wrap gap-1.5">
+                            {nameSuggestions.map(({ product, score }) => (
+                              <button
+                                key={product.id}
+                                type="button"
+                                onClick={() => handleApplySuggestedProduct(product)}
+                                className="px-2.5 py-1 text-xs font-medium bg-white border border-amber-300 rounded-lg text-amber-800 hover:bg-amber-100"
+                              >
+                                {product.name}{product.sku ? `（${product.sku}）` : ''} · {Math.round(score * 100)}%
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
+                      {selectedProductRef && splitProductOptions(selectedProductRef.colors).length > 1 && (
+                        <div>
+                          <label className="text-[11px] sm:text-xs font-medium text-slate-500 block mb-1">顏色快捷點選</label>
+                          <div className="flex flex-wrap gap-1.5">
+                            {splitProductOptions(selectedProductRef.colors).map((clr) => (
+                              <button
+                                key={clr}
+                                type="button"
+                                onClick={() => setCurrentItem({ ...currentItem, color: clr })}
+                                className={`px-3 py-1 text-xs font-bold rounded-lg border transition ${
+                                  currentItem.color === clr
+                                    ? 'bg-slate-800 text-white border-slate-800'
+                                    : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-100'
+                                }`}
+                              >
+                                {clr}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
+                      <div className="grid grid-cols-2 gap-2">
+                        <div>
+                          <label className="text-[11px] sm:text-xs font-medium text-slate-500 block">顏色款式</label>
+                          <input
+                            type="text"
+                            placeholder="黑色 / 白色"
+                            value={currentItem.color}
+                            onChange={(e) => setCurrentItem({ ...currentItem, color: e.target.value })}
+                            className="w-full text-xs sm:text-sm p-2 rounded-md border border-slate-200 bg-white"
+                          />
+                        </div>
+                        <div>
+                          <label className="text-[11px] sm:text-xs font-medium text-slate-500 block">單價 ($)</label>
+                          <input
+                            type="number"
+                            value={currentItem.price}
+                            onChange={(e) => setCurrentItem({ ...currentItem, price: Math.max(0, Number(e.target.value)) })}
+                            className="w-full text-xs sm:text-sm p-2 rounded-md border border-slate-200 bg-white"
+                          />
+                          {/* [v2.13.4] 單價比商品庫定價低時即時提醒，避免不小心改低價吃掉利潤 */}
+                          {selectedProductRef && Number(currentItem.price) < Number(selectedProductRef.price || 0) && (
+                            <p className="text-[11px] text-red-600 mt-1">⚠️ 比商品庫定價 ${selectedProductRef.price} 低，請確認金額</p>
+                          )}
+                        </div>
+                      </div>
+
+
+                      {/* Size Quick Select（[v2.14.18] 多一個尺寸系列下拉：亞洲／通用／歐美／自訂） */}
+                      <div>
+                        <div className="flex items-center justify-between gap-2 mb-1">
+                          <label className="text-[11px] sm:text-xs font-medium text-slate-500">{selectedProductRef ? '尺寸（商品庫）' : '尺寸快捷點選'}</label>
+                          {!selectedProductRef && (
+                            <select
+                              value={sizeSeries}
+                              onChange={(e) => setSizeSeries(e.target.value)}
+                              className="text-xs px-2 py-1 rounded-lg border border-slate-200 bg-white text-slate-700 font-semibold focus:outline-none focus:border-emerald-500"
+                            >
+                              {SIZE_SERIES.map((sr) => <option key={sr.key} value={sr.key}>{sr.label}</option>)}
+                              <option value={SIZE_SERIES_CUSTOM}>自訂</option>
+                            </select>
+                          )}
+                        </div>
+                        {!selectedProductRef && sizeSeries === SIZE_SERIES_CUSTOM ? (
+                          <div>
+                            <input
+                              type="text"
+                              placeholder="例如：均碼（留空＝F）"
+                              value={currentItem.size === 'F' ? '' : currentItem.size}
+                              onChange={(e) => setCurrentItem({ ...currentItem, size: e.target.value === '' ? 'F' : e.target.value })}
+                              className="w-full text-xs sm:text-sm px-3 py-2 rounded-xl border border-slate-200 focus:outline-none focus:border-emerald-500"
+                            />
+                            <p className="text-[11px] text-slate-400 mt-1">目前尺寸：{currentItem.size}</p>
+                          </div>
+                        ) : (
+                          <div className="flex flex-wrap gap-1.5">
+                            {(selectedProductRef ? splitProductOptions(selectedProductRef.sizes) : getSizeSeriesList(sizeSeries)).map((sz) => {
+                              const cleanSz = sz.trim();
+                              if (!cleanSz) return null;
+                              const isSelected = currentItem.size === cleanSz;
+                              return (
+                                <button
+                                  key={cleanSz}
+                                  type="button"
+                                  onClick={() => setCurrentItem({ ...currentItem, size: cleanSz })}
+                                  className={`px-3 py-1 text-xs font-bold rounded-lg border transition ${
+                                    isSelected
+                                      ? 'bg-slate-800 text-white border-slate-800'
+                                      : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-100'
+                                  }`}
+                                >
+                                  {cleanSz}
+                                </button>
+                              );
+                            })}
+                          </div>
+                        )}
+                      </div>
+
+                      {/* Quantity Controls */}
+                      <div className="flex items-center justify-between pt-1">
+                        <span className="text-xs sm:text-sm font-medium text-slate-600">購買數量</span>
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => setCurrentItem(p => ({ ...p, qty: Math.max(1, p.qty - 1) }))}
+                            className="w-8 h-8 rounded-lg bg-white border border-slate-200 text-slate-600 flex items-center justify-center font-bold active:bg-slate-100"
+                          >
+                            -
+                          </button>
+                          <input
+                            type="number"
+                            value={currentItem.qty}
+                            onChange={(e) => setCurrentItem({ ...currentItem, qty: Math.max(1, Number(e.target.value)) })}
+                            className="w-12 text-center text-xs sm:text-sm font-bold p-1 rounded-md border border-slate-200 bg-white"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => setCurrentItem(p => ({ ...p, qty: p.qty + 1 }))}
+                            className="w-8 h-8 rounded-lg bg-white border border-slate-200 text-slate-600 flex items-center justify-center font-bold active:bg-slate-100"
+                          >
+                            +
+                          </button>
+                        </div>
+                      </div>
+
+                      <button
+                        type="button"
+                        onClick={handleAddItemToOrder}
+                        className="w-full py-2.5 bg-slate-800 hover:bg-slate-900 text-white text-xs sm:text-sm font-bold rounded-lg shadow-sm transition flex items-center justify-center gap-1"
+                      >
+                        <IconPlus size={16} />
+                        加入此訂單品項
+                      </button>
+                    </div>
+
+                    {/* Added Items List */}
+                    {orderItems.length > 0 && (
                       <div className="space-y-2 pt-2 border-t border-slate-100">
                         <span className="text-xs sm:text-sm font-bold text-slate-600 block">已加入商品 ({orderItems.length})</span>
                         <div className="space-y-1.5 max-h-48 overflow-y-auto pr-1">
-                          {addedItemRows}
+                          {orderItems.map((item) => (
+                            <div key={item.id} className="flex items-center justify-between bg-slate-50 p-2.5 rounded-xl border border-slate-200/60 text-xs sm:text-sm">
+                              <div>
+                                <span className="font-bold text-slate-800">{item.name}</span>
+                                <span className="text-slate-500 ml-2">({item.color || '預設款式'}/{item.size})</span>
+                                <div className="text-[11px] sm:text-xs text-slate-400">
+                                  ${item.price} x {item.qty} = <span className="font-semibold text-emerald-600">${item.price * item.qty}</span>
+                                </div>
+                              </div>
+                              <button
+                                type="button"
+                                onClick={() => handleRemoveOrderItem(item.id)}
+                                className="p-1.5 text-slate-400 hover:text-red-500 rounded-lg hover:bg-red-50 transition"
+                              >
+                                <IconTrash2 size={16} />
+                              </button>
+                            </div>
+                          ))}
                         </div>
                       </div>
                     )}
                   </div>
 
-                  {/* [v2.14.11] 2xl 以上：右側作業欄（商品規格輸入 → 已加入商品 → 總額與送出鈕），捲動時固定；2xl 以下維持原本直排 */}
-                  <div className="2xl:col-span-4 2xl:sticky 2xl:top-24 2xl:flex 2xl:flex-col 2xl:gap-4 2xl:max-h-[calc(100vh_-_7rem)] 2xl:overflow-y-auto">
-                    {isWideLayout && (
-                      <>
-                        <div className="bg-white rounded-2xl p-4 sm:p-5 border border-slate-200/80 shadow-sm space-y-3 shrink-0">
-                          <h2 className="text-xs sm:text-sm font-bold text-slate-700 border-b border-slate-100 pb-2.5">3. 規格與數量</h2>
-                          {itemEditorBlock}
-                        </div>
-                        <div className="flex flex-col gap-2 flex-1 min-h-[8rem] bg-white rounded-2xl p-4 sm:p-5 border border-slate-200/80 shadow-sm">
-                          <span className="text-xs sm:text-sm font-bold text-slate-600 block">已加入商品 ({orderItems.length})</span>
-                          {orderItems.length === 0 ? (
-                            <p className="text-center text-xs text-slate-400 py-4">尚未加入商品，點中間的商品後按「加入此訂單品項」</p>
-                          ) : (
-                            <div className="space-y-1.5 min-h-0 flex-1 overflow-y-auto pr-1">
-                              {addedItemRows}
-                            </div>
-                          )}
-                        </div>
-                      </>
-                    )}
-
-                    {/* Summary & Submit */}
-                    <div className="bg-white rounded-2xl p-4 sm:p-5 border border-slate-200/80 shadow-sm space-y-3 2xl:shrink-0">
-                      <div className="bg-slate-900 text-white p-4 rounded-xl flex items-center justify-between">
-                        <div>
-                          <span className="text-xs text-slate-400 block">小計 ${currentOrderSubtotal} + 運費 ${shippingFee}</span>
-                          <span className="text-xs sm:text-sm font-medium">訂單總金額</span>
-                        </div>
-                        <span className="text-xl sm:text-2xl font-bold text-emerald-400">${currentOrderTotal}</span>
+                  {/* Summary & Submit */}
+                  <div className="bg-white rounded-2xl p-4 sm:p-5 border border-slate-200/80 shadow-sm space-y-3">
+                    <div className="bg-slate-900 text-white p-4 rounded-xl flex items-center justify-between">
+                      <div>
+                        <span className="text-xs text-slate-400 block">小計 ${currentOrderSubtotal} + 運費 ${shippingFee}</span>
+                        <span className="text-xs sm:text-sm font-medium">訂單總金額</span>
                       </div>
-
-                      <button
-                        type="submit"
-                        disabled={isSubmittingOrder}
-                        className="w-full py-3.5 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60 disabled:cursor-not-allowed text-white font-bold text-sm sm:text-base rounded-xl shadow-md transition flex items-center justify-center gap-2"
-                      >
-                        <IconCheck size={20} />
-                        {isSubmittingOrder ? '送出中…請稍候（請勿重複按）' : '儲存並即時同步建立訂單'}
-                      </button>
+                      <span className="text-xl sm:text-2xl font-bold text-emerald-400">${currentOrderTotal}</span>
                     </div>
+
+                    <button
+                      type="submit"
+                      disabled={isSubmittingOrder}
+                      className="w-full py-3.5 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60 disabled:cursor-not-allowed text-white font-bold text-sm sm:text-base rounded-xl shadow-md transition flex items-center justify-center gap-2"
+                    >
+                      <IconCheck size={20} />
+                      {isSubmittingOrder ? '送出中…請稍候（請勿重複按）' : '儲存並即時同步建立訂單'}
+                    </button>
                   </div>
                 </div>
               </form>
@@ -8517,6 +9547,7 @@
                   handleSelectExcelImported,
                   handleTogglePayment,
                   handleToggleShipment,
+                  handleToggleAbandon,
                 }}
               />
             )}
@@ -8557,6 +9588,7 @@
                   setIsMessageTemplateOpen,
                   setIsShippingSettingsOpen,
                   setIsBlacklistOpen,
+                  setIsFinanceOpen,
                   handleExportCSV,
                   handleExportProductsExcel,
                   handleSignOut,
