@@ -59,7 +59,7 @@
     // ==========================================
     // config.js — 版本號 / Firebase設定 / 常數設定值
     // ==========================================
-    const APP_VERSION = '2.14.10';
+    const APP_VERSION = '2.14.11';
     document.title = `Sprout 📱 小豆苗訂單助手 V${APP_VERSION} (Firebase RTDB 實時同步版)`;
 
     const firebaseConfig = {
@@ -5871,6 +5871,22 @@
       // [V2.4] 快速帶入：搜尋 / 全部商品面板 / 自動捲動到編輯區
       const [pickerSearch, setPickerSearch] = React.useState('');
       const [isPickerPanelOpen, setIsPickerPanelOpen] = React.useState(false);
+      // [v2.14.11] 寬螢幕（≥1536px，與 Tailwind 的 2xl 斷點相同）才用三欄版面：商品輸入表單搬到右側作業欄。
+      // 用 matchMedia 讓「表單只渲染一份」（表單有 ref 與輸入框，不能同時放兩份再用 CSS 藏起來）。
+      // 不支援 matchMedia 時視為窄螢幕，表單仍留在中間卡片內，功能不受影響。
+      const [isWideLayout, setIsWideLayout] = React.useState(() =>
+        typeof window !== 'undefined' && typeof window.matchMedia === 'function' && window.matchMedia('(min-width: 1536px)').matches
+      );
+      React.useEffect(() => {
+        if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return undefined;
+        const mq = window.matchMedia('(min-width: 1536px)');
+        const onChange = (e) => setIsWideLayout(e.matches);
+        setIsWideLayout(mq.matches);
+        if (mq.addEventListener) mq.addEventListener('change', onChange); else mq.addListener(onChange);
+        return () => {
+          if (mq.removeEventListener) mq.removeEventListener('change', onChange); else mq.removeListener(onChange);
+        };
+      }, []);
       const itemEditorRef = React.useRef(null);
 
       // [V2.8] 送出防連點：送出中鎖住按鈕；同一張訂單重試時沿用同一個訂單編號（重送只會覆蓋、不會多一張）
@@ -7486,6 +7502,179 @@
         </div>
       ));
 
+      // [v2.14.11] 商品規格輸入表單（款號/名稱/顏色/單價/尺寸/數量/加入鈕）：手機/平板放在商品挑選卡片內，2xl 以上放在右側作業欄，只渲染一份
+      const itemEditorBlock = (
+                    <div ref={itemEditorRef} className="bg-slate-50 p-3.5 sm:p-4 rounded-xl border border-slate-200/60 space-y-3">
+                      {/* [v2.13.4] 上鎖不清空：同商品要連續輸入不同花色/尺寸時使用 */}
+                      <div className="flex justify-end">
+                        <button
+                          type="button"
+                          onClick={() => setIsKeepFieldsLocked(v => !v)}
+                          className={`flex items-center gap-1 text-[11px] font-semibold px-2.5 py-1 rounded-full border ${
+                            isKeepFieldsLocked
+                              ? 'bg-amber-100 border-amber-300 text-amber-800'
+                              : 'bg-white border-slate-200 text-slate-400'
+                          }`}
+                        >
+                          <span>{isKeepFieldsLocked ? '已上鎖不清空' : '上鎖不清空'}</span>
+                          {isKeepFieldsLocked ? <IconLock size={14} /> : <IconUnlock size={14} />}
+                        </button>
+                      </div>
+                      <div className="grid grid-cols-3 gap-2">
+                        <div>
+                          <label className="text-[11px] sm:text-xs font-medium text-slate-500 block">商品款號</label>
+                          <input
+                            type="text"
+                            placeholder="A01"
+                            value={currentItem.sku}
+                            onChange={(e) => setCurrentItem({ ...currentItem, sku: e.target.value })}
+                            className="w-full text-xs sm:text-sm p-2 rounded-md border border-slate-200 bg-white"
+                          />
+                        </div>
+                        <div className="col-span-2">
+                          <label className="text-[11px] sm:text-xs font-medium text-slate-500 block">商品名稱 *</label>
+                          <input
+                            type="text"
+                            placeholder="例如：韓系純棉 T 恤"
+                            value={currentItem.name}
+                            onChange={(e) => setCurrentItem({ ...currentItem, name: e.target.value })}
+                            className="w-full text-xs sm:text-sm p-2 rounded-md border border-slate-200 bg-white"
+                          />
+                        </div>
+                      </div>
+
+                      {/* [v2.13.4] 相似商品建議：手動輸入商品名稱、停頓後跟商品庫比對；點選後完整套用商品庫資料(比照從商品庫選取) */}
+                      {nameSuggestions.length > 0 && (
+                        <div className="bg-amber-50 border border-amber-200 rounded-lg p-2.5 space-y-1.5">
+                          <p className="text-[11px] text-amber-700 font-medium">💡 商品庫有相似商品，點選可帶入完整商品資料：</p>
+                          <div className="flex flex-wrap gap-1.5">
+                            {nameSuggestions.map(({ product, score }) => (
+                              <button
+                                key={product.id}
+                                type="button"
+                                onClick={() => handleApplySuggestedProduct(product)}
+                                className="px-2.5 py-1 text-xs font-medium bg-white border border-amber-300 rounded-lg text-amber-800 hover:bg-amber-100"
+                              >
+                                {product.name}{product.sku ? `（${product.sku}）` : ''} · {Math.round(score * 100)}%
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
+                      {selectedProductRef && splitProductOptions(selectedProductRef.colors).length > 1 && (
+                        <div>
+                          <label className="text-[11px] sm:text-xs font-medium text-slate-500 block mb-1">顏色快捷點選</label>
+                          <div className="flex flex-wrap gap-1.5">
+                            {splitProductOptions(selectedProductRef.colors).map((clr) => (
+                              <button
+                                key={clr}
+                                type="button"
+                                onClick={() => setCurrentItem({ ...currentItem, color: clr })}
+                                className={`px-3 py-1 text-xs font-bold rounded-lg border transition ${
+                                  currentItem.color === clr
+                                    ? 'bg-slate-800 text-white border-slate-800'
+                                    : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-100'
+                                }`}
+                              >
+                                {clr}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
+                      <div className="grid grid-cols-2 gap-2">
+                        <div>
+                          <label className="text-[11px] sm:text-xs font-medium text-slate-500 block">顏色款式</label>
+                          <input
+                            type="text"
+                            placeholder="黑色 / 白色"
+                            value={currentItem.color}
+                            onChange={(e) => setCurrentItem({ ...currentItem, color: e.target.value })}
+                            className="w-full text-xs sm:text-sm p-2 rounded-md border border-slate-200 bg-white"
+                          />
+                        </div>
+                        <div>
+                          <label className="text-[11px] sm:text-xs font-medium text-slate-500 block">單價 ($)</label>
+                          <input
+                            type="number"
+                            value={currentItem.price}
+                            onChange={(e) => setCurrentItem({ ...currentItem, price: Math.max(0, Number(e.target.value)) })}
+                            className="w-full text-xs sm:text-sm p-2 rounded-md border border-slate-200 bg-white"
+                          />
+                          {/* [v2.13.4] 單價比商品庫定價低時即時提醒，避免不小心改低價吃掉利潤 */}
+                          {selectedProductRef && Number(currentItem.price) < Number(selectedProductRef.price || 0) && (
+                            <p className="text-[11px] text-red-600 mt-1">⚠️ 比商品庫定價 ${selectedProductRef.price} 低，請確認金額</p>
+                          )}
+                        </div>
+                      </div>
+
+
+                      {/* Size Quick Select */}
+                      <div>
+                        <label className="text-[11px] sm:text-xs font-medium text-slate-500 block mb-1">尺寸快捷點選</label>
+                        <div className="flex flex-wrap gap-1.5">
+                          {(selectedProductRef ? splitProductOptions(selectedProductRef.sizes) : ['S', 'M', 'L', 'XL', 'F']).map((sz) => {
+                            const cleanSz = sz.trim();
+                            if (!cleanSz) return null;
+                            const isSelected = currentItem.size === cleanSz;
+                            return (
+                              <button
+                                key={cleanSz}
+                                type="button"
+                                onClick={() => setCurrentItem({ ...currentItem, size: cleanSz })}
+                                className={`px-3 py-1 text-xs font-bold rounded-lg border transition ${
+                                  isSelected
+                                    ? 'bg-slate-800 text-white border-slate-800'
+                                    : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-100'
+                                }`}
+                              >
+                                {cleanSz}
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </div>
+
+                      {/* Quantity Controls */}
+                      <div className="flex items-center justify-between pt-1">
+                        <span className="text-xs sm:text-sm font-medium text-slate-600">購買數量</span>
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => setCurrentItem(p => ({ ...p, qty: Math.max(1, p.qty - 1) }))}
+                            className="w-8 h-8 rounded-lg bg-white border border-slate-200 text-slate-600 flex items-center justify-center font-bold active:bg-slate-100"
+                          >
+                            -
+                          </button>
+                          <input
+                            type="number"
+                            value={currentItem.qty}
+                            onChange={(e) => setCurrentItem({ ...currentItem, qty: Math.max(1, Number(e.target.value)) })}
+                            className="w-12 text-center text-xs sm:text-sm font-bold p-1 rounded-md border border-slate-200 bg-white"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => setCurrentItem(p => ({ ...p, qty: p.qty + 1 }))}
+                            className="w-8 h-8 rounded-lg bg-white border border-slate-200 text-slate-600 flex items-center justify-center font-bold active:bg-slate-100"
+                          >
+                            +
+                          </button>
+                        </div>
+                      </div>
+
+                      <button
+                        type="button"
+                        onClick={handleAddItemToOrder}
+                        className="w-full py-2.5 bg-slate-800 hover:bg-slate-900 text-white text-xs sm:text-sm font-bold rounded-lg shadow-sm transition flex items-center justify-center gap-1"
+                      >
+                        <IconPlus size={16} />
+                        加入此訂單品項
+                      </button>
+                    </div>
+      );
+
       const navItems = [
         { id: 'add', label: '新增訂單', icon: IconPlus },
         { id: 'list', label: '訂單列表', icon: IconList },
@@ -8092,7 +8281,7 @@
 
                 {/* Right Column: Product Selector & List */}
                 <div className="md:col-span-7 space-y-4 2xl:space-y-0 2xl:contents">
-                  <div className="2xl:col-span-5 bg-white rounded-2xl p-4 sm:p-5 border border-slate-200/80 shadow-sm space-y-3.5">
+                  <div className="2xl:col-span-4 bg-white rounded-2xl p-4 sm:p-5 border border-slate-200/80 shadow-sm space-y-3.5">
                     <div className="flex items-center justify-between border-b border-slate-100 pb-2.5">
                       <h2 className="text-xs sm:text-sm font-bold text-slate-700 flex items-center gap-1.5">
                         <IconShoppingBag size={18} className="text-emerald-600" />
@@ -8228,180 +8417,12 @@
                       </div>
                     )}
 
-                    {/* Selected Item Editor */}
-                    <div ref={itemEditorRef} className="bg-slate-50 p-3.5 sm:p-4 rounded-xl border border-slate-200/60 space-y-3">
-                      {/* [v2.13.4] 上鎖不清空：同商品要連續輸入不同花色/尺寸時使用 */}
-                      <div className="flex justify-end">
-                        <button
-                          type="button"
-                          onClick={() => setIsKeepFieldsLocked(v => !v)}
-                          className={`flex items-center gap-1 text-[11px] font-semibold px-2.5 py-1 rounded-full border ${
-                            isKeepFieldsLocked
-                              ? 'bg-amber-100 border-amber-300 text-amber-800'
-                              : 'bg-white border-slate-200 text-slate-400'
-                          }`}
-                        >
-                          <span>{isKeepFieldsLocked ? '已上鎖不清空' : '上鎖不清空'}</span>
-                          {isKeepFieldsLocked ? <IconLock size={14} /> : <IconUnlock size={14} />}
-                        </button>
-                      </div>
-                      <div className="grid grid-cols-3 gap-2">
-                        <div>
-                          <label className="text-[11px] sm:text-xs font-medium text-slate-500 block">商品款號</label>
-                          <input
-                            type="text"
-                            placeholder="A01"
-                            value={currentItem.sku}
-                            onChange={(e) => setCurrentItem({ ...currentItem, sku: e.target.value })}
-                            className="w-full text-xs sm:text-sm p-2 rounded-md border border-slate-200 bg-white"
-                          />
-                        </div>
-                        <div className="col-span-2">
-                          <label className="text-[11px] sm:text-xs font-medium text-slate-500 block">商品名稱 *</label>
-                          <input
-                            type="text"
-                            placeholder="例如：韓系純棉 T 恤"
-                            value={currentItem.name}
-                            onChange={(e) => setCurrentItem({ ...currentItem, name: e.target.value })}
-                            className="w-full text-xs sm:text-sm p-2 rounded-md border border-slate-200 bg-white"
-                          />
-                        </div>
-                      </div>
+                    {/* Selected Item Editor（2xl 以上改放右側作業欄，見 itemEditorBlock） */}
+                    {!isWideLayout && itemEditorBlock}
 
-                      {/* [v2.13.4] 相似商品建議：手動輸入商品名稱、停頓後跟商品庫比對；點選後完整套用商品庫資料(比照從商品庫選取) */}
-                      {nameSuggestions.length > 0 && (
-                        <div className="bg-amber-50 border border-amber-200 rounded-lg p-2.5 space-y-1.5">
-                          <p className="text-[11px] text-amber-700 font-medium">💡 商品庫有相似商品，點選可帶入完整商品資料：</p>
-                          <div className="flex flex-wrap gap-1.5">
-                            {nameSuggestions.map(({ product, score }) => (
-                              <button
-                                key={product.id}
-                                type="button"
-                                onClick={() => handleApplySuggestedProduct(product)}
-                                className="px-2.5 py-1 text-xs font-medium bg-white border border-amber-300 rounded-lg text-amber-800 hover:bg-amber-100"
-                              >
-                                {product.name}{product.sku ? `（${product.sku}）` : ''} · {Math.round(score * 100)}%
-                              </button>
-                            ))}
-                          </div>
-                        </div>
-                      )}
-
-                      {selectedProductRef && splitProductOptions(selectedProductRef.colors).length > 1 && (
-                        <div>
-                          <label className="text-[11px] sm:text-xs font-medium text-slate-500 block mb-1">顏色快捷點選</label>
-                          <div className="flex flex-wrap gap-1.5">
-                            {splitProductOptions(selectedProductRef.colors).map((clr) => (
-                              <button
-                                key={clr}
-                                type="button"
-                                onClick={() => setCurrentItem({ ...currentItem, color: clr })}
-                                className={`px-3 py-1 text-xs font-bold rounded-lg border transition ${
-                                  currentItem.color === clr
-                                    ? 'bg-slate-800 text-white border-slate-800'
-                                    : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-100'
-                                }`}
-                              >
-                                {clr}
-                              </button>
-                            ))}
-                          </div>
-                        </div>
-                      )}
-
-                      <div className="grid grid-cols-2 gap-2">
-                        <div>
-                          <label className="text-[11px] sm:text-xs font-medium text-slate-500 block">顏色款式</label>
-                          <input
-                            type="text"
-                            placeholder="黑色 / 白色"
-                            value={currentItem.color}
-                            onChange={(e) => setCurrentItem({ ...currentItem, color: e.target.value })}
-                            className="w-full text-xs sm:text-sm p-2 rounded-md border border-slate-200 bg-white"
-                          />
-                        </div>
-                        <div>
-                          <label className="text-[11px] sm:text-xs font-medium text-slate-500 block">單價 ($)</label>
-                          <input
-                            type="number"
-                            value={currentItem.price}
-                            onChange={(e) => setCurrentItem({ ...currentItem, price: Math.max(0, Number(e.target.value)) })}
-                            className="w-full text-xs sm:text-sm p-2 rounded-md border border-slate-200 bg-white"
-                          />
-                          {/* [v2.13.4] 單價比商品庫定價低時即時提醒，避免不小心改低價吃掉利潤 */}
-                          {selectedProductRef && Number(currentItem.price) < Number(selectedProductRef.price || 0) && (
-                            <p className="text-[11px] text-red-600 mt-1">⚠️ 比商品庫定價 ${selectedProductRef.price} 低，請確認金額</p>
-                          )}
-                        </div>
-                      </div>
-
-
-                      {/* Size Quick Select */}
-                      <div>
-                        <label className="text-[11px] sm:text-xs font-medium text-slate-500 block mb-1">尺寸快捷點選</label>
-                        <div className="flex flex-wrap gap-1.5">
-                          {(selectedProductRef ? splitProductOptions(selectedProductRef.sizes) : ['S', 'M', 'L', 'XL', 'F']).map((sz) => {
-                            const cleanSz = sz.trim();
-                            if (!cleanSz) return null;
-                            const isSelected = currentItem.size === cleanSz;
-                            return (
-                              <button
-                                key={cleanSz}
-                                type="button"
-                                onClick={() => setCurrentItem({ ...currentItem, size: cleanSz })}
-                                className={`px-3 py-1 text-xs font-bold rounded-lg border transition ${
-                                  isSelected
-                                    ? 'bg-slate-800 text-white border-slate-800'
-                                    : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-100'
-                                }`}
-                              >
-                                {cleanSz}
-                              </button>
-                            );
-                          })}
-                        </div>
-                      </div>
-
-                      {/* Quantity Controls */}
-                      <div className="flex items-center justify-between pt-1">
-                        <span className="text-xs sm:text-sm font-medium text-slate-600">購買數量</span>
-                        <div className="flex items-center gap-2">
-                          <button
-                            type="button"
-                            onClick={() => setCurrentItem(p => ({ ...p, qty: Math.max(1, p.qty - 1) }))}
-                            className="w-8 h-8 rounded-lg bg-white border border-slate-200 text-slate-600 flex items-center justify-center font-bold active:bg-slate-100"
-                          >
-                            -
-                          </button>
-                          <input
-                            type="number"
-                            value={currentItem.qty}
-                            onChange={(e) => setCurrentItem({ ...currentItem, qty: Math.max(1, Number(e.target.value)) })}
-                            className="w-12 text-center text-xs sm:text-sm font-bold p-1 rounded-md border border-slate-200 bg-white"
-                          />
-                          <button
-                            type="button"
-                            onClick={() => setCurrentItem(p => ({ ...p, qty: p.qty + 1 }))}
-                            className="w-8 h-8 rounded-lg bg-white border border-slate-200 text-slate-600 flex items-center justify-center font-bold active:bg-slate-100"
-                          >
-                            +
-                          </button>
-                        </div>
-                      </div>
-
-                      <button
-                        type="button"
-                        onClick={handleAddItemToOrder}
-                        className="w-full py-2.5 bg-slate-800 hover:bg-slate-900 text-white text-xs sm:text-sm font-bold rounded-lg shadow-sm transition flex items-center justify-center gap-1"
-                      >
-                        <IconPlus size={16} />
-                        加入此訂單品項
-                      </button>
-                    </div>
-
-                    {/* Added Items List（2xl 以上改顯示在右側獨立欄，這裡隱藏） */}
-                    {orderItems.length > 0 && (
-                      <div className="space-y-2 pt-2 border-t border-slate-100 2xl:hidden">
+                    {/* Added Items List（2xl 以上改顯示在右側作業欄） */}
+                    {!isWideLayout && orderItems.length > 0 && (
+                      <div className="space-y-2 pt-2 border-t border-slate-100">
                         <span className="text-xs sm:text-sm font-bold text-slate-600 block">已加入商品 ({orderItems.length})</span>
                         <div className="space-y-1.5 max-h-48 overflow-y-auto pr-1">
                           {addedItemRows}
@@ -8410,18 +8431,26 @@
                     )}
                   </div>
 
-                  {/* [v2.14.10] 2xl 以上：已加入商品＋總額＋送出鈕，固定在右側獨立一欄；2xl 以下維持原本直排 */}
-                  <div className="2xl:col-span-3 2xl:sticky 2xl:top-24 2xl:flex 2xl:flex-col 2xl:gap-4 2xl:max-h-[calc(100vh_-_7rem)]">
-                    <div className="hidden 2xl:flex flex-col gap-2 min-h-0 bg-white rounded-2xl p-4 sm:p-5 border border-slate-200/80 shadow-sm">
-                      <span className="text-xs sm:text-sm font-bold text-slate-600 block">已加入商品 ({orderItems.length})</span>
-                      {orderItems.length === 0 ? (
-                        <p className="text-center text-xs text-slate-400 py-6">尚未加入商品，請從中間挑選商品後按「加入此訂單品項」</p>
-                      ) : (
-                        <div className="space-y-1.5 min-h-0 flex-1 overflow-y-auto pr-1">
-                          {addedItemRows}
+                  {/* [v2.14.11] 2xl 以上：右側作業欄（商品規格輸入 → 已加入商品 → 總額與送出鈕），捲動時固定；2xl 以下維持原本直排 */}
+                  <div className="2xl:col-span-4 2xl:sticky 2xl:top-24 2xl:flex 2xl:flex-col 2xl:gap-4 2xl:max-h-[calc(100vh_-_7rem)] 2xl:overflow-y-auto">
+                    {isWideLayout && (
+                      <>
+                        <div className="bg-white rounded-2xl p-4 sm:p-5 border border-slate-200/80 shadow-sm space-y-3 shrink-0">
+                          <h2 className="text-xs sm:text-sm font-bold text-slate-700 border-b border-slate-100 pb-2.5">3. 規格與數量</h2>
+                          {itemEditorBlock}
                         </div>
-                      )}
-                    </div>
+                        <div className="flex flex-col gap-2 flex-1 min-h-[8rem] bg-white rounded-2xl p-4 sm:p-5 border border-slate-200/80 shadow-sm">
+                          <span className="text-xs sm:text-sm font-bold text-slate-600 block">已加入商品 ({orderItems.length})</span>
+                          {orderItems.length === 0 ? (
+                            <p className="text-center text-xs text-slate-400 py-4">尚未加入商品，點中間的商品後按「加入此訂單品項」</p>
+                          ) : (
+                            <div className="space-y-1.5 min-h-0 flex-1 overflow-y-auto pr-1">
+                              {addedItemRows}
+                            </div>
+                          )}
+                        </div>
+                      </>
+                    )}
 
                     {/* Summary & Submit */}
                     <div className="bg-white rounded-2xl p-4 sm:p-5 border border-slate-200/80 shadow-sm space-y-3 2xl:shrink-0">
