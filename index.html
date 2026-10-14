@@ -59,7 +59,7 @@
     // ==========================================
     // config.js — 版本號 / Firebase設定 / 常數設定值
     // ==========================================
-    const APP_VERSION = '2.14.24';
+    const APP_VERSION = '2.14.25';
 
     // [v2.14.18] 尺寸系列：新增訂單與商品庫的尺寸快捷選項。存進資料庫的仍是「80, 90, 100」這種逗號字串，系列只是輸入輔助。
     // 要增減尺寸只改這裡；統一存大寫（與既有資料、sortSizes 的排序表一致）。
@@ -1717,6 +1717,138 @@
       });
 
       return drafts;
+    };
+
+    // ==========================================
+    // [v2.14.10] 賣貨便「批次新增商品範本」（雙規格商品匯入）→ 商品庫
+    // 賣貨便一列＝一個商品，主規格（款式／顏色）與子規格（尺寸）各自用換行放多個值，
+    // 剛好對應商品庫「一個商品＋逗號分隔的 colors／sizes」，不需要展開成多筆。
+    // 本區只做「轉接」：輸出成 buildImportProducts 看得懂的虛擬列（商品名稱／價格／尺寸／顏色／備註），
+    // 後面的歸納、款號編號、分類推斷全部沿用既有流程，buildImportProducts 本身沒有改動。
+    // ==========================================
+    const MAIHUOBIAN_DUAL_SHEET_NAME = '雙規格商品匯入';
+
+    // 商品名稱比對用的鍵（與 buildImportProducts 判斷「商品庫已有同名商品」的規則一致）
+    const normalizeProductNameKey = (name) => String(name || '').trim().toLowerCase();
+
+    // 讀「雙規格商品匯入」分頁。依標題文字找欄位（不寫死 A／E／G／I），標題列不一定在第 1 列。
+    // 回傳 null＝沒有這個分頁；回傳 { error } 或 { rows, warnings }
+    const parseMaihuobianDual = (workbook) => {
+      const ws = workbook && workbook.Sheets ? workbook.Sheets[MAIHUOBIAN_DUAL_SHEET_NAME] : null;
+      if (!ws) return null;
+
+      const grid = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
+      const norm = (v) => String(v ?? '').replace(/[*＊\s]/g, '');
+      const headerIdx = grid.findIndex(r =>
+        r.some(c => norm(c) === '商品名稱') && r.some(c => norm(c) === '主規格')
+      );
+      if (headerIdx < 0) return { error: '找不到標題列（需要有「商品名稱」與「主規格」欄）' };
+
+      const h = grid[headerIdx].map(norm);
+      const cName = h.indexOf('商品名稱');
+      const cMain = h.indexOf('主規格');
+      const cMainName = h.indexOf('主規格名稱');
+      const cSub = h.indexOf('子規格');
+      const cSubName = h.indexOf('子規格名稱');
+      const cPrice = h.indexOf('價格');
+      const cDesc = h.findIndex(x => x.startsWith('商品描述'));
+      if (cSub < 0 || cPrice < 0) return { error: '找不到「子規格」或「價格」欄' };
+
+      const lines = (v) => {
+        const out = [];
+        String(v ?? '').split(/\r?\n/).map(x => x.trim()).filter(Boolean).forEach(x => {
+          if (!out.includes(x)) out.push(x);
+        });
+        return out;
+      };
+
+      const rows = [];
+      const warnings = [];
+      grid.slice(headerIdx + 1).forEach((r) => {
+        const name = String(r[cName] ?? '').trim();
+        if (!name) return;                                   // 範本留白的列
+        const colors = lines(r[cMain]);
+        const sizes = lines(r[cSub]);
+        const price = r[cPrice];
+        if (colors.length === 0 || sizes.length === 0) {
+          warnings.push(`「${name}」缺少${colors.length === 0 ? '主規格' : ''}${colors.length === 0 && sizes.length === 0 ? '、' : ''}${sizes.length === 0 ? '子規格' : ''}`);
+        }
+        if (cSubName >= 0) {
+          const subName = String(r[cSubName] ?? '').trim();
+          if (subName && subName !== '尺寸') warnings.push(`「${name}」子規格名稱是「${subName}」，仍當成尺寸匯入`);
+        }
+        if (!parseCleanNumber(price)) warnings.push(`「${name}」價格是 0 或空白`);
+        rows.push({
+          '商品名稱': name,
+          '價格': price,
+          '尺寸': sizes.join(', '),
+          '顏色': colors.join(', '),
+          '備註': cDesc >= 0 ? String(r[cDesc] ?? '').replace(/\r\n?/g, '\n').trim() : ''
+        });
+      });
+
+      if (rows.length === 0) return { error: '沒有讀到任何商品（商品名稱欄是空的）' };
+      return { rows, warnings };
+    };
+
+    // 把「新增／取代」套用到單一規格欄位（顏色或尺寸）。
+    //   mode 'add'：現有的保留，只補上 Excel 裡現有沒有的；'replace'：整組換成 Excel 的；'skip'：不動
+    //   placeholder：現有值若「只有」預設佔位字（顏色'預設'、尺寸'F'），新增時不保留它
+    //   Excel 這欄是空的（incoming 為空）→ 一律不動，避免把現有規格清空
+    const mergeSpecField = (existingStr, incoming, mode, placeholder, sortIt) => {
+      const oldList = splitProductOptions(existingStr);
+      const oldValue = oldList.join(', ');
+      const unchanged = { value: String(existingStr || ''), changed: false, added: [] };
+      if (mode === 'skip' || !incoming || incoming.length === 0) return unchanged;
+
+      if (mode === 'replace') {
+        const list = sortIt ? sortSizes(incoming) : [...incoming];
+        const value = list.join(', ');
+        return { value, changed: value !== oldValue, added: incoming.filter(x => !oldList.includes(x)) };
+      }
+
+      const base = (oldList.length === 1 && oldList[0] === placeholder) ? [] : oldList;
+      const added = incoming.filter(x => !base.includes(x));
+      if (added.length === 0 && base.length === oldList.length) return unchanged;
+      const list = sortIt ? sortSizes([...base, ...added]) : [...base, ...added];
+      return { value: list.join(', '), changed: true, added };
+    };
+
+    // 規劃「商品庫已有同名商品」的規格更新（純函式，不碰資料庫）。
+    //   rawRows：parseMaihuobianDual 輸出的虛擬列；modes：{ [名稱鍵]: 'add'|'replace'|'skip' }，沒指定視為 'add'
+    //   只動 colors／sizes，不動價格、備註、款號等其他欄位。
+    const buildExistingSpecPlans = (rawRows, existingProducts, modes, smartSort) => {
+      const groups = new Map();
+      (rawRows || []).forEach((row) => {
+        const name = cleanImportCell(row['商品名稱']);
+        if (!name) return;
+        const key = normalizeProductNameKey(name);
+        if (!groups.has(key)) groups.set(key, { colors: [], sizes: [] });
+        const g = groups.get(key);
+        splitImportList(cleanImportCell(row['顏色'])).forEach(c => { if (!g.colors.includes(c)) g.colors.push(c); });
+        splitImportList(cleanImportCell(row['尺寸'])).forEach(s => { if (!g.sizes.includes(s)) g.sizes.push(s); });
+      });
+
+      const plans = [];
+      groups.forEach((g, key) => {
+        const ex = (existingProducts || []).find(p => normalizeProductNameKey(p.name) === key);
+        if (!ex) return;
+        const mode = (modes && modes[key]) || 'add';
+        const colors = mergeSpecField(ex.colors, g.colors, mode, '預設', false);
+        const sizes = mergeSpecField(ex.sizes, g.sizes, mode, 'F', Boolean(smartSort));
+        plans.push({
+          key,
+          id: ex.id,
+          name: ex.name,
+          mode,
+          oldColors: ex.colors || '',
+          oldSizes: ex.sizes || '',
+          newColors: colors.value,
+          newSizes: sizes.value,
+          changed: colors.changed || sizes.changed
+        });
+      });
+      return plans;
     };
 
     // ==========================================
@@ -5542,21 +5674,31 @@
 
     // [Phase 1] 商品 Excel 匯入預覽彈窗
     function ProductImportModal({ pi }) {
-      const { handleCloseImportModal, handleConfirmBatchImport, importFileName, importHeaders, importOptions, importRawRows, isImportModalOpen, isProductImporting, parsedImportProducts, setImportOptions } = pi;
+      const { handleCloseImportModal, handleConfirmBatchImport, importFileName, importHeaders, importMeta, importOptions, importRawRows, importUpdatePlans, isImportModalOpen, isProductImporting, parsedImportProducts, setAllImportExistingModes, setImportExistingMode, setImportOptions } = pi;
       return (
         <>
           {/* Import Preview Modal (V2.1.1 智慧歸納) */}
           {isImportModalOpen && (() => {
+            // [v2.14.10] 賣貨便範本來源：同名商品不是單純略過，而是讓使用者選「新增／取代／略過」規格
+            const isMhb = Boolean(importMeta && importMeta.source === 'maihuobian');
+            const planMap = new Map((importUpdatePlans || []).map(x => [x.key, x]));
             const importableCount = parsedImportProducts.filter(p => p.willImport).length;
             const existingCount = parsedImportProducts.filter(p => p.isExisting).length;
-            const optionItems = [
+            const updateCount = (importUpdatePlans || []).filter(x => x.mode !== 'skip' && x.changed).length;
+            const totalCount = importableCount + updateCount;
+            const warnings = (isMhb && importMeta.warnings) ? importMeta.warnings : [];
+            const allOptionItems = [
               { key: 'autoExtract', title: '⚡ 智慧拆解名稱', desc: '-藏青90 → 顏色藏青 / 尺寸90' },
               { key: 'groupBySeries', title: '📦 歸納同系列規格', desc: '同品名合併多尺寸多顏色' },
               { key: 'smartSort', title: '📐 尺寸智慧排序', desc: 'XS→S→M 或 66→80→90' },
               { key: 'autoCategory', title: '🧠 關鍵字分類推斷', desc: '服飾 / 鞋包配飾 / 母嬰' },
               { key: 'skipExisting', title: '🛡️ 略過已有同名商品', desc: '避免重複匯入' },
-              { key: 'importNote', title: '📝 匯入備註欄', desc: '訂購單的備註是訂單備註，通常不用勾' }
+              { key: 'importNote', title: '📝 匯入備註欄', desc: isMhb ? '賣貨便的商品描述（材質等）→ 商品備註' : '訂購單的備註是訂單備註，通常不用勾' }
             ];
+            // 賣貨便來源固定不拆解名稱、同名商品改由下方逐項選擇，所以這兩個選項不顯示
+            const optionItems = isMhb
+              ? allOptionItems.filter(o => o.key !== 'autoExtract' && o.key !== 'skipExisting')
+              : allOptionItems;
 
             return (
               <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-sm flex items-center justify-center p-4 overflow-y-auto">
@@ -5565,7 +5707,7 @@
                     <div className="min-w-0">
                       <h3 className="font-bold text-base flex items-center gap-2">
                         <IconFileSpreadsheet size={18} className="text-emerald-400" />
-                        Excel 商品智慧歸納預覽
+                        {isMhb ? '賣貨便範本匯入預覽' : 'Excel 商品智慧歸納預覽'}
                       </h3>
                       <p className="text-xs text-slate-300 truncate">
                         {importFileName} · 讀到 {importRawRows.length} 列 → 歸納出 {parsedImportProducts.length} 項商品
@@ -5594,6 +5736,34 @@
                       </label>
                     ))}
                   </div>
+
+                  {isMhb && warnings.length > 0 && (
+                    <div className="bg-amber-50 border-b border-amber-200 px-4 py-2.5 text-xs text-amber-900 space-y-0.5">
+                      <div className="font-bold flex items-center gap-1.5">
+                        <IconAlertTriangle size={14} />
+                        範本內容有 {warnings.length} 項需要留意（仍可匯入）
+                      </div>
+                      {warnings.slice(0, 5).map((w, i) => <div key={i}>・{w}</div>)}
+                      {warnings.length > 5 && <div>…另有 {warnings.length - 5} 項</div>}
+                    </div>
+                  )}
+
+                  {isMhb && existingCount > 0 && (
+                    <div className="bg-blue-50 border-b border-blue-200 px-4 py-3 text-xs text-blue-900 space-y-2">
+                      <div className="font-bold">商品庫已有 {existingCount} 項同名商品，請選擇規格的處理方式：</div>
+                      <div className="space-y-0.5 text-[11px] leading-relaxed">
+                        <div><strong>新增</strong>：保留現有顏色／尺寸，只補上 Excel 裡現有沒有的</div>
+                        <div><strong>取代</strong>：整組換成 Excel 的顏色／尺寸（現有的會被覆蓋）</div>
+                        <div><strong>略過</strong>：這項完全不動。價格、備註、款號等其他欄位一律不會更動。</div>
+                      </div>
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <span className="font-bold">全部：</span>
+                        <button type="button" onClick={() => setAllImportExistingModes('add')} className="px-2.5 py-1 bg-white border border-blue-300 rounded-lg font-bold hover:bg-blue-100">新增</button>
+                        <button type="button" onClick={() => setAllImportExistingModes('replace')} className="px-2.5 py-1 bg-white border border-blue-300 rounded-lg font-bold hover:bg-blue-100">取代</button>
+                        <button type="button" onClick={() => setAllImportExistingModes('skip')} className="px-2.5 py-1 bg-white border border-blue-300 rounded-lg font-bold hover:bg-blue-100">略過</button>
+                      </div>
+                    </div>
+                  )}
 
                   {parsedImportProducts.length === 0 ? (
                     <div className="p-5">
@@ -5626,20 +5796,47 @@
                           </tr>
                         </thead>
                         <tbody className="divide-y divide-slate-100">
-                          {parsedImportProducts.map((p, idx) => (
-                            <tr key={idx} className={`hover:bg-slate-50 ${p.willImport ? '' : 'opacity-50'}`}>
-                              <td className="p-2.5 font-mono text-emerald-600 font-semibold">{p.sku || '-'}</td>
+                          {parsedImportProducts.map((p, idx) => {
+                            const plan = (isMhb && p.isExisting) ? planMap.get(String(p.name || '').trim().toLowerCase()) : null;
+                            const planActive = plan ? (plan.mode !== 'skip' && plan.changed) : false;
+                            const rowDim = plan ? !planActive : !p.willImport;
+                            const shownSizes = plan ? (plan.mode === 'skip' ? plan.oldSizes : plan.newSizes) : p.sizes;
+                            const shownColors = plan ? (plan.mode === 'skip' ? plan.oldColors : plan.newColors) : p.colors;
+                            return (
+                            <tr key={idx} className={`hover:bg-slate-50 ${rowDim ? 'opacity-50' : ''}`}>
+                              <td className="p-2.5 font-mono text-emerald-600 font-semibold">{plan ? (p.sku || '現有') : (p.sku || '-')}</td>
                               <td className="p-2.5 font-bold text-slate-800">{p.name}</td>
                               <td className="p-2.5 font-semibold">${p.price}</td>
                               <td className="p-2.5">
-                                <span className="bg-amber-50 text-amber-700 font-semibold px-2 py-0.5 rounded border border-amber-200 inline-block">{p.sizes}</span>
+                                <span className="bg-amber-50 text-amber-700 font-semibold px-2 py-0.5 rounded border border-amber-200 inline-block">{shownSizes}</span>
+                                {plan && planActive && plan.newSizes !== plan.oldSizes && (
+                                  <div className="text-[10px] text-slate-400 mt-0.5">現有：{plan.oldSizes || '（空）'}</div>
+                                )}
                               </td>
                               <td className="p-2.5">
-                                <span className="bg-blue-50 text-blue-700 font-semibold px-2 py-0.5 rounded border border-blue-200 inline-block">{p.colors}</span>
+                                <span className="bg-blue-50 text-blue-700 font-semibold px-2 py-0.5 rounded border border-blue-200 inline-block">{shownColors}</span>
+                                {plan && planActive && plan.newColors !== plan.oldColors && (
+                                  <div className="text-[10px] text-slate-400 mt-0.5">現有：{plan.oldColors || '（空）'}</div>
+                                )}
                               </td>
                               <td className="p-2.5 text-slate-500">{p.category}</td>
                               <td className="p-2.5">
-                                {p.isExisting ? (
+                                {plan ? (
+                                  <div className="space-y-1">
+                                    <select
+                                      value={plan.mode}
+                                      onChange={(e) => setImportExistingMode(plan.key, e.target.value)}
+                                      className="text-[11px] border border-slate-300 rounded-lg px-1.5 py-1 bg-white font-bold text-slate-700"
+                                    >
+                                      <option value="add">新增</option>
+                                      <option value="replace">取代</option>
+                                      <option value="skip">略過</option>
+                                    </select>
+                                    <div className="text-[10px] text-slate-500">
+                                      {plan.mode === 'skip' ? '不更動' : (plan.changed ? '會更新規格' : '規格已相同，無變更')}
+                                    </div>
+                                  </div>
+                                ) : p.isExisting ? (
                                   <span className="text-[11px] bg-slate-200 text-slate-600 px-2 py-0.5 rounded-full font-bold">
                                     {p.willImport ? '已有（仍匯入）' : '已有，略過'}
                                   </span>
@@ -5651,7 +5848,8 @@
                                 )}
                               </td>
                             </tr>
-                          ))}
+                            );
+                          })}
                         </tbody>
                       </table>
                     </div>
@@ -5659,7 +5857,11 @@
 
                   <div className="p-4 bg-slate-50 border-t border-slate-100 flex items-center justify-between gap-2">
                     <span className="text-xs text-slate-500">
-                      預計匯入 <strong className="text-emerald-600 text-sm">{importableCount}</strong> 項，寫入 Firebase 商品庫
+                      {isMhb ? (
+                        <>預計新增 <strong className="text-emerald-600 text-sm">{importableCount}</strong> 項商品、更新 <strong className="text-blue-600 text-sm">{updateCount}</strong> 項規格，寫入 Firebase 商品庫</>
+                      ) : (
+                        <>預計匯入 <strong className="text-emerald-600 text-sm">{importableCount}</strong> 項，寫入 Firebase 商品庫</>
+                      )}
                     </span>
                     <div className="flex gap-2">
                       <button
@@ -5671,12 +5873,12 @@
                       </button>
                       <button
                         type="button"
-                        disabled={importableCount === 0 || isProductImporting}
+                        disabled={totalCount === 0 || isProductImporting}
                         onClick={handleConfirmBatchImport}
                         className="px-5 py-2 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed text-white font-semibold rounded-xl text-xs sm:text-sm transition shadow flex items-center gap-1.5"
                       >
                         <IconCheck size={18} />
-                        {isProductImporting ? '寫入中...' : `確認匯入 ${importableCount} 項`}
+                        {isProductImporting ? '寫入中...' : `確認匯入 ${totalCount} 項`}
                       </button>
                     </div>
                   </div>
@@ -5870,7 +6072,7 @@
                       <label className="cursor-pointer flex flex-col md:flex-row items-center justify-center gap-1 px-2 py-2.5 md:px-3 md:py-2 bg-slate-800 hover:bg-slate-900 text-white font-semibold text-[11px] md:text-sm rounded-xl shadow transition whitespace-nowrap">
                         <IconDownload size={18} />
                         匯入 Excel
-                        <input type="file" accept=".xlsx, .xls, .csv" onChange={handleFileUpload} className="hidden" />
+                        <input type="file" accept=".xlsx, .xls, .csv, .xlsm" onChange={handleFileUpload} className="hidden" />
                       </label>
 
                       <button
@@ -7051,6 +7253,8 @@
       const [importOptions, setImportOptions] = React.useState(DEFAULT_IMPORT_OPTIONS);
       const [isProductImporting, setIsProductImporting] = React.useState(false);
       const [isImportModalOpen, setIsImportModalOpen] = React.useState(false);
+      const [importMeta, setImportMeta] = React.useState(null);                 // [v2.14.10] 來源說明：{ source: 'maihuobian', warnings: [...] }；一般 Excel 匯入為 null
+      const [importExistingModes, setImportExistingModes] = React.useState({});  // [v2.14.10] 賣貨便匯入時，同名商品的處理方式 { 名稱鍵: 'add'|'replace'|'skip' }
 
       // [V2.1] Order List Upgrade States
       const [editingOrder, setEditingOrder] = React.useState(null); // Order object or null
@@ -8731,6 +8935,23 @@
           try {
             const data = new Uint8Array(evt.target.result);
             const workbook = XLSX.read(data, { type: 'array' });
+
+            // [v2.14.10] 賣貨便「批次新增商品範本」：有「雙規格商品匯入」分頁就走專用轉接
+            // （這個範本標題列不在第 1 列，直接走一般流程會把說明文字當成商品）
+            const maihuobian = parseMaihuobianDual(workbook);
+            if (maihuobian) {
+              if (maihuobian.error) {
+                showToast(`❌ 賣貨便範本讀取失敗：${maihuobian.error}`);
+                return;
+              }
+              setImportMeta({ source: 'maihuobian', warnings: maihuobian.warnings });
+              setImportExistingModes({});
+              setImportOptions(prev => ({ ...prev, importNote: true }));   // 商品描述 → 商品備註（預覽視窗可取消勾選）
+              setImportRawRows(maihuobian.rows);
+              setIsImportModalOpen(true);
+              return;
+            }
+
             const sheetName = workbook.SheetNames[0];
             const sheet = workbook.Sheets[sheetName];
             const rawData = XLSX.utils.sheet_to_json(sheet, { defval: '' });
@@ -8742,6 +8963,7 @@
 
             // 先進預覽視窗，由視窗告訴使用者「認得哪些欄位、能匯入幾項」，
             // 就算欄位名稱認不得也不會只跳一句錯誤就結束。
+            setImportMeta(null);
             setImportRawRows(rawData);
             setIsImportModalOpen(true);
           } catch (err) {
@@ -8755,16 +8977,34 @@
         e.target.value = '';
       };
 
+      // [v2.14.10] 關閉匯入視窗時，把賣貨便來源的暫時設定還原（備註匯入勾選回到預設）
+      const resetImportSource = () => {
+        if (importMeta && importMeta.source === 'maihuobian') {
+          setImportOptions(prev => ({ ...prev, importNote: DEFAULT_IMPORT_OPTIONS.importNote }));
+        }
+        setImportMeta(null);
+        setImportExistingModes({});
+      };
+
       const handleCloseImportModal = () => {
         if (isProductImporting) return;
         setIsImportModalOpen(false);
         setImportRawRows([]);
+        resetImportSource();
       };
 
       const handleConfirmBatchImport = async () => {
         const toImport = parsedImportProducts.filter(p => p.willImport);
-        if (toImport.length === 0) {
+        // [v2.14.10] 賣貨便匯入：商品庫已有的同名商品，依使用者選的「新增／取代」更新顏色與尺寸
+        const toUpdate = isMaihuobianImport
+          ? importUpdatePlans.filter(x => x.mode !== 'skip' && x.changed && x.id)
+          : [];
+        if (toImport.length === 0 && toUpdate.length === 0) {
           showToast('沒有可匯入的新商品');
+          return;
+        }
+        const replaceCount = toUpdate.filter(x => x.mode === 'replace').length;
+        if (replaceCount > 0 && !window.confirm(`「取代」會用 Excel 的顏色與尺寸覆蓋 ${replaceCount} 項現有商品的規格（原本的規格無法自動還原）。確定要匯入嗎？`)) {
           return;
         }
         if (!requireConnection('匯入商品')) return;
@@ -8777,13 +9017,24 @@
             const newKey = dbRef('products').push().key;
             updates[newKey] = { ...prodData, createdAt, status: 'active' };
           });
+          // 既有商品只改 colors／sizes 兩個欄位（用路徑寫入，不會動到其他欄位）
+          toUpdate.forEach((x) => {
+            updates[`${x.id}/colors`] = x.newColors;
+            updates[`${x.id}/sizes`] = x.newSizes;
+          });
 
           // 一次性寫入，要嘛全成功、要嘛全失敗
           await withSyncTracking(dbRef('products').update(updates));
-          logAction('product_import', 'product', '', `匯入 Excel 商品 ${toImport.length} 項：${summarizeNames(toImport.map(p => p.name))}`);
-          showToast(`🎉 成功匯入 ${toImport.length} 項商品！`);
+          if (toUpdate.length === 0) {
+            logAction('product_import', 'product', '', `匯入 Excel 商品 ${toImport.length} 項：${summarizeNames(toImport.map(p => p.name))}`);
+            showToast(`🎉 成功匯入 ${toImport.length} 項商品！`);
+          } else {
+            logAction('product_import', 'product', '', `匯入賣貨便商品：新增 ${toImport.length} 項、更新規格 ${toUpdate.length} 項（取代 ${replaceCount} 項）：${summarizeNames([...toImport.map(p => p.name), ...toUpdate.map(x => x.name)])}`);
+            showToast(`🎉 新增 ${toImport.length} 項商品、更新 ${toUpdate.length} 項商品規格！`);
+          }
           setIsImportModalOpen(false);
           setImportRawRows([]);
+          resetImportSource();
         } catch (err) {
           console.error("Batch import error:", err);
           showToast('❌ 匯入過程發生錯誤，請檢查權限或網路連線');
@@ -8846,10 +9097,29 @@
       }, [enrichedProducts]);
 
       // [V2.1.1] 商品匯入預覽：原始列 + 勾選選項 → 商品清單
+      // [v2.14.10] 賣貨便來源：強制關閉「智慧拆解名稱」（會改寫含括號的品名）、強制略過同名（同名改走下面的規格更新規劃）
+      const isMaihuobianImport = Boolean(importMeta && importMeta.source === 'maihuobian');
       const parsedImportProducts = React.useMemo(() => {
         if (importRawRows.length === 0) return [];
-        return buildImportProducts(importRawRows, importOptions, products, trashProducts.map(p => p.sku));
-      }, [importRawRows, importOptions, products, trashProducts]);
+        const effectiveOptions = isMaihuobianImport
+          ? { ...importOptions, autoExtract: false, skipExisting: true }
+          : importOptions;
+        return buildImportProducts(importRawRows, effectiveOptions, products, trashProducts.map(p => p.sku));
+      }, [importRawRows, importOptions, products, trashProducts, isMaihuobianImport]);
+
+      const importUpdatePlans = React.useMemo(() => {
+        if (!isMaihuobianImport || importRawRows.length === 0) return [];
+        return buildExistingSpecPlans(importRawRows, products, importExistingModes, importOptions.smartSort);
+      }, [isMaihuobianImport, importRawRows, products, importExistingModes, importOptions.smartSort]);
+
+      const setImportExistingMode = (key, mode) => {
+        setImportExistingModes(prev => ({ ...prev, [key]: mode }));
+      };
+      const setAllImportExistingModes = (mode) => {
+        const next = {};
+        importUpdatePlans.forEach(x => { next[x.key] = mode; });
+        setImportExistingModes(next);
+      };
 
       const importHeaders = React.useMemo(() => {
         return importRawRows.length > 0 ? Object.keys(importRawRows[0]) : [];
@@ -9448,7 +9718,7 @@
 
           {/* Import Preview Modal → modal-product.js */}
           <ProductImportModal
-            pi={{ handleCloseImportModal, handleConfirmBatchImport, importFileName, importHeaders, importOptions, importRawRows, isImportModalOpen, isProductImporting, parsedImportProducts, setImportOptions }}
+            pi={{ handleCloseImportModal, handleConfirmBatchImport, importFileName, importHeaders, importMeta, importOptions, importRawRows, importUpdatePlans, isImportModalOpen, isProductImporting, parsedImportProducts, setAllImportExistingModes, setImportExistingMode, setImportOptions }}
           />
 
           {/* Header */}
