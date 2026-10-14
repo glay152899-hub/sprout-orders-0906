@@ -59,7 +59,7 @@
     // ==========================================
     // config.js — 版本號 / Firebase設定 / 常數設定值
     // ==========================================
-    const APP_VERSION = '2.14.22';
+    const APP_VERSION = '2.14.23';
 
     // [v2.14.18] 尺寸系列：新增訂單與商品庫的尺寸快捷選項。存進資料庫的仍是「80, 90, 100」這種逗號字串，系列只是輸入輔助。
     // 要增減尺寸只改這裡；統一存大寫（與既有資料、sortSizes 的排序表一致）。
@@ -2166,7 +2166,8 @@
       category: String(raw?.category || ''),
       note: String(raw?.note || ''),
       createdAt: Number(raw?.createdAt) || 0,
-      createdBy: String(raw?.createdBy || '')
+      createdBy: String(raw?.createdBy || ''),
+      imp: String(raw?.imp || '') // [v2.14.23] Excel 匯入的來源標記（例 'm:2026-09'），重新匯入時用來取代舊紀錄
     });
 
     // 有資料的月份（新到舊）；一定包含當月，讓空資料時畫面也有可選的月份
@@ -2329,6 +2330,196 @@
         .sort((a, b) => (a.date < b.date ? -1 : 1))
         .map(p => ({ '下單日': p.date, '商品金額（待入帳）': p.amount, '已等天數': financeDaysBetween(p.date, financeToday()) }));
       return { aoa, detail, pend, data };
+    };
+  </script>
+  <script type="text/babel">
+    // ==========================================
+    // utils-finance-import.js  (v2.14.23 新增，收支報表「匯入 Excel 收支表」)
+    // 讀取老婆的 Excel 收支表（月表、現貨表、年度總結）→ 收支紀錄＋與系統訂單營收的對帳預覽。純函式：不碰 state／Firebase／畫面。
+    // 輸入是 SheetJS（XLSX.read）讀出來的 workbook：wb.SheetNames、wb.Sheets[name]['B5'].v。
+    // 相依：utils-finance.js（常數與 isValidFinanceDate、financeToday）。
+    // 匯入時每筆紀錄帶 imp 標記（例：'m:2026-09'），重新匯入同一份時，先取代同標記的舊紀錄，不會重複。
+    // ==========================================
+
+    const FINANCE_IMPORT_LABELS = ['包材', '廣告', '進貨', '國際運費', '寄送運費'];
+    const FINANCE_IMPORT_BY = 'Excel匯入';
+    const FINANCE_LEGACY_BY = '歷史匯入';
+
+    const finColLetters = (n) => { let s = ''; while (n > 0) { const m = (n - 1) % 26; s = String.fromCharCode(65 + m) + s; n = Math.floor((n - 1) / 26); } return s; };
+    const finCell = (ws, r, c) => { const x = ws[finColLetters(c) + r]; return x ? x.v : undefined; };
+    const finNum = (v) => (typeof v === 'number' && isFinite(v) ? v : null);
+    const finSheetSize = (ws) => {
+      const m = /^([A-Z]+)(\d+):([A-Z]+)(\d+)$/.exec(String(ws['!ref'] || ''));
+      if (!m) return { maxR: 0, maxC: 0 };
+      const idx = (L) => L.split('').reduce((a, ch) => a * 26 + ch.charCodeAt(0) - 64, 0);
+      return { maxR: Number(m[4]), maxC: idx(m[3]) };
+    };
+    const finDaysIn = (y, m) => new Date(y, m, 0).getDate();
+    const finPad = (n) => String(n).padStart(2, '0');
+
+    const detectLedgerYear = (fileName, wb) => {
+      const m = /(20\d{2})/.exec(String(fileName || ''));
+      if (m) return Number(m[1]);
+      for (const n of wb.SheetNames) { const s = /(20\d{2})\s*年度總結/.exec(n); if (s) return Number(s[1]); }
+      return null;
+    };
+
+    const finEntry = (date, type, amount, category, note, imp) => ({ date, type, amount: Math.round(amount), category, note: note || '', imp });
+
+    // 一個「N月」工作表：上半是支出（每個項目一列、每天一格），下半「收入表」是每筆訂單的金額（只拿來對帳，不逐筆匯入）
+    const parseMonthSheet = (ws, year, month) => {
+      const { maxR, maxC } = finSheetSize(ws);
+      const lastCol = Math.min(maxC, 32); // B～AF＝1～31 日；AG 是整列合計，不能算進去
+      let incRow = null;
+      for (let r = 1; r <= maxR; r++) { const a = finCell(ws, r, 1); if (typeof a === 'string' && a.trim().endsWith('收入表')) { incRow = r; break; } }
+      if (incRow === null) return null;
+      const ym = `${year}-${finPad(month)}`, imp = `m:${ym}`, last = finDaysIn(year, month);
+      const entries = []; let cellExpense = 0; let cellIncome = 0; let incomeCells = 0;
+      for (let r = 1; r < incRow; r++) {
+        const label = finCell(ws, r, 1);
+        if (typeof label !== 'string' || ['總額', '項目', '日期', '支出表'].includes(label.trim())) continue;
+        const lab = label.trim();
+        for (let c = 2; c <= lastCol; c++) {
+          const v = finNum(finCell(ws, r, c));
+          if (!v) continue;
+          let day = c - 1, note = FINANCE_IMPORT_LABELS.includes(lab) ? '' : lab;
+          if (day > last) { note = `${note} 原記在${day}日`.trim(); day = last; }
+          cellExpense += v;
+          entries.push(finEntry(`${ym}-${finPad(day)}`, 'out', v, FINANCE_IMPORT_LABELS.includes(lab) ? lab : '其他支出', note, imp));
+        }
+      }
+      for (let r = incRow + 1; r <= maxR; r++) {
+        const label = finCell(ws, r, 1);
+        if (label === '總額') break;
+        if (['日期', '訂單', '月份'].includes(label)) continue;
+        for (let c = 2; c <= lastCol; c++) { const v = finNum(finCell(ws, r, c)); if (v) { cellIncome += v; incomeCells++; } }
+      }
+      let totalExpense = null, totalIncome = null;
+      for (let r = 1; r <= maxR; r++) for (let c = 1; c <= lastCol; c++) {
+        if (finCell(ws, r, c) === '總計') { const v = finNum(finCell(ws, r, c + 1)); if (v !== null) { if (r < incRow) totalExpense = v; else totalIncome = v; } }
+      }
+      const warnings = [];
+      if (totalIncome !== null && Math.abs(totalIncome - cellIncome) > 0.5) warnings.push(`${month} 月收入「總計」(${Math.round(totalIncome)}) 與逐格加總 (${Math.round(cellIncome)}) 不同，疑似公式漏加；以「總計」為準`);
+      if (totalExpense !== null && Math.abs(totalExpense - cellExpense) > 0.5) warnings.push(`${month} 月支出「總計」(${Math.round(totalExpense)}) 與逐格加總 (${Math.round(cellExpense)}) 不同；以逐格明細匯入`);
+      return {
+        ym, entries, warnings, hasData: entries.length > 0 || incomeCells > 0,
+        excelIncome: totalIncome !== null ? totalIncome : cellIncome, excelExpense: totalExpense !== null ? totalExpense : cellExpense,
+        cellIncome, cellExpense
+      };
+    };
+
+    // 現貨表（髮飾、圍兜…各一張）：支出「進貨」那列的欄位＝月份；收入表的每一列＝月份、欄位＝日
+    const parseSpotSheet = (ws, sheetName, year) => {
+      const { maxR, maxC } = finSheetSize(ws);
+      const lastCol = Math.min(maxC, 32); // B～AF＝1～31 日；AG 是整列合計，不能算進去
+      let incRow = null;
+      for (let r = 1; r <= maxR; r++) { const a = finCell(ws, r, 1); if (typeof a === 'string' && a.trim().endsWith('收入表')) { incRow = r; break; } }
+      if (incRow === null) return null;
+      const imp = `s:${sheetName}:${year}`, entries = [];
+      for (let r = 1; r < incRow; r++) {
+        const lab = finCell(ws, r, 1);
+        if (!FINANCE_IMPORT_LABELS.includes(typeof lab === 'string' ? lab.trim() : '')) continue;
+        for (let c = 2; c <= 13; c++) { const v = finNum(finCell(ws, r, c)); if (v) entries.push(finEntry(`${year}-${finPad(c - 1)}-01`, 'out', v, lab.trim(), `${sheetName}（現貨表，月份記在當月1日）`, imp)); }
+      }
+      for (let r = incRow + 1; r <= maxR; r++) {
+        const mo = finNum(finCell(ws, r, 1));
+        if (!mo || mo < 1 || mo > 12) continue;
+        for (let c = 2; c <= lastCol; c++) {
+          const v = finNum(finCell(ws, r, c)); if (!v) continue;
+          const day = c - 1;
+          if (day > finDaysIn(year, mo)) continue;
+          entries.push(finEntry(`${year}-${finPad(mo)}-${finPad(day)}`, 'in', v, '現貨銷售', sheetName, imp));
+        }
+      }
+      return { sheetName, entries, imp };
+    };
+
+    // 年度總結裡的「圍兜」區塊（只有每月合計，沒有逐日明細）：A 欄標題（如「圍兜」）下一列是支出、再下一列是收入
+    const parseSummaryExtras = (ws, year) => {
+      const { maxR } = finSheetSize(ws);
+      const extras = [];
+      for (let r = 1; r < maxR - 1; r++) {
+        const title = finCell(ws, r, 1), l1 = finCell(ws, r + 1, 1), l2 = finCell(ws, r + 2, 1);
+        if (typeof title === 'string' && !['支出', '收入'].includes(title.trim()) && l1 === '支出' && l2 === '收入') {
+          const imp = `x:${title.trim()}:${year}`, entries = [];
+          for (let c = 2; c <= 13; c++) {
+            const last = finDaysIn(year, c - 1), date = `${year}-${finPad(c - 1)}-${finPad(last)}`;
+            const e = finNum(finCell(ws, r + 1, c)), i = finNum(finCell(ws, r + 2, c));
+            if (e) entries.push(finEntry(date, 'out', e, '進貨', `${title.trim()}（年度總表月彙總，無逐日明細）`, imp));
+            if (i) entries.push(finEntry(date, 'in', i, '現貨銷售', `${title.trim()}（年度總表月彙總，無逐日明細）`, imp));
+          }
+          if (entries.length) extras.push({ label: title.trim(), imp, entries });
+        }
+      }
+      return extras;
+    };
+
+    // 讀一份 Excel：回傳 { fileName, year, months:{ym:{...}}, spots:[...], extras:[...], warnings, kind }
+    const parseLedgerWorkbook = (wb, fileName, yearOverride) => {
+      const year = yearOverride || detectLedgerYear(fileName, wb);
+      const out = { fileName, year, months: {}, spots: [], extras: [], warnings: [], kind: 'unknown' };
+      if (!year) { out.warnings.push('無法從檔名判斷年份，請在下方選擇'); return out; }
+      wb.SheetNames.forEach((name) => {
+        const ws = wb.Sheets[name];
+        const mm = /^(\d{1,2})月$/.exec(name.trim());
+        if (mm) {
+          const m = Number(mm[1]);
+          if (m >= 1 && m <= 12) { const r = parseMonthSheet(ws, year, m); if (r) { out.months[r.ym] = r; out.warnings.push(...r.warnings); } }
+        } else if (/年度總結/.test(name)) {
+          out.extras.push(...parseSummaryExtras(ws, year));
+        } else if (name.trim() !== '原稿') {
+          const r = parseSpotSheet(ws, name.trim(), year); if (r && r.entries.length) out.spots.push(r);
+        }
+      });
+      const monthCount = Object.values(out.months).filter(x => x.hasData).length;
+      out.kind = monthCount > 0 ? 'monthly' : out.spots.length > 0 ? 'spot' : 'unknown';
+      if (out.kind === 'unknown') out.warnings.push('沒有辨識出月表或現貨表，請確認是老婆的收支表檔案');
+      return out;
+    };
+
+    // 對帳預覽：每個月 Excel 收入 vs 系統訂單營收（含待入帳，避免之後標已領貨時差額跑掉）
+    const buildImportPreview = (parsedList, sysByMonth) => {
+      const rows = [];
+      parsedList.forEach(p => Object.values(p.months).filter(x => x.hasData).forEach(m => {
+        const sys = Math.round(sysByMonth[m.ym] || 0);
+        rows.push({ ym: m.ym, excelIncome: Math.round(m.excelIncome), excelExpense: Math.round(m.excelExpense), sys, diff: Math.round(m.excelIncome) - sys, hasSystem: sys > 0 });
+      }));
+      return rows.sort((a, b) => (a.ym < b.ym ? -1 : 1));
+    };
+
+    // 產生寫入計畫：要新增的紀錄（id → 資料）與要先移除的舊紀錄 id
+    // adjSel: { ym: true/false } 是否為該月建立「營收調整」；includeExtras: { imp: true/false }；cleanLegacy：同時清掉 createdBy=歷史匯入 的舊紀錄
+    const planFinanceImport = ({ parsedList, existing, sysByMonth, adjSel, includeExtras, cleanLegacy, nowMs }) => {
+      const now = nowMs || Date.now();
+      const all = [];
+      parsedList.forEach(p => {
+        Object.values(p.months).forEach(m => all.push(...m.entries));
+        p.spots.forEach(s => all.push(...s.entries));
+        p.extras.forEach(x => { if (includeExtras && includeExtras[x.imp]) all.push(...x.entries); });
+      });
+      const preview = buildImportPreview(parsedList, sysByMonth || {});
+      const tags = new Set(all.map(e => e.imp));
+      preview.forEach(r => {
+        tags.add(`m:${r.ym}`);
+        if (adjSel && adjSel[r.ym] && r.diff !== 0) {
+          const [y, mo] = r.ym.split('-').map(Number);
+          all.push(finEntry(`${r.ym}-${finPad(finDaysIn(y, mo))}`, 'adj', r.diff, '營收調整', '歷史對帳：Excel 收入表與系統訂單營收的差額（團購／現貨／內退等）', `m:${r.ym}`));
+        }
+      });
+      // 穩定 id：日期＋類型＋類別＋流水號（同一份重新匯入，id 不變）
+      const CAT = { '進貨': 'a', '包材': 'b', '廣告': 'c', '國際運費': 'd', '寄送運費': 'e', '其他支出': 'f', '現貨銷售': 'g', '營收調整': 'h' };
+      const seen = {}; const writes = {};
+      all.slice().sort((a, b) => (a.date + a.type + a.category + a.note + a.amount < b.date + b.type + b.category + b.note + b.amount ? -1 : 1)).forEach(e => {
+        const base = `x${e.date.replace(/-/g, '')}${e.type[0]}${CAT[e.category] || 'z'}`;
+        seen[base] = (seen[base] || 0) + 1;
+        writes[`${base}${String(seen[base]).padStart(2, '0')}`] = { date: e.date, type: e.type, amount: e.amount, category: e.category, note: e.note, createdAt: now, createdBy: FINANCE_IMPORT_BY, imp: e.imp };
+      });
+      const removes = (existing || []).filter(e => (e.imp && tags.has(e.imp)) || (cleanLegacy && e.createdBy === FINANCE_LEGACY_BY)).map(e => e.id);
+      const count = (fn) => Object.values(writes).filter(fn).length;
+      return {
+        writes, removes, preview,
+        stats: { total: Object.keys(writes).length, expenses: count(e => e.type === 'out'), spotIncome: count(e => e.type === 'in'), adjusts: count(e => e.type === 'adj'), replaced: removes.length }
+      };
     };
   </script>
   <script type="text/babel">
@@ -6045,6 +6236,7 @@
     // props：user、onClose、showToast、logAction、withSyncTracking
     // [v2.14.11] 收入 = 訂單營收（自動，唯讀）＋手動收入＋營收調整；支出手動。
     //   訂單營收：切換日（FINANCE_ORDER_CUTOVER）前用 salesArchive、之後用 App 即時訂單 orders；棄單／取消排除
+    // [v2.14.23] 「匯入 Excel 收支表」：讀老婆的月表／現貨表，預覽與系統訂單營收的對帳差額後寫入（邏輯在 utils-finance-import.js）
     // [v2.14.20] 新增「年度」分頁：年度總表（每月收支＋分類×月份矩陣，同她 Excel 的年度總結）與匯出 Excel
     // [v2.14.13] 記帳日＝下單日。領貨制啟用日（FINANCE_PICKUP_START）之後下單的訂單要「已領貨」才入帳，未領貨列「待入帳」
     // props 另有 orders（App 即時訂單，唯讀）
@@ -6056,6 +6248,8 @@
       const [view, setView] = React.useState('overview'); // overview | detail | year | trash
       const [year, setYear] = React.useState(() => financeToday().slice(0, 4)); // 年度分頁選的年份
       const [showMatrix, setShowMatrix] = React.useState(false);
+      const [imp, setImp] = React.useState(null); // 匯入 Excel 的預覽狀態：null＝沒開；否則 { files, adjSel, extraSel, cleanLegacy, busy }
+      const importInputRef = React.useRef(null);
       const [month, setMonth] = React.useState(() => financeToday().slice(0, 7)); // 'YYYY-MM' | 'all'
       const [openDays, setOpenDays] = React.useState(() => new Set());
       const [form, setForm] = React.useState(null); // null = 不顯示；否則 { id?, type, date, amount, category, note }
@@ -6067,6 +6261,72 @@
       const yearData = React.useMemo(() => computeFinanceYear(entries, year), [entries, year]);
       const yearPending = React.useMemo(() => orderRevenue.pending.filter(x => x.date.slice(0, 4) === year), [orderRevenue, year]);
       const yearPendingTotal = yearPending.reduce((s, x) => s + x.amount, 0);
+
+      // ---- 匯入老婆的 Excel 收支表 ----
+      // 系統訂單營收（含待入帳，這樣之後把訂單標成已領貨，對帳差額不會跑掉）
+      const sysByMonth = React.useMemo(() => {
+        const m = {};
+        orderRevenue.entries.forEach(e => { const k = e.date.slice(0, 7); m[k] = (m[k] || 0) + e.amount; });
+        orderRevenue.pending.forEach(e => { const k = e.date.slice(0, 7); m[k] = (m[k] || 0) + e.amount; });
+        return m;
+      }, [orderRevenue]);
+      const legacyCount = manualEntries.filter(e => e.createdBy === FINANCE_LEGACY_BY).length;
+      const importParsed = React.useMemo(() => (imp ? imp.files.filter(f => f.parsed.kind !== 'unknown') .map(f => f.parsed) : []), [imp]);
+      const importPlan = React.useMemo(() => {
+        if (!imp || importParsed.length === 0) return null;
+        return planFinanceImport({ parsedList: importParsed, existing: manualEntries, sysByMonth, adjSel: imp.adjSel, includeExtras: imp.extraSel, cleanLegacy: imp.cleanLegacy });
+      }, [imp, importParsed, manualEntries, sysByMonth]);
+
+      const startImport = async (fileList) => {
+        const picked = Array.from(fileList || []);
+        if (picked.length === 0) return;
+        if (typeof XLSX === 'undefined') { showToast('❌ Excel 讀取元件尚未載入，請稍後再試'); return; }
+        const files = [];
+        for (const f of picked) {
+          try {
+            const wb = XLSX.read(await f.arrayBuffer(), { type: 'array' });
+            files.push({ name: f.name, wb, parsed: parseLedgerWorkbook(wb, f.name, null) });
+          } catch (err) {
+            console.error('Excel read error:', err);
+            showToast(`❌ 讀不了「${f.name}」，請確認是 .xlsx 檔`);
+          }
+        }
+        if (files.length === 0) return;
+        const parsedOk = files.filter(f => f.parsed.kind !== 'unknown').map(f => f.parsed);
+        const adjSel = {}; buildImportPreview(parsedOk, sysByMonth).forEach(r => { adjSel[r.ym] = r.hasSystem; });
+        const spotKeys = new Set(parsedOk.flatMap(p => p.spots.map(sp => sp.sheetName + ':' + p.year)));
+        const extraSel = {}; parsedOk.forEach(p => p.extras.forEach(x => { extraSel[x.imp] = !spotKeys.has(x.label + ':' + p.year); }));
+        setImp({ files, adjSel, extraSel, cleanLegacy: legacyCount > 0, busy: false });
+      };
+      const reparseWithYear = (idx, yearStr) => setImp(cur => {
+        const files = cur.files.map((f, i) => (i === idx ? { ...f, parsed: parseLedgerWorkbook(f.wb, f.name, Number(yearStr)) } : f));
+        const parsedOk = files.filter(f => f.parsed.kind !== 'unknown').map(f => f.parsed);
+        const adjSel = {}; buildImportPreview(parsedOk, sysByMonth).forEach(r => { adjSel[r.ym] = r.hasSystem; });
+        const extraSel = { ...cur.extraSel }; parsedOk.forEach(p => p.extras.forEach(x => { if (!(x.imp in extraSel)) extraSel[x.imp] = true; }));
+        return { ...cur, files, adjSel, extraSel };
+      });
+      const confirmImport = async () => {
+        if (!imp || !importPlan || imp.busy) return;
+        setImp(cur => ({ ...cur, busy: true }));
+        try {
+          const updates = {};
+          importPlan.removes.forEach(id => { updates[`finance/entries/${id}`] = null; });
+          Object.entries(importPlan.writes).forEach(([id, data]) => { updates[`finance/entries/${id}`] = data; });
+          const paths = Object.keys(updates);
+          for (let i = 0; i < paths.length; i += 300) {
+            const chunk = {}; paths.slice(i, i + 300).forEach(k => { chunk[k] = updates[k]; });
+            await withSyncTracking(dbRoot().update(chunk));
+          }
+          logAction('finance_import', 'finance', '', `匯入 Excel 收支表：新增 ${importPlan.stats.total} 筆、取代 ${importPlan.stats.replaced} 筆`);
+          showToast(`✅ 已匯入 ${importPlan.stats.total} 筆收支`);
+          setImp(null);
+          setView('year');
+        } catch (err) {
+          console.error('Finance import error:', err);
+          showToast('❌ 匯入失敗，請檢查網路或權限後再試（已寫入的部分重新匯入同一份即可，不會重複）');
+          setImp(cur => (cur ? { ...cur, busy: false } : cur));
+        }
+      };
 
       // 匯出該年度：總表（分類×月份）、收支明細、待入帳（有才有）三張工作表
       const handleExportYear = () => {
@@ -6254,6 +6514,8 @@
             </div>
           </div>
 
+          <input ref={importInputRef} type="file" accept=".xlsx,.xls" multiple className="hidden" onChange={(e) => { startImport(e.target.files); e.target.value = ''; }} />
+
           {/* Body */}
           <div className="flex-1 overflow-y-auto">
             <div className="max-w-3xl mx-auto p-4 space-y-4" style={{ paddingBottom: 'calc(env(safe-area-inset-bottom, 0px) + 96px)' }}>
@@ -6262,6 +6524,12 @@
 
               {!loading && view === 'overview' && (
                 <>
+                  {manualEntries.length === 0 && (
+                    <button type="button" onClick={() => importInputRef.current && importInputRef.current.click()} className="w-full text-left bg-white border border-dashed border-emerald-400 rounded-2xl p-4">
+                      <div className="font-bold text-sm text-emerald-700">📂 匯入老婆的 Excel 收支表</div>
+                      <div className="text-xs text-slate-500 mt-0.5">還沒有支出紀錄？選擇她的 2025／2026 收支表（月表、現貨表），先預覽再匯入。</div>
+                    </button>
+                  )}
                   <div className="grid grid-cols-2 gap-3">
                     <div className={`col-span-2 rounded-2xl p-4 text-white shadow ${netNegative ? 'bg-red-600' : 'bg-emerald-600'}`}>
                       <div className="text-xs opacity-80">{month === 'all' ? '全部期間' : month.replace('-', ' 年 ') + ' 月'} 淨收支</div>
@@ -6402,6 +6670,9 @@
                   <button type="button" onClick={handleExportYear} className="w-full py-3 rounded-xl text-sm font-bold bg-emerald-600 hover:bg-emerald-700 text-white shadow">
                     📥 匯出 {year} 年收支 Excel
                   </button>
+                  <button type="button" onClick={() => importInputRef.current && importInputRef.current.click()} className="w-full py-2.5 rounded-xl text-xs font-bold bg-white border border-slate-200 text-slate-600">
+                    📂 匯入老婆的 Excel 收支表
+                  </button>
 
                   <div className="bg-white rounded-2xl border border-slate-200/80 overflow-hidden">
                     <div className="grid grid-cols-[44px_1fr_1fr_1fr] gap-2 px-4 py-2 text-[11px] font-bold text-slate-400 bg-slate-50 border-b border-slate-100">
@@ -6505,6 +6776,108 @@
             >
               <IconPlus size={26} />
             </button>
+          )}
+
+          {/* 匯入 Excel 預覽（底部抽屜） */}
+          {imp && (
+            <div className="absolute inset-0 z-10 bg-slate-900/50 flex items-end sm:items-center justify-center" onClick={() => !imp.busy && setImp(null)}>
+              <div className={MORE_SHEET_CLASS} onClick={(e) => e.stopPropagation()}>
+                <div className="px-5 pt-4 pb-3 flex items-center justify-between border-b border-slate-100">
+                  <div>
+                    <h3 className="font-bold text-base text-slate-800">📂 匯入 Excel 收支表</h3>
+                    <p className="text-[11px] text-slate-400">只讀取檔案，不會改動她的原檔；確認前不會寫入任何資料</p>
+                  </div>
+                  <button type="button" disabled={imp.busy} onClick={() => setImp(null)} aria-label="關閉" className="p-1.5 text-slate-400 hover:text-slate-700 rounded-lg hover:bg-slate-100"><IconX size={22} /></button>
+                </div>
+
+                <div className="flex-1 overflow-y-auto p-5 space-y-4">
+                  {imp.files.map((f, idx) => (
+                    <div key={f.name + idx} className="rounded-xl border border-slate-200 p-3 space-y-1">
+                      <div className="text-sm font-bold text-slate-800 break-all">📄 {f.name}</div>
+                      {f.parsed.kind === 'unknown' ? (
+                        <div className="text-xs text-red-600">{f.parsed.year ? '沒有辨識出月表或現貨表，請確認是老婆的收支表。' : '無法從檔名判斷年份，請選擇年份：'}</div>
+                      ) : (
+                        <div className="text-xs text-slate-500">
+                          {f.parsed.year} 年・{f.parsed.kind === 'monthly' ? `月表（${Object.values(f.parsed.months).filter(x => x.hasData).length} 個月有資料）` : '現貨表'}
+                          {f.parsed.spots.length > 0 && `・現貨：${f.parsed.spots.map(sp => sp.sheetName).join('、')}`}
+                        </div>
+                      )}
+                      {!f.parsed.year && (
+                        <select defaultValue="" onChange={(e) => e.target.value && reparseWithYear(idx, e.target.value)} className="text-xs px-2 py-1 rounded-lg border border-slate-200 bg-white">
+                          <option value="">選擇年份…</option>
+                          {[2027, 2026, 2025, 2024].map(y => <option key={y} value={y}>{y} 年</option>)}
+                        </select>
+                      )}
+                    </div>
+                  ))}
+
+                  {importPlan && (() => {
+                    const warns = Array.from(new Set(importParsed.flatMap(p => p.warnings)));
+                    return warns.length > 0 ? (
+                      <div className="text-[11px] text-amber-800 bg-amber-50 border border-amber-200 rounded-xl px-3 py-2 space-y-0.5">
+                        <div className="font-bold">她的 Excel 有 {warns.length} 個需要注意的地方：</div>
+                        {warns.slice(0, 6).map((w, i) => <div key={i}>・{w}</div>)}
+                        {warns.length > 6 && <div>…另有 {warns.length - 6} 個</div>}
+                      </div>
+                    ) : null;
+                  })()}
+
+                  {importPlan && importPlan.preview.length > 0 && (
+                    <div className="space-y-1.5">
+                      <h4 className="text-sm font-bold text-slate-800">收入對帳（每月）</h4>
+                      <div className="rounded-xl border border-slate-200 overflow-hidden">
+                        <div className="grid grid-cols-[40px_1fr_1fr_1fr_36px] gap-1 px-3 py-2 text-[10px] font-bold text-slate-400 bg-slate-50 border-b border-slate-100">
+                          <span>月份</span><span className="text-right">Excel 收入</span><span className="text-right">系統訂單</span><span className="text-right">差額</span><span className="text-center">調整</span>
+                        </div>
+                        {importPlan.preview.map(r => (
+                          <div key={r.ym} className="grid grid-cols-[40px_1fr_1fr_1fr_36px] gap-1 px-3 py-2 text-xs tabular-nums items-center border-b border-slate-100 last:border-0">
+                            <span className="font-bold">{Number(r.ym.slice(5))} 月{r.ym.slice(0, 4) !== importPlan.preview[0].ym.slice(0, 4) || importPlan.preview.some(x => x.ym.slice(0, 4) !== r.ym.slice(0, 4)) ? <span className="block text-[9px] font-normal text-slate-400">{r.ym.slice(0, 4)}</span> : null}</span>
+                            <span className="text-right">{r.excelIncome.toLocaleString()}</span>
+                            <span className={`text-right ${r.hasSystem ? '' : 'text-slate-300'}`}>{r.hasSystem ? r.sys.toLocaleString() : '—'}</span>
+                            <span className={`text-right font-bold ${r.diff === 0 ? 'text-slate-300' : r.diff < 0 ? 'text-red-600' : 'text-green-600'}`}>{r.diff === 0 ? '0' : formatMoney(r.diff)}</span>
+                            <span className="text-center">
+                              <input type="checkbox" checked={Boolean(imp.adjSel[r.ym])} disabled={r.diff === 0} onChange={(e) => setImp(cur => ({ ...cur, adjSel: { ...cur.adjSel, [r.ym]: e.target.checked } }))} className="w-4 h-4 accent-emerald-600" />
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                      <p className="text-[11px] text-slate-400">差額＝Excel 收入表有、但系統訂單沒有的收入（團購、現貨、內退等）。勾選「調整」會建立一筆「營收調整」，讓該月收入與 Excel 一致。系統訂單顯示「—」＝訂單還沒進系統，建議先不勾，等訂單匯入後再匯入一次（重新匯入會取代，不會重複）。</p>
+                    </div>
+                  )}
+
+                  {importParsed.flatMap(p => p.extras.map(x => ({ x, p }))).map(({ x, p }) => (
+                    <label key={x.imp} className="flex items-start gap-2 text-xs text-slate-700 cursor-pointer">
+                      <input type="checkbox" checked={Boolean(imp.extraSel[x.imp])} onChange={(e) => setImp(cur => ({ ...cur, extraSel: { ...cur.extraSel, [x.imp]: e.target.checked } }))} className="w-4 h-4 mt-0.5 accent-emerald-600" />
+                      <span>匯入「{x.label}」{p.year} 年度總表的月彙總（沒有逐日明細）<span className="block text-[11px] text-slate-400">{p.spots.some(sp => sp.sheetName === x.label) ? '同一批已有現貨表逐日明細，建議不勾，以免重複。' : '她的年度總結裡有這一塊，月表裡沒有。'}</span></span>
+                    </label>
+                  ))}
+
+                  {legacyCount > 0 && (
+                    <label className="flex items-start gap-2 text-xs text-slate-700 cursor-pointer">
+                      <input type="checkbox" checked={imp.cleanLegacy} onChange={(e) => setImp(cur => ({ ...cur, cleanLegacy: e.target.checked }))} className="w-4 h-4 mt-0.5 accent-emerald-600" />
+                      <span>同時移除先前用「還原備份」放進去的歷史資料（{legacyCount} 筆）<span className="block text-[11px] text-slate-400">若這次沒有一起選現貨表，那部分也會被移除，之後再匯入現貨表即可。</span></span>
+                    </label>
+                  )}
+
+                  {importPlan ? (
+                    <div className="rounded-xl bg-slate-50 border border-slate-200 p-3 text-xs text-slate-600 space-y-0.5">
+                      <div className="font-bold text-slate-800">將新增 {importPlan.stats.total} 筆</div>
+                      <div>支出 {importPlan.stats.expenses}・現貨收入 {importPlan.stats.spotIncome}・營收調整 {importPlan.stats.adjusts}</div>
+                      {importPlan.stats.replaced > 0 && <div className="text-amber-700">會先取代先前匯入的 {importPlan.stats.replaced} 筆（你手動記的不會動；若你改過匯入的紀錄，會被還原成 Excel 的內容）</div>}
+                    </div>
+                  ) : (
+                    <div className="text-xs text-slate-400">沒有可以匯入的內容。</div>
+                  )}
+                </div>
+
+                <div className="p-4 border-t border-slate-100 flex gap-2" style={{ paddingBottom: 'calc(env(safe-area-inset-bottom, 0px) + 16px)' }}>
+                  <button type="button" disabled={imp.busy} onClick={() => setImp(null)} className="px-5 py-3 rounded-xl text-sm font-bold bg-slate-100 text-slate-700 border border-slate-200">取消</button>
+                  <button type="button" disabled={imp.busy || !importPlan || importPlan.stats.total === 0} onClick={confirmImport} className="flex-1 py-3 rounded-xl text-sm font-bold bg-emerald-600 hover:bg-emerald-700 text-white disabled:opacity-50">
+                    {imp.busy ? '匯入中…' : `確認匯入${importPlan ? `（${importPlan.stats.total} 筆）` : ''}`}
+                  </button>
+                </div>
+              </div>
+            </div>
           )}
 
           {/* 新增／編輯表單（底部抽屜） */}
