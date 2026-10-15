@@ -59,7 +59,7 @@
     // ==========================================
     // config.js — 版本號 / Firebase設定 / 常數設定值
     // ==========================================
-    const APP_VERSION = '2.14.25';
+    const APP_VERSION = '2.14.26';
 
     // [v2.14.18] 尺寸系列：新增訂單與商品庫的尺寸快捷選項。存進資料庫的仍是「80, 90, 100」這種逗號字串，系列只是輸入輔助。
     // 要增減尺寸只改這裡；統一存大寫（與既有資料、sortSizes 的排序表一致）。
@@ -4609,6 +4609,83 @@
     // 從 app-shell.js 抽出，只搬「畫面(JSX)」本身，狀態與商業邏輯仍留在 app-shell.js，
     // 透過單一 `list` 物件把所有需要的資料/狀態/處理函式一次傳入（過渡方案，非最終精緻拆法）。
     // ==========================================
+    // [v2.14.13] 滑鼠拖拽捲動：電腦端用滑鼠按住並上下拖動即可捲動（像手機一樣）。
+    // - 只處理滑鼠左鍵；觸控裝置照原生捲動，不受影響。
+    // - 拖動超過 4px 才算拖拽，未超過仍是一般點擊（點卡片選取訂單、按鈕照常作用）。
+    // - 拖拽中不會選取文字（整個區塊 select-none），游標為 grab／grabbing（小手），拖拽結束時不會誤觸點擊。
+    // - 把狀態與事件監聽包在這個小元件裡，OrderListTab 本身維持沒有 hook。
+    function DragScrollPane({ className = '', style, children }) {
+      const paneRef = React.useRef(null);
+      const dragRef = React.useRef({ active: false, moved: false, startY: 0, startScroll: 0 });
+      const detachRef = React.useRef(null);
+      const [dragging, setDragging] = React.useState(false);
+
+      // 元件卸載時，若還在拖拽中，把掛在 window 上的監聽器拆掉
+      React.useEffect(() => () => { if (detachRef.current) detachRef.current(); }, []);
+
+      const handleMouseDown = (e) => {
+        if (e.button !== 0) return;
+        const target = e.target;
+        if (target && target.closest && target.closest('input, textarea, select')) return;
+        const el = paneRef.current;
+        if (!el) return;
+        if (detachRef.current) detachRef.current();
+        const d = dragRef.current;
+        d.active = true;
+        d.moved = false;
+        d.startY = e.clientY;
+        d.startScroll = el.scrollTop;
+
+        const onMove = (ev) => {
+          if (!d.active) return;
+          const dy = ev.clientY - d.startY;
+          if (!d.moved) {
+            if (Math.abs(dy) < 4) return;
+            d.moved = true;
+            setDragging(true);
+            const sel = window.getSelection ? window.getSelection() : null;
+            if (sel && sel.removeAllRanges) sel.removeAllRanges();
+          }
+          ev.preventDefault();
+          el.scrollTop = d.startScroll - dy;
+        };
+        const detach = () => {
+          window.removeEventListener('mousemove', onMove);
+          window.removeEventListener('mouseup', onUp);
+          detachRef.current = null;
+        };
+        const onUp = () => {
+          d.active = false;
+          detach();
+          setDragging(false);
+        };
+        window.addEventListener('mousemove', onMove);
+        window.addEventListener('mouseup', onUp);
+        detachRef.current = detach;
+      };
+
+      // 剛拖拽完放開滑鼠時瀏覽器仍會送出 click，這裡攔下，避免誤選取訂單或誤按按鈕
+      const handleClickCapture = (e) => {
+        if (dragRef.current.moved) {
+          dragRef.current.moved = false;
+          e.stopPropagation();
+          e.preventDefault();
+        }
+      };
+
+      return (
+        <div
+          ref={paneRef}
+          onMouseDown={handleMouseDown}
+          onClickCapture={handleClickCapture}
+          className={`${className} select-none ${dragging ? 'cursor-grabbing [&_*]:!cursor-grabbing' : 'cursor-grab'}`}
+          style={style}
+        >
+          {children}
+        </div>
+      );
+    }
+
     function OrderListTab({ list }) {
       const {
         orders,
@@ -4662,47 +4739,52 @@
 
       // 仿紙本訂購單內容：窄螢幕（md 以上）訂單展開區與寬螢幕右側詳情共用同一份
       const renderPaperForm = (order, subtotal, totalAmount, dateShort) => (
-                              <div className="max-w-3xl">
+                              <div className="max-w-5xl">
                                 <h3 className="text-base font-bold text-slate-800 mb-3">訂購單</h3>
 
-                                {/* 抬頭：顧客姓名 / 手機 / 物流勾選 */}
-                                <div className="flex flex-wrap items-baseline gap-x-8 gap-y-2 text-sm text-slate-700">
-                                  <span>
+                                {/* [v2.14.14] 抬頭：固定三欄格線，每筆訂單的欄位位置一致
+                                    第一列：顧客姓名 / 手機 / LINE・IG；第二列：到貨店家 / 建立日期 / 物流勾選 */}
+                                <div className="grid grid-cols-3 gap-x-6 gap-y-2 items-baseline text-sm text-slate-700">
+                                  <div className="min-w-0 break-words">
                                     <span className="text-slate-500">顧客姓名：</span>
                                     <span className="font-semibold">{order.customerName}</span>
                                     {order.orderNo && !isOrderNoRedundant(order) && (
                                       <span className="ml-2 text-xs text-slate-400 font-mono">({order.orderNo})</span>
                                     )}
-                                  </span>
-                                  <span>
+                                  </div>
+                                  <div className="min-w-0 break-words">
                                     <span className="text-slate-500">手機：</span>
                                     <span className="font-mono">{order.customerPhone || '＿＿＿＿＿＿'}</span>
-                                  </span>
-                                  {order.customerLine && (
-                                    <span>
-                                      <span className="text-slate-500">LINE：</span>
-                                      <span className="font-semibold">{order.customerLine}</span>
-                                    </span>
-                                  )}
-                                  {order.customerIg && (
-                                    <span>
-                                      <span className="text-slate-500">IG：</span>
-                                      <span className="font-semibold">{order.customerIg}</span>
-                                    </span>
-                                  )}
-                                  <span className="flex items-center gap-4">
+                                  </div>
+                                  <div className="min-w-0 break-all">
+                                    {order.customerLine && (
+                                      <div>
+                                        <span className="text-slate-500">LINE：</span>
+                                        <span className="font-semibold">{order.customerLine}</span>
+                                      </div>
+                                    )}
+                                    {order.customerIg && (
+                                      <div>
+                                        <span className="text-slate-500">IG：</span>
+                                        <span className="font-semibold">{order.customerIg}</span>
+                                      </div>
+                                    )}
+                                  </div>
+                                  <div className="min-w-0 break-words">
+                                    <span className="text-slate-500">到貨店家：</span>
+                                    <span className="font-semibold">{formatStoreLine(order) || '＿＿＿＿＿＿'}</span>
+                                  </div>
+                                  <div className="min-w-0">
+                                    <span className="text-slate-500">建立：</span>
+                                    <span className="font-mono text-slate-600">{dateShort}</span>
+                                  </div>
+                                  <div className="min-w-0 flex flex-wrap items-center gap-x-4 gap-y-1">
                                     {['7-11', '全家', '宅配'].map(m => (
                                       <span key={m} className={(order.deliveryMethod || '').includes(m) ? 'font-bold text-slate-800' : 'text-slate-400'}>
                                         {(order.deliveryMethod || '').includes(m) ? '☑' : '☐'} {m}
                                       </span>
                                     ))}
-                                  </span>
-                                </div>
-                                <div className="mt-2 text-sm text-slate-700">
-                                  <span className="text-slate-500">到貨店家：</span>
-                                  <span className="font-semibold">{formatStoreLine(order) || '＿＿＿＿＿＿'}</span>
-                                  <span className="ml-8 text-slate-500">建立：</span>
-                                  <span className="font-mono text-slate-600">{dateShort}</span>
+                                  </div>
                                 </div>
 
                                 {/* 品項表格 */}
@@ -4714,7 +4796,7 @@
                                       <th className="border border-slate-300 px-3 py-1.5 w-24 text-center font-semibold">金額</th>
                                       <th className="border border-slate-300 px-3 py-1.5 w-20 text-center font-semibold">數量</th>
                                       <th className="border border-slate-300 px-3 py-1.5 w-28 text-center font-semibold">總金額</th>
-                                      <th className="border border-slate-300 px-3 py-1.5 w-40 text-center font-semibold">備註</th>
+                                      <th className="border border-slate-300 px-3 py-1.5 w-32 text-center font-semibold">備註</th>
                                     </tr>
                                   </thead>
                                   <tbody>
@@ -4729,8 +4811,8 @@
                                               <span className="text-slate-500">-{item.color}{item.size}</span>
                                             )}
                                           </td>
-                                          <td className="border border-slate-300 px-3 py-1.5 text-right tabular-nums">{item.price}</td>
-                                          <td className="border border-slate-300 px-3 py-1.5 text-right tabular-nums">{item.qty}</td>
+                                          <td className="border border-slate-300 px-3 py-1.5 text-center tabular-nums">{item.price}</td>
+                                          <td className="border border-slate-300 px-3 py-1.5 text-center tabular-nums">{item.qty}</td>
                                           <td className="border border-slate-300 px-3 py-1.5 text-right tabular-nums">{item.price * item.qty}</td>
                                           <td className="border border-slate-300 px-3 py-1.5 text-slate-500">
                                             {adj ? '折抵/內退' : (item.sku || '')}
@@ -4788,7 +4870,7 @@
                         <div
                           key={order.id}
                           onClick={isMasterDetail ? () => setSelectedDetailOrderId(order.id) : undefined}
-                          className={`${isDetailSelected ? 'bg-emerald-50/60' : 'bg-white'} rounded-2xl border ${isDetailSelected ? 'border-emerald-500' : 'border-slate-200/80'} shadow-sm hover:shadow-md overflow-hidden transition ${selectMode && selectedOrderIds.has(order.id) ? 'ring-2 ring-red-400' : ''}${isMasterDetail ? ' cursor-pointer' : ''}`}
+                          className={`${isDetailSelected ? 'bg-emerald-50/60' : 'bg-white'} rounded-2xl border ${isDetailSelected ? 'border-emerald-500' : 'border-slate-200/80'} shadow-sm hover:shadow-md overflow-hidden transition ${selectMode && selectedOrderIds.has(order.id) ? 'ring-2 ring-red-400' : ''}`}
                         >
                           {/* 第 1 行（收合時也顯示）：姓名 + 付款 / 出貨狀態 */}
                           <div className="px-3.5 pt-3 sm:px-4 sm:pt-4 flex items-center justify-between gap-2">
@@ -5242,12 +5324,12 @@
                 ) : (
                   isMasterDetail ? (
                     <div className="flex gap-4 items-start">
-                      <div className="w-[380px] flex-shrink-0 space-y-3 overflow-y-auto pr-1" style={{ height: 'calc(100vh - 7rem)', minHeight: '28rem' }}>
+                      <DragScrollPane className="w-[380px] flex-shrink-0 space-y-3 overflow-y-auto pr-1" style={{ height: 'calc(100vh - 7rem)', minHeight: '28rem' }}>
                         {orderCardsNode}
-                      </div>
+                      </DragScrollPane>
                       <div className="flex-1 min-w-0 bg-white rounded-2xl border border-slate-200/80 shadow-sm overflow-y-auto px-8 py-6" style={{ height: 'calc(100vh - 7rem)', minHeight: '28rem' }}>
                         {selectedDetailOrder && (
-                          <div className="mx-auto max-w-3xl">
+                          <div className="mx-auto max-w-5xl">
                             {renderPaperForm(selectedDetailOrder, calcOrderSubtotal(selectedDetailOrder), calcOrderTotal(selectedDetailOrder), formatOrderStamp(selectedDetailOrder))}
                           </div>
                         )}
