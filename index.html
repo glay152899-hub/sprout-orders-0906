@@ -59,7 +59,7 @@
     // ==========================================
     // config.js — 版本號 / Firebase設定 / 常數設定值
     // ==========================================
-    const APP_VERSION = '2.14.26';
+    const APP_VERSION = '2.14.27';
 
     // [v2.14.18] 尺寸系列：新增訂單與商品庫的尺寸快捷選項。存進資料庫的仍是「80, 90, 100」這種逗號字串，系列只是輸入輔助。
     // 要增減尺寸只改這裡；統一存大寫（與既有資料、sortSizes 的排序表一致）。
@@ -2199,7 +2199,7 @@
       let paidCount = 0;
 
       orders.forEach(o => {
-        const total = calcOrderTotal(o);
+        const total = calcOrderSubtotal(o); // [v2.14.27] 統計只算商品金額，不含運費（運費不是店家收入；免運的運費由店家負擔，記在收支報表的「寄送運費」）
         if (o.closeStatus === 'abandoned') { // [v2.14.12] 棄單：不算未領貨、不算待收
           abandonedCount += 1;
           abandonedAmount += total;
@@ -4934,7 +4934,7 @@
                           {/* 第 2 行（收合時也顯示）：金額 + 日期，右邊是操作 */}
                           <div className="px-3.5 pb-2.5 pt-1 sm:px-4 sm:pb-3 flex items-center justify-between gap-2">
                             <div className="flex items-baseline gap-2 min-w-0">
-                              <span className={`font-bold text-base sm:text-lg ${order.closeStatus === 'abandoned' ? 'text-slate-400 line-through' : 'text-emerald-600'}`}>${totalAmount}</span>
+                              <span className={`font-bold text-base sm:text-lg ${order.closeStatus === 'abandoned' ? 'text-slate-400 line-through' : 'text-emerald-600'}`}>${totalAmount}<span className="ml-0.5 text-[10px] font-normal text-slate-400">含運</span></span>
                               <span className="text-sm font-medium text-slate-500 whitespace-nowrap">{dateShort}</span>
                             </div>
 
@@ -5122,7 +5122,7 @@
                   >
                     <span className="text-xs sm:text-sm font-semibold text-slate-500 leading-4 truncate w-full">總訂單</span>
                     <span className="text-lg sm:text-2xl font-bold text-slate-800 leading-7">{orderListStats.total}</span>
-                    <span className="text-[10px] text-slate-400 leading-4 truncate w-full">合計 ${(orderListStats.receivedRevenue + orderListStats.pendingRevenue).toLocaleString()}</span>
+                    <span className="text-[10px] text-slate-400 leading-4 truncate w-full">商品合計 ${(orderListStats.receivedRevenue + orderListStats.pendingRevenue).toLocaleString()}</span>
                   </button>
                   <button
                     type="button"
@@ -5145,7 +5145,7 @@
                   <div className="flex flex-col items-start justify-start bg-white px-2 py-2 sm:p-4 rounded-xl sm:rounded-2xl border border-slate-200/80 shadow-sm min-w-0">
                     <span className="text-xs sm:text-sm font-semibold text-emerald-700 leading-4 truncate w-full">已實收</span>
                     <span className="text-lg sm:text-2xl font-bold text-emerald-700 leading-7 truncate w-full tracking-tight">${orderListStats.receivedRevenue.toLocaleString()}</span>
-                    <span className="text-[10px] text-slate-400 leading-4 truncate w-full">{orderListStats.paidCount} 筆已領貨</span>
+                    <span className="text-[10px] text-slate-400 leading-4 truncate w-full">{orderListStats.paidCount} 筆已領貨・不含運</span>
                   </div>
                 </div>
 
@@ -5245,7 +5245,7 @@
 
                   <div className="text-[11px] sm:text-xs text-slate-400 flex items-center justify-between gap-2 border-t border-slate-100 pt-2">
                     <span className="min-w-0 truncate">
-                      {filteredOrders.length} / {orders.length} 筆 · 合計 <b className="text-slate-600">${filteredOrdersTotal.toLocaleString()}</b>
+                      {filteredOrders.length} / {orders.length} 筆 · 商品合計 <b className="text-slate-600">${filteredOrdersTotal.toLocaleString()}</b>
                     </span>
                     <div className="flex items-center gap-1 flex-shrink-0">
                       {hasActiveOrderFilter && (
@@ -9247,7 +9247,7 @@
       const orderListStats = React.useMemo(() => computeOrderListStats(orders), [orders]);
 
       const filteredOrdersTotal = React.useMemo(() => {
-        return filteredOrders.reduce((sum, o) => sum + calcOrderTotal(o), 0);
+        return filteredOrders.reduce((sum, o) => sum + calcOrderSubtotal(o), 0); // [v2.14.27] 商品合計，不含運費（與統計卡一致）
       }, [filteredOrders]);
 
       const selectedVisibleCount = React.useMemo(() => {
