@@ -59,7 +59,7 @@
     // ==========================================
     // config.js — 版本號 / Firebase設定 / 常數設定值
     // ==========================================
-    const APP_VERSION = '2.14.27';
+    const APP_VERSION = '2.14.28';
 
     // [v2.14.18] 尺寸系列：新增訂單與商品庫的尺寸快捷選項。存進資料庫的仍是「80, 90, 100」這種逗號字串，系列只是輸入輔助。
     // 要增減尺寸只改這裡；統一存大寫（與既有資料、sortSizes 的排序表一致）。
@@ -2621,7 +2621,9 @@
 
     // 產生寫入計畫：要新增的紀錄（id → 資料）與要先移除的舊紀錄 id
     // adjSel: { ym: true/false } 是否為該月建立「營收調整」；includeExtras: { imp: true/false }；cleanLegacy：同時清掉 createdBy=歷史匯入 的舊紀錄
-    const planFinanceImport = ({ parsedList, existing, sysByMonth, adjSel, includeExtras, cleanLegacy, nowMs }) => {
+    // [v2.14.28] wipe：''＝不清空；'imported'＝先清掉所有 Excel 匯入／歷史匯入的紀錄；'all'＝先清掉全部收支（含手動）。
+    // 被清掉的紀錄會進 trash/finance（trashIds），但「這次會被同 id 重新寫入」的不放進回收桶，避免日後誤還原蓋掉新資料。
+    const planFinanceImport = ({ parsedList, existing, sysByMonth, adjSel, includeExtras, cleanLegacy, wipe, nowMs }) => {
       const now = nowMs || Date.now();
       const all = [];
       parsedList.forEach(p => {
@@ -2646,11 +2648,16 @@
         seen[base] = (seen[base] || 0) + 1;
         writes[`${base}${String(seen[base]).padStart(2, '0')}`] = { date: e.date, type: e.type, amount: e.amount, category: e.category, note: e.note, createdAt: now, createdBy: FINANCE_IMPORT_BY, imp: e.imp };
       });
-      const removes = (existing || []).filter(e => (e.imp && tags.has(e.imp)) || (cleanLegacy && e.createdBy === FINANCE_LEGACY_BY)).map(e => e.id);
+      const isImported = (e) => Boolean(e.imp) || e.createdBy === FINANCE_IMPORT_BY || e.createdBy === FINANCE_LEGACY_BY;
+      const removes = (existing || []).filter(e =>
+        wipe === 'all' || (wipe === 'imported' && isImported(e)) ||
+        (e.imp && tags.has(e.imp)) || (cleanLegacy && e.createdBy === FINANCE_LEGACY_BY)
+      ).map(e => e.id);
+      const trashIds = wipe ? removes.filter(id => !(id in writes)) : [];
       const count = (fn) => Object.values(writes).filter(fn).length;
       return {
-        writes, removes, preview,
-        stats: { total: Object.keys(writes).length, expenses: count(e => e.type === 'out'), spotIncome: count(e => e.type === 'in'), adjusts: count(e => e.type === 'adj'), replaced: removes.length }
+        writes, removes, trashIds, preview,
+        stats: { total: Object.keys(writes).length, expenses: count(e => e.type === 'out'), spotIncome: count(e => e.type === 'in'), adjusts: count(e => e.type === 'adj'), replaced: removes.length, wiped: wipe ? removes.length : 0, trashed: trashIds.length }
       };
     };
   </script>
@@ -6606,8 +6613,9 @@
       const importParsed = React.useMemo(() => (imp ? imp.files.filter(f => f.parsed.kind !== 'unknown') .map(f => f.parsed) : []), [imp]);
       const importPlan = React.useMemo(() => {
         if (!imp || importParsed.length === 0) return null;
-        return planFinanceImport({ parsedList: importParsed, existing: manualEntries, sysByMonth, adjSel: imp.adjSel, includeExtras: imp.extraSel, cleanLegacy: imp.cleanLegacy });
+        return planFinanceImport({ parsedList: importParsed, existing: manualEntries, sysByMonth, adjSel: imp.adjSel, includeExtras: imp.extraSel, cleanLegacy: imp.cleanLegacy, wipe: imp.wipe ? imp.wipeScope : '' });
       }, [imp, importParsed, manualEntries, sysByMonth]);
+      const wipeBlocked = Boolean(imp && imp.wipe && imp.wipeScope === 'all' && imp.wipeText.trim() !== '清空'); // 全部清空要輸入「清空」才放行
 
       const startImport = async (fileList) => {
         const picked = Array.from(fileList || []);
@@ -6628,7 +6636,7 @@
         const adjSel = {}; buildImportPreview(parsedOk, sysByMonth).forEach(r => { adjSel[r.ym] = r.hasSystem; });
         const spotKeys = new Set(parsedOk.flatMap(p => p.spots.map(sp => sp.sheetName + ':' + p.year)));
         const extraSel = {}; parsedOk.forEach(p => p.extras.forEach(x => { extraSel[x.imp] = !spotKeys.has(x.label + ':' + p.year); }));
-        setImp({ files, adjSel, extraSel, cleanLegacy: legacyCount > 0, busy: false });
+        setImp({ files, adjSel, extraSel, cleanLegacy: legacyCount > 0, wipe: false, wipeScope: 'imported', wipeText: '', busy: false });
       };
       const reparseWithYear = (idx, yearStr) => setImp(cur => {
         const files = cur.files.map((f, i) => (i === idx ? { ...f, parsed: parseLedgerWorkbook(f.wb, f.name, Number(yearStr)) } : f));
@@ -6642,6 +6650,11 @@
         setImp(cur => ({ ...cur, busy: true }));
         try {
           const updates = {};
+          const trashSet = new Set(importPlan.trashIds || []);
+          const nowTs = Date.now();
+          manualEntries.forEach(e => {
+            if (trashSet.has(e.id)) { const { id, ...rest } = e; updates[`trash/finance/${id}`] = { ...rest, deletedAt: nowTs, deletedBy: user?.email || '' }; }
+          });
           importPlan.removes.forEach(id => { updates[`finance/entries/${id}`] = null; });
           Object.entries(importPlan.writes).forEach(([id, data]) => { updates[`finance/entries/${id}`] = data; });
           const paths = Object.keys(updates);
@@ -6649,7 +6662,7 @@
             const chunk = {}; paths.slice(i, i + 300).forEach(k => { chunk[k] = updates[k]; });
             await withSyncTracking(dbRoot().update(chunk));
           }
-          logAction('finance_import', 'finance', '', `匯入 Excel 收支表：新增 ${importPlan.stats.total} 筆、取代 ${importPlan.stats.replaced} 筆`);
+          logAction('finance_import', 'finance', '', `匯入 Excel 收支表：新增 ${importPlan.stats.total} 筆、取代 ${importPlan.stats.replaced} 筆${importPlan.stats.wiped > 0 ? `（先清空：${imp.wipeScope === 'all' ? '全部' : '匯入的'} ${importPlan.stats.wiped} 筆）` : ''}`);
           showToast(`✅ 已匯入 ${importPlan.stats.total} 筆收支`);
           setImp(null);
           setView('year');
@@ -6784,6 +6797,29 @@
         } catch (err) {
           console.error('Finance restore error:', err);
           showToast('❌ 還原失敗，請稍後再試');
+        }
+      };
+
+      // [v2.14.28] 永久清除「已刪除」裡的全部收支（測試反覆清空重匯時用；清除後無法還原）
+      const [confirmPurge, setConfirmPurge] = React.useState(false);
+      const [isPurging, setIsPurging] = React.useState(false);
+      const handlePurgeTrash = async () => {
+        if (isPurging || trash.length === 0) return;
+        setIsPurging(true);
+        try {
+          const paths = trash.map(t => `trash/finance/${t.id}`);
+          for (let i = 0; i < paths.length; i += 300) {
+            const chunk = {}; paths.slice(i, i + 300).forEach(k => { chunk[k] = null; });
+            await withSyncTracking(dbRoot().update(chunk));
+          }
+          logAction('finance_purge', 'finance', '', `永久清除已刪除的收支 ${paths.length} 筆`);
+          showToast(`🧹 已永久清除 ${paths.length} 筆`);
+        } catch (err) {
+          console.error('Finance purge error:', err);
+          showToast('❌ 清除失敗，請稍後再試');
+        } finally {
+          setIsPurging(false);
+          setConfirmPurge(false);
         }
       };
 
@@ -7080,6 +7116,18 @@
                 <>
                   <h2 className="text-sm font-bold text-slate-800">已刪除的收支（可還原）</h2>
                   {trash.length === 0 && <div className="text-center text-xs text-slate-400 py-10">沒有已刪除的紀錄</div>}
+                  {trash.length > 0 && (
+                    <div className="flex gap-2">
+                      {confirmPurge ? (
+                        <>
+                          <button type="button" disabled={isPurging} onClick={handlePurgeTrash} className="flex-1 py-2.5 rounded-xl text-xs font-bold bg-red-600 text-white">{isPurging ? '清除中…' : `確定永久清除 ${trash.length} 筆（無法還原）`}</button>
+                          <button type="button" disabled={isPurging} onClick={() => setConfirmPurge(false)} className="px-4 py-2.5 rounded-xl text-xs font-bold bg-slate-100 text-slate-700 border border-slate-200">取消</button>
+                        </>
+                      ) : (
+                        <button type="button" onClick={() => setConfirmPurge(true)} className="px-4 py-2.5 rounded-xl text-xs font-bold bg-red-50 text-red-700 border border-red-200">永久清除全部（{trash.length} 筆）</button>
+                      )}
+                    </div>
+                  )}
                   <div className="space-y-2">
                     {trash.map(t => (
                       <div key={t.id} className="bg-white rounded-xl border border-slate-200/80 px-4 py-3 flex items-center gap-3">
@@ -7191,11 +7239,34 @@
                     </label>
                   )}
 
+                  <div className="rounded-xl border border-red-200 bg-red-50/50 p-3 space-y-2">
+                    <label className="flex items-start gap-2 text-xs text-slate-800 cursor-pointer font-bold">
+                      <input type="checkbox" checked={imp.wipe} onChange={(e) => setImp(cur => ({ ...cur, wipe: e.target.checked, wipeText: '' }))} className="w-4 h-4 mt-0.5 accent-red-600" />
+                      <span>匯入前先清空收支紀錄<span className="block text-[11px] font-normal text-slate-500">清掉的會進「已刪除」，可還原（訂單營收是自動算的，不受影響）。</span></span>
+                    </label>
+                    {imp.wipe && (
+                      <div className="pl-6 space-y-2 text-xs text-slate-700">
+                        <label className="flex items-start gap-2 cursor-pointer">
+                          <input type="radio" name="wipeScope" checked={imp.wipeScope === 'imported'} onChange={() => setImp(cur => ({ ...cur, wipeScope: 'imported', wipeText: '' }))} className="mt-0.5 accent-red-600" />
+                          <span>只清 Excel 匯入與歷史匯入的（手動記的保留）</span>
+                        </label>
+                        <label className="flex items-start gap-2 cursor-pointer">
+                          <input type="radio" name="wipeScope" checked={imp.wipeScope === 'all'} onChange={() => setImp(cur => ({ ...cur, wipeScope: 'all' }))} className="mt-0.5 accent-red-600" />
+                          <span>全部清空（含手動記的 {manualEntries.filter(e => !e.imp && e.createdBy !== FINANCE_IMPORT_BY && e.createdBy !== FINANCE_LEGACY_BY).length} 筆）</span>
+                        </label>
+                        {imp.wipeScope === 'all' && (
+                          <input type="text" placeholder="請輸入「清空」兩個字才能匯入" value={imp.wipeText} onChange={(e) => setImp(cur => ({ ...cur, wipeText: e.target.value }))} className="w-full px-3 py-2 bg-white border border-red-200 rounded-lg text-xs focus:outline-none focus:ring-2 focus:ring-red-400/40" />
+                        )}
+                        {importPlan && <div className="text-red-700 font-bold">將先清掉 {importPlan.stats.wiped} 筆現有收支</div>}
+                      </div>
+                    )}
+                  </div>
+
                   {importPlan ? (
                     <div className="rounded-xl bg-slate-50 border border-slate-200 p-3 text-xs text-slate-600 space-y-0.5">
                       <div className="font-bold text-slate-800">將新增 {importPlan.stats.total} 筆</div>
                       <div>支出 {importPlan.stats.expenses}・現貨收入 {importPlan.stats.spotIncome}・營收調整 {importPlan.stats.adjusts}</div>
-                      {importPlan.stats.replaced > 0 && <div className="text-amber-700">會先取代先前匯入的 {importPlan.stats.replaced} 筆（你手動記的不會動；若你改過匯入的紀錄，會被還原成 Excel 的內容）</div>}
+                      {importPlan.stats.replaced > 0 && !imp.wipe && <div className="text-amber-700">會先取代先前匯入的 {importPlan.stats.replaced} 筆（你手動記的不會動；若你改過匯入的紀錄，會被還原成 Excel 的內容）</div>}
                     </div>
                   ) : (
                     <div className="text-xs text-slate-400">沒有可以匯入的內容。</div>
@@ -7204,7 +7275,7 @@
 
                 <div className="p-4 border-t border-slate-100 flex gap-2" style={{ paddingBottom: 'calc(env(safe-area-inset-bottom, 0px) + 16px)' }}>
                   <button type="button" disabled={imp.busy} onClick={() => setImp(null)} className="px-5 py-3 rounded-xl text-sm font-bold bg-slate-100 text-slate-700 border border-slate-200">取消</button>
-                  <button type="button" disabled={imp.busy || !importPlan || importPlan.stats.total === 0} onClick={confirmImport} className="flex-1 py-3 rounded-xl text-sm font-bold bg-emerald-600 hover:bg-emerald-700 text-white disabled:opacity-50">
+                  <button type="button" disabled={imp.busy || wipeBlocked || !importPlan || importPlan.stats.total === 0} onClick={confirmImport} className="flex-1 py-3 rounded-xl text-sm font-bold bg-emerald-600 hover:bg-emerald-700 text-white disabled:opacity-50">
                     {imp.busy ? '匯入中…' : `確認匯入${importPlan ? `（${importPlan.stats.total} 筆）` : ''}`}
                   </button>
                 </div>
