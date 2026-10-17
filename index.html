@@ -59,7 +59,7 @@
     // ==========================================
     // config.js — 版本號 / Firebase設定 / 常數設定值
     // ==========================================
-    const APP_VERSION = '2.14.29';
+    const APP_VERSION = '2.14.30';
 
     // [v2.14.18] 尺寸系列：新增訂單與商品庫的尺寸快捷選項。存進資料庫的仍是「80, 90, 100」這種逗號字串，系列只是輸入輔助。
     // 要增減尺寸只改這裡；統一存大寫（與既有資料、sortSizes 的排序表一致）。
@@ -7480,6 +7480,15 @@
         setTimeout(() => setToastMessage(''), 2500);
       };
 
+      // [v2.14.30] 可「復原」的提示：領貨狀態標錯時，6 秒內點一下就回到原本的狀態（含領貨日）
+      const [undoToast, setUndoToast] = React.useState(null);
+      const undoTimerRef = React.useRef(null);
+      const showUndoToast = (msg, onUndo) => {
+        if (undoTimerRef.current) clearTimeout(undoTimerRef.current);
+        setUndoToast({ msg, onUndo });
+        undoTimerRef.current = setTimeout(() => setUndoToast(null), 6000);
+      };
+
       // ------------------------------------------
       // Real-time Firebase Database Listeners (on)
       // ------------------------------------------
@@ -8297,15 +8306,44 @@
 
       // [v2.14.12] 「已付款」改稱「已領貨」：標記時記下領貨日（今天，可在編輯訂單修改）；取消時清掉；同時解除棄單
       const handleTogglePayment = async (orderId, currentStatus) => {
+        const target = orders.find(o => o.id === orderId);
+        const name = target?.customerName || '';
+        // [v2.14.30] 已領貨 → 未領貨 是危險方向（會讓收支報表的收入變成待入帳），一定要先確認；未領貨 → 已領貨維持一鍵
+        if (currentStatus && target) {
+          const orderDay = toDateInputValue(target.timestamp);
+          const amountText = `$${calcOrderSubtotal(target).toLocaleString()}`;
+          const impact = orderDay >= FINANCE_PICKUP_START
+            ? `收支報表會把這張的 ${amountText} 從收入改成「待入帳」。`
+            : `這張是舊訂單，收支報表仍視為已入帳，只有訂單列表的狀態會改變。`;
+          const paidInfo = target.paidDate ? `（領貨日 ${target.paidDate}）` : '';
+          if (!window.confirm(`把「${name}」從「已領貨」改回「未領貨」？${paidInfo}\n\n${impact}\n\n如果是不小心點到，請按「取消」。`)) return;
+        }
+        const prev = {
+          paymentStatus: Boolean(target?.paymentStatus),
+          paidDate: target?.paidDate || '',
+          closeStatus: target?.closeStatus || ''
+        };
         try {
           await withSyncTracking(dbRef(`orders/${orderId}`).update({
             paymentStatus: !currentStatus,
             paidDate: currentStatus ? '' : toDateInputValue(Date.now()),
             closeStatus: ''
           }));
-          const target = orders.find(o => o.id === orderId);
-          logAction('order_payment', 'order', orderId, `領貨狀態：${target?.customerName || ''}　${currentStatus ? '已領貨' : '未領貨'} → ${currentStatus ? '未領貨' : '已領貨'}`);
-          showToast(currentStatus ? '已改回未領貨' : '✅ 已標記為已領貨（款項入帳）');
+          logAction('order_payment', 'order', orderId, `領貨狀態：${name}　${currentStatus ? '已領貨' : '未領貨'} → ${currentStatus ? '未領貨' : '已領貨'}`);
+          showUndoToast(
+            currentStatus ? `已改回未領貨：${name}` : `✅ 已標記為已領貨：${name}`,
+            async () => {
+              try {
+                await withSyncTracking(dbRef(`orders/${orderId}`).update(prev));
+                logAction('order_payment', 'order', orderId, `領貨狀態：${name}　復原為${prev.closeStatus === 'abandoned' ? '棄單' : prev.paymentStatus ? '已領貨' : '未領貨'}`);
+                setUndoToast(null);
+                showToast('↩️ 已復原');
+              } catch (err) {
+                console.error('Undo payment error:', err);
+                showToast('❌ 復原失敗，請檢查網路後再試');
+              }
+            }
+          );
         } catch (err) {
           console.error("Toggle payment error:", err);
           showToast('❌ 更新領貨狀態失敗，請檢查網路後再試');
@@ -9637,6 +9675,14 @@
             <div className="fixed top-4 left-1/2 -translate-x-1/2 z-[60] bg-slate-900/90 text-white px-5 py-2.5 rounded-full text-xs sm:text-sm font-medium shadow-2xl backdrop-blur-sm transition-all animate-bounce flex items-center gap-2">
               <IconSparkles size={16} className="text-amber-400" />
               {toastMessage}
+            </div>
+          )}
+
+          {/* [v2.14.30] 領貨狀態「復原」提示（6 秒） */}
+          {undoToast && (
+            <div className="fixed bottom-24 md:bottom-8 left-1/2 -translate-x-1/2 z-[60] bg-slate-900/90 text-white pl-5 pr-3 py-2 rounded-full text-xs sm:text-sm font-medium shadow-2xl backdrop-blur-sm flex items-center gap-3 max-w-[92vw]">
+              <span className="truncate">{undoToast.msg}</span>
+              <button type="button" onClick={undoToast.onUndo} className="flex-none px-3 py-1 rounded-full bg-amber-400 text-slate-900 font-bold">復原</button>
             </div>
           )}
 
