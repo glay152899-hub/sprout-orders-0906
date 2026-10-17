@@ -59,7 +59,7 @@
     // ==========================================
     // config.js — 版本號 / Firebase設定 / 常數設定值
     // ==========================================
-    const APP_VERSION = '2.14.31';
+    const APP_VERSION = '2.14.32';
 
     // [v2.14.18] 尺寸系列：新增訂單與商品庫的尺寸快捷選項。存進資料庫的仍是「80, 90, 100」這種逗號字串，系列只是輸入輔助。
     // 要增減尺寸只改這裡；統一存大寫（與既有資料、sortSizes 的排序表一致）。
@@ -2491,6 +2491,30 @@
         year: y, months, incomeRows, expenseRows, incomeByMonth, expenseByMonth, netByMonth,
         totals: { income: sum(incomeByMonth), expense: sum(expenseByMonth), net: sum(netByMonth) }
       };
+    };
+
+    // [v2.14.32] 電腦版年度橫式總表（仿老婆的「年度總結」）：主表＝月表（訂單營收、手動記帳、月表匯入…）；
+    // 現貨區塊＝Excel 匯入時帶 `s:商品:年`／`x:商品:年` 標記的紀錄，依商品（圍兜、髮飾…）各自一塊；手動記的現貨沒有標記，仍併在主表。
+    // 主表＋所有現貨區塊的合計，必須等於 computeFinanceYear 的 totals（兩者都不丟紀錄）。
+    const financeSpotName = (e) => { const m = /^[sx]:([^:]+):/.exec(e.imp || ''); return m ? m[1] : ''; };
+    const computeFinanceYearBlocks = (entries, year) => {
+      const y = String(year);
+      const zero = () => Array(12).fill(0);
+      const main = { out: zero(), inc: zero() };
+      const spotMap = {};
+      (entries || []).forEach(e => {
+        if (!e.date || e.date.slice(0, 4) !== y) return;
+        const mi = Number(e.date.slice(5, 7)) - 1;
+        if (mi < 0 || mi > 11) return;
+        const name = financeSpotName(e);
+        const blk = name ? (spotMap[name] = spotMap[name] || { name, out: zero(), inc: zero() }) : main;
+        (e.type === 'out' ? blk.out : blk.inc)[mi] += e.amount;
+      });
+      const sum = (a) => a.reduce((t, v) => t + v, 0);
+      const spots = Object.values(spotMap).sort((a, b) => a.name.localeCompare(b.name, 'zh-Hant'));
+      const totalOut = sum(main.out) + spots.reduce((t, b) => t + sum(b.out), 0);
+      const totalInc = sum(main.inc) + spots.reduce((t, b) => t + sum(b.inc), 0);
+      return { year: y, main, spots, totals: { income: totalInc, expense: totalOut, net: totalInc - totalOut } };
     };
 
     // 匯出 Excel 用：三張表的資料。entries 要含自動的訂單營收；pending 是待入帳訂單 [{date, amount}]
@@ -6660,6 +6684,7 @@
       const months = React.useMemo(() => listFinanceMonths(entries), [entries]);
       const years = React.useMemo(() => listFinanceYears(entries), [entries]);
       const yearData = React.useMemo(() => computeFinanceYear(entries, year), [entries, year]);
+      const yearBlocks = React.useMemo(() => (view === 'year' && isWide ? computeFinanceYearBlocks(entries, year) : null), [view, isWide, entries, year]);
       const yearPending = React.useMemo(() => orderRevenue.pending.filter(x => x.date.slice(0, 4) === year), [orderRevenue, year]);
       const yearPendingTotal = yearPending.reduce((s, x) => s + x.amount, 0);
 
@@ -6965,7 +6990,7 @@
 
           {/* Body */}
           <div className="flex-1 overflow-y-auto">
-            <div className={`${showGrid && view === 'detail' ? 'max-w-[1700px]' : 'max-w-3xl'} mx-auto p-4 space-y-4`} style={{ paddingBottom: 'calc(env(safe-area-inset-bottom, 0px) + 96px)' }}>
+            <div className={`${showGrid && view === 'detail' ? 'max-w-[1700px]' : isWide && view === 'year' ? 'max-w-6xl' : 'max-w-3xl'} mx-auto p-4 space-y-4`} style={{ paddingBottom: 'calc(env(safe-area-inset-bottom, 0px) + 96px)' }}>
               {error && <div className="bg-red-50 border border-red-200 text-red-700 text-xs rounded-xl p-3">{error}</div>}
               {loading && !error && <div className="text-center text-xs text-slate-400 py-10">載入中…</div>}
 
@@ -7218,6 +7243,58 @@
                     📂 匯入老婆的 Excel 收支表
                   </button>
 
+                  {isWide && yearBlocks ? (() => {
+                    const yb = yearBlocks;
+                    const sum = (a) => a.reduce((t, v) => t + v, 0);
+                    const fmt = (n) => (n === 0 ? '–' : n.toLocaleString());
+                    const thCls = 'border border-slate-200 bg-slate-50 px-2 py-2 font-medium text-slate-500 min-w-[4.25rem] text-right';
+                    const lblCls = 'sticky left-0 z-10 border border-slate-200 bg-slate-50 px-3 py-2 text-left font-bold text-slate-700 min-w-[4.5rem] whitespace-nowrap';
+                    const sumCls = 'border border-slate-200 bg-slate-50 px-3 py-2 text-right font-bold text-slate-800 min-w-[5.5rem]';
+                    const goMonth = (mi) => { setMonth(`${year}-${String(mi + 1).padStart(2, '0')}`); setView('detail'); };
+                    const block = (title, blk) => {
+                      const netArr = blk.inc.map((v, i) => ((v !== 0 || blk.out[i] !== 0) ? v - blk.out[i] : 0));
+                      return (
+                        <div key={title}>
+                          <div className="text-xs font-bold text-slate-600 mb-1.5">{title}</div>
+                          <div className="bg-white rounded-xl border border-slate-200/80 overflow-x-auto">
+                            <table className="text-xs border-collapse w-full tabular-nums">
+                              <thead>
+                                <tr>
+                                  <th className={`${lblCls} text-slate-500 font-medium`}>項目</th>
+                                  {blk.out.map((_, i) => <th key={i} className={`${thCls} cursor-pointer hover:bg-emerald-50`} title="點一下看這個月的月表" onClick={() => goMonth(i)}>{i + 1}月</th>)}
+                                  <th className={sumCls}>合計</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                <tr>
+                                  <td className={lblCls}>支出</td>
+                                  {blk.out.map((v, i) => <td key={i} className={`border border-slate-200 px-2 py-2 text-right ${v === 0 ? 'text-slate-300' : 'text-red-600'}`}>{fmt(v)}</td>)}
+                                  <td className={`${sumCls} text-red-700`}>{sum(blk.out).toLocaleString()}</td>
+                                </tr>
+                                <tr>
+                                  <td className={lblCls}>收入</td>
+                                  {blk.inc.map((v, i) => <td key={i} className={`border border-slate-200 px-2 py-2 text-right ${v === 0 ? 'text-slate-300' : 'text-green-700'}`}>{fmt(v)}</td>)}
+                                  <td className={`${sumCls} text-green-700`}>{sum(blk.inc).toLocaleString()}</td>
+                                </tr>
+                                <tr className="font-bold">
+                                  <td className={lblCls}>損益</td>
+                                  {netArr.map((v, i) => <td key={i} className={`border border-slate-200 bg-slate-50 px-2 py-2 text-right ${v === 0 ? 'text-slate-300' : v < 0 ? 'text-red-600' : 'text-slate-800'}`}>{v === 0 ? '–' : v.toLocaleString()}</td>)}
+                                  <td className={`${sumCls} ${sum(netArr) < 0 ? 'text-red-700' : ''}`}>{sum(netArr).toLocaleString()}</td>
+                                </tr>
+                              </tbody>
+                            </table>
+                          </div>
+                        </div>
+                      );
+                    };
+                    return (
+                      <div className="space-y-4">
+                        {block('主表（月表）', yb.main)}
+                        {yb.spots.map(b => block(`${b.name}（現貨）`, b))}
+                        <p className="text-[11px] text-slate-400 px-1">主表是月表的收支（含訂單營收與手動記的）；Excel 匯入的現貨（圍兜、髮飾…）各自一塊，上方三格的年度合計是全部加總。點月份標題可看那個月的月表。</p>
+                      </div>
+                    );
+                  })() : (<>
                   <div className="bg-white rounded-2xl border border-slate-200/80 overflow-hidden">
                     <div className="grid grid-cols-[44px_1fr_1fr_1fr] gap-2 px-4 py-2 text-[11px] font-bold text-slate-400 bg-slate-50 border-b border-slate-100">
                       <span>月份</span><span className="text-right">收入</span><span className="text-right">支出</span><span className="text-right">淨收支</span>
@@ -7243,6 +7320,7 @@
                     </div>
                   </div>
                   <p className="text-[11px] text-slate-400 px-1">點任一個月份，可以跳到那個月的總覽。</p>
+                  </>)}
 
                   <button type="button" onClick={() => setShowMatrix(v => !v)} className="w-full py-2.5 rounded-xl text-xs font-bold bg-white border border-slate-200 text-slate-600">
                     {showMatrix ? '收合完整年度總表' : '展開完整年度總表（分類 × 月份，可左右滑動）'}
