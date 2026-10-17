@@ -59,7 +59,7 @@
     // ==========================================
     // config.js — 版本號 / Firebase設定 / 常數設定值
     // ==========================================
-    const APP_VERSION = '2.14.30';
+    const APP_VERSION = '2.14.31';
 
     // [v2.14.18] 尺寸系列：新增訂單與商品庫的尺寸快捷選項。存進資料庫的仍是「80, 90, 100」這種逗號字串，系列只是輸入輔助。
     // 要增減尺寸只改這裡；統一存大寫（與既有資料、sortSizes 的排序表一致）。
@@ -2369,6 +2369,7 @@
       const days = {};
       const excluded = [];
       const pending = [];
+      const perOrder = {}; // [v2.14.31] 每天每張訂單的金額（月表「一張訂單一列」用），與 days 同一套規則
       const take = (o, isLive) => {
         const date = toDateInputValue(o?.timestamp);
         if (!date) return;
@@ -2380,6 +2381,7 @@
         if (!days[date]) days[date] = { amount: 0, count: 0 };
         days[date].amount += amount;
         days[date].count += 1;
+        (perOrder[date] = perOrder[date] || []).push({ amount, ts: Number(o.timestamp) || 0 });
       };
       (liveOrders || []).forEach(o => take(o, true));
       (archiveOrders || []).forEach(o => take(o, false));
@@ -2389,7 +2391,55 @@
       }));
       excluded.sort((a, b) => (a.date < b.date ? 1 : -1));
       pending.sort((a, b) => (a.date < b.date ? 1 : -1));
-      return { entries, excluded, pending };
+      const orderAmounts = {};
+      Object.keys(perOrder).forEach(date => { orderAmounts[date] = perOrder[date].sort((a, b) => a.ts - b.ts).map(x => x.amount); });
+      return { entries, excluded, pending, orderAmounts };
+    };
+
+    // ---------- [v2.14.31] 電腦版月表（仿老婆 Excel：上方支出表＝類別 × 日期；下方收入表＝一張訂單一列 × 日期） ----------
+    const FINANCE_GRID_EXPENSE_ORDER = ['包材', '廣告', '進貨', '國際運費', '寄送運費']; // 她 Excel 的列順序；「其他支出」有資料才出現
+    const buildFinanceMonthGrid = (entries, orderAmounts, month) => {
+      const [y, m] = String(month).split('-').map(Number);
+      const D = new Date(y, m, 0).getDate();
+      const blank = () => Array.from({ length: D + 1 }, () => ({ amount: 0, entries: [] })); // 用 1..D
+      const expMap = {}, incMap = {};
+      (entries || []).forEach(e => {
+        if (e.source === 'order' || !e.date || e.date.slice(0, 7) !== month) return;
+        const d = Number(e.date.slice(8, 10));
+        if (!(d >= 1 && d <= D)) return;
+        const map = e.type === 'out' ? expMap : incMap;
+        const cat = e.category || (e.type === 'out' ? '其他支出' : '其他收入');
+        if (!map[cat]) map[cat] = blank();
+        map[cat][d].amount += e.amount;
+        map[cat][d].entries.push(e);
+      });
+      const sumRow = (cells) => cells.reduce((s, c) => s + c.amount, 0);
+      const expLabels = [...FINANCE_GRID_EXPENSE_ORDER, ...Object.keys(expMap).filter(k => !FINANCE_GRID_EXPENSE_ORDER.includes(k)).sort()];
+      const expenseRows = expLabels.map(label => {
+        const cells = expMap[label] || blank();
+        return { label, type: 'out', cells, total: sumRow(cells) };
+      });
+      const incPreferred = [...FINANCE_INCOME_CATEGORIES, ...FINANCE_ADJUST_CATEGORIES];
+      const incLabels = [...incPreferred.filter(k => incMap[k]), ...Object.keys(incMap).filter(k => !incPreferred.includes(k)).sort()];
+      const extraIncomeRows = incLabels.map(label => {
+        const cells = incMap[label];
+        const t = cells.some(c => c.entries.some(e => e.type === 'adj')) || FINANCE_ADJUST_CATEGORIES.includes(label) ? 'adj' : 'in';
+        return { label, type: t, cells, total: sumRow(cells) };
+      });
+      const prefix = `${month}-`;
+      const dayAmounts = (d) => (orderAmounts && orderAmounts[prefix + String(d).padStart(2, '0')]) || [];
+      let maxN = 0;
+      for (let d = 1; d <= D; d++) maxN = Math.max(maxN, dayAmounts(d).length);
+      const orderRows = Array.from({ length: maxN }, (_, n) => {
+        const cells = Array.from({ length: D + 1 }, (_, d) => (d >= 1 ? (dayAmounts(d)[n] || 0) : 0));
+        return { label: `訂單 ${n + 1}`, cells, total: cells.reduce((s, v) => s + v, 0) };
+      });
+      const expenseDay = Array.from({ length: D + 1 }, (_, d) => (d >= 1 ? expenseRows.reduce((s, r) => s + r.cells[d].amount, 0) : 0));
+      const incomeDay = Array.from({ length: D + 1 }, (_, d) => (d >= 1
+        ? orderRows.reduce((s, r) => s + r.cells[d], 0) + extraIncomeRows.reduce((s, r) => s + r.cells[d].amount, 0) : 0));
+      const expenseTotal = expenseDay.reduce((s, v) => s + v, 0);
+      const incomeTotal = incomeDay.reduce((s, v) => s + v, 0);
+      return { days: D, month, expenseRows, expenseDay, expenseTotal, orderRows, extraIncomeRows, incomeDay, incomeTotal, net: incomeTotal - expenseTotal };
     };
 
     // 兩個 YYYY-MM-DD 相差幾天（b - a）
@@ -6592,6 +6642,16 @@
       const [month, setMonth] = React.useState(() => financeToday().slice(0, 7)); // 'YYYY-MM' | 'all'
       const [openDays, setOpenDays] = React.useState(() => new Set());
       const [openTouched, setOpenTouched] = React.useState(false); // [v2.14.29] 沒動過展開鈕時，預設只展開最新一天
+      // [v2.14.31] 電腦版（≥1280px，與 Tailwind xl: 成對）明細可切「表格（仿 Excel 月表）／清單」；手機永遠是清單
+      const [detailMode, setDetailMode] = React.useState('grid');
+      const [isWide, setIsWide] = React.useState(() => Boolean(window.matchMedia && window.matchMedia('(min-width: 1280px)').matches));
+      React.useEffect(() => {
+        if (!window.matchMedia) return undefined;
+        const mq = window.matchMedia('(min-width: 1280px)');
+        const onChange = (e) => setIsWide(e.matches);
+        mq.addEventListener ? mq.addEventListener('change', onChange) : mq.addListener(onChange);
+        return () => { mq.removeEventListener ? mq.removeEventListener('change', onChange) : mq.removeListener(onChange); };
+      }, []);
       React.useEffect(() => { setOpenTouched(false); }, [month]);
       const [form, setForm] = React.useState(null); // null = 不顯示；否則 { id?, type, date, amount, category, note }
       const [isSaving, setIsSaving] = React.useState(false);
@@ -6706,6 +6766,19 @@
       const overdueCount = pendingInScope.filter(x => financeDaysBetween(x.date, todayStr) >= FINANCE_PENDING_WARN_DAYS).length;
       const maxExpense = summary.expenseByCategory.reduce((m, c) => Math.max(m, Math.abs(c.amount)), 0) || 1;
       const maxIncome = summary.incomeByCategory.reduce((m, c) => Math.max(m, Math.abs(c.amount)), 0) || 1;
+      const canGrid = isWide && month !== 'all';
+      const showGrid = canGrid && detailMode === 'grid';
+      const monthGrid = React.useMemo(
+        () => (showGrid && view === 'detail' ? buildFinanceMonthGrid(entries, orderRevenue.orderAmounts, month) : null),
+        [showGrid, view, entries, orderRevenue, month]
+      );
+      const gridCellClick = (row, d) => {
+        const date = `${month}-${String(d).padStart(2, '0')}`;
+        const c = row.cells[d];
+        if (c.entries.length === 1) openEdit(c.entries[0]);
+        else if (c.entries.length > 1) { setDetailMode('list'); setOpenDays(new Set([date])); setOpenTouched(true); } // 同格多筆：切到清單看細項
+        else { setConfirmDelete(false); setForm({ type: row.type, date, amount: '', category: row.label, note: '' }); } // 空格：像在 Excel 打字一樣直接新增
+      };
       const latestDayDate = summary.days.length > 0 ? summary.days[0].date : '';
       const isDayOpen = (date) => (openTouched ? openDays.has(date) : date === latestDayDate);
       const allOpen = summary.days.length > 0 && summary.days.every(d => isDayOpen(d.date));
@@ -6892,7 +6965,7 @@
 
           {/* Body */}
           <div className="flex-1 overflow-y-auto">
-            <div className="max-w-3xl mx-auto p-4 space-y-4" style={{ paddingBottom: 'calc(env(safe-area-inset-bottom, 0px) + 96px)' }}>
+            <div className={`${showGrid && view === 'detail' ? 'max-w-[1700px]' : 'max-w-3xl'} mx-auto p-4 space-y-4`} style={{ paddingBottom: 'calc(env(safe-area-inset-bottom, 0px) + 96px)' }}>
               {error && <div className="bg-red-50 border border-red-200 text-red-700 text-xs rounded-xl p-3">{error}</div>}
               {loading && !error && <div className="text-center text-xs text-slate-400 py-10">載入中…</div>}
 
@@ -6990,13 +7063,91 @@
                     </div>
                   </div>
                   <div className="flex items-center justify-between">
-                    <h2 className="text-sm font-bold text-slate-800">每日明細</h2>
-                    {summary.days.length > 0 && (
-                      <button type="button" onClick={toggleAll} className="px-3 py-1 rounded-full text-xs border border-slate-200 bg-white text-slate-500 hover:text-emerald-700 hover:border-emerald-500">
-                        {allOpen ? '全部收合' : '全部展開'}
-                      </button>
-                    )}
+                    <h2 className="text-sm font-bold text-slate-800">{showGrid ? `${month.replace('-', ' / ')}　月表` : '每日明細'}</h2>
+                    <div className="flex items-center gap-2">
+                      {canGrid && (
+                        <div className="flex rounded-full border border-slate-200 bg-white overflow-hidden text-xs">
+                          <button type="button" onClick={() => setDetailMode('grid')} className={`px-3 py-1 ${showGrid ? 'bg-emerald-600 text-white font-bold' : 'text-slate-500'}`}>表格</button>
+                          <button type="button" onClick={() => setDetailMode('list')} className={`px-3 py-1 ${!showGrid ? 'bg-emerald-600 text-white font-bold' : 'text-slate-500'}`}>清單</button>
+                        </div>
+                      )}
+                      {!showGrid && summary.days.length > 0 && (
+                        <button type="button" onClick={toggleAll} className="px-3 py-1 rounded-full text-xs border border-slate-200 bg-white text-slate-500 hover:text-emerald-700 hover:border-emerald-500">
+                          {allOpen ? '全部收合' : '全部展開'}
+                        </button>
+                      )}
+                    </div>
                   </div>
+                  {showGrid && monthGrid ? (() => {
+                    const g = monthGrid;
+                    const dayNums = Array.from({ length: g.days }, (_, i) => i + 1);
+                    const fmt = (n) => (n === 0 ? '' : n.toLocaleString());
+                    const thCls = 'border border-slate-200 bg-slate-50 px-1.5 py-1.5 font-medium text-slate-500 min-w-[2.75rem] text-right';
+                    const lblCls = 'sticky left-0 z-10 border border-slate-200 bg-slate-50 px-2 py-1.5 text-left font-bold text-slate-700 min-w-[5.5rem] whitespace-nowrap';
+                    const sumCls = 'border border-slate-200 bg-slate-50 px-2 py-1.5 text-right font-bold text-slate-800 min-w-[4.5rem]';
+                    const head = (first) => (
+                      <tr>
+                        <th className={`${lblCls} text-slate-500 font-medium`}>{first}</th>
+                        {dayNums.map(d => <th key={d} className={thCls}>{d}</th>)}
+                        <th className={sumCls}>月合計</th>
+                      </tr>
+                    );
+                    const editableRow = (row, colorCls) => (
+                      <tr key={row.label}>
+                        <td className={lblCls}>{row.label}</td>
+                        {dayNums.map(d => {
+                          const c = row.cells[d];
+                          return (
+                            <td key={d} onClick={() => gridCellClick(row, d)} title={c.entries.length > 1 ? `${c.entries.length} 筆，點一下到清單看細項` : c.entries.length === 1 ? '點一下編輯' : '點一下新增'} className={`border border-slate-200 px-1.5 py-1.5 text-right cursor-pointer hover:bg-emerald-50 ${c.amount < 0 ? 'text-red-600' : colorCls}`}>{fmt(c.amount)}</td>
+                          );
+                        })}
+                        <td className={sumCls}>{fmt(row.total)}</td>
+                      </tr>
+                    );
+                    const totalRow = (label, arr, total) => (
+                      <tr className="font-bold">
+                        <td className={lblCls}>{label}</td>
+                        {dayNums.map(d => <td key={d} className={`border border-slate-200 bg-slate-50 px-1.5 py-1.5 text-right ${arr[d] === 0 ? 'text-slate-300' : 'text-slate-800'}`}>{arr[d].toLocaleString()}</td>)}
+                        <td className={sumCls}>{total.toLocaleString()}</td>
+                      </tr>
+                    );
+                    return (
+                      <div className="space-y-4">
+                        <div>
+                          <div className="text-xs font-bold text-slate-600 mb-1.5">支出表</div>
+                          <div className="bg-white rounded-xl border border-slate-200/80 overflow-x-auto">
+                            <table className="text-xs border-collapse w-max min-w-full tabular-nums">
+                              <thead>{head('項目')}</thead>
+                              <tbody>
+                                {g.expenseRows.map(r => editableRow(r, 'text-red-600'))}
+                                {totalRow('總額', g.expenseDay, g.expenseTotal)}
+                              </tbody>
+                            </table>
+                          </div>
+                        </div>
+                        <div>
+                          <div className="text-xs font-bold text-slate-600 mb-1.5">收入表</div>
+                          <div className="bg-white rounded-xl border border-slate-200/80 overflow-x-auto">
+                            <table className="text-xs border-collapse w-max min-w-full tabular-nums">
+                              <thead>{head('訂單')}</thead>
+                              <tbody>
+                                {g.orderRows.map(r => (
+                                  <tr key={r.label}>
+                                    <td className={lblCls}>{r.label}</td>
+                                    {dayNums.map(d => <td key={d} title={r.cells[d] ? '訂單營收（自動帶入，不能在這裡改）' : ''} className="border border-slate-200 px-1.5 py-1.5 text-right text-green-700">{fmt(r.cells[d])}</td>)}
+                                    <td className={sumCls}>{fmt(r.total)}</td>
+                                  </tr>
+                                ))}
+                                {g.extraIncomeRows.map(r => editableRow(r, 'text-green-700'))}
+                                {totalRow('總額', g.incomeDay, g.incomeTotal)}
+                              </tbody>
+                            </table>
+                          </div>
+                          <div className="text-[11px] text-slate-400 mt-1.5">訂單營收是由訂單自動帶入（只算已領貨、不含運費）；支出與現貨、團購、營收調整的格子可以點一下編輯，空格點一下可新增。</div>
+                        </div>
+                      </div>
+                    );
+                  })() : (<>
                   {summary.days.length === 0 && <div className="text-center text-xs text-slate-400 py-10">這個範圍還沒有紀錄，按右下角「＋」開始記帳</div>}
                   {summary.days.length > 0 && (
                     <div className="bg-white rounded-xl border border-slate-200/80 overflow-hidden">
@@ -7033,6 +7184,7 @@
                       })}
                     </div>
                   )}
+                  </>)}
                   <div className="h-20" />
                 </>
               )}
