@@ -59,7 +59,7 @@
     // ==========================================
     // config.js — 版本號 / Firebase設定 / 常數設定值
     // ==========================================
-    const APP_VERSION = '2.14.33';
+    const APP_VERSION = '2.14.34';
 
     // [v2.14.18] 尺寸系列：新增訂單與商品庫的尺寸快捷選項。存進資料庫的仍是「80, 90, 100」這種逗號字串，系列只是輸入輔助。
     // 要增減尺寸只改這裡；統一存大寫（與既有資料、sortSizes 的排序表一致）。
@@ -2312,6 +2312,8 @@
     };
 
     // 訂單列表統計卡（orderListStats 的 useMemo 內容）
+    // [v2.14.34] 改成「互不重疊的階段」：待出貨（未出貨）／待領貨（已出貨、未領）／已領貨（已出貨、已領）／棄單。
+    // 四者相加＝總訂單（已付款但還沒出貨的單算在「待出貨」，因為還要出貨）。棄單不算進其他階段，也不算進待收。
     const computeOrderListStats = (orders) => {
       let unpaidCount = 0;
       let unshippedCount = 0;
@@ -2322,13 +2324,17 @@
       let abandonedCount = 0;
       let abandonedAmount = 0;
       let paidCount = 0;
+      let pickupWaitingCount = 0; // 待領貨：已出貨、客人還沒領
+      let doneCount = 0;          // 已領貨：已出貨、已領
 
       orders.forEach(o => {
         const total = calcOrderSubtotal(o); // [v2.14.27] 統計只算商品金額，不含運費（運費不是店家收入；免運的運費由店家負擔，記在收支報表的「寄送運費」）
         if (o.closeStatus === 'abandoned') { // [v2.14.12] 棄單：不算未領貨、不算待收
           abandonedCount += 1;
           abandonedAmount += total;
-        } else if (o.paymentStatus) {
+          return;
+        }
+        if (o.paymentStatus) {
           paidCount += 1;
           receivedRevenue += total;
         } else {
@@ -2338,6 +2344,10 @@
         if (o.shipmentStatus !== 'shipped') {
           unshippedCount += 1;
           if (o.paymentStatus) readyToShipCount += 1; // 已付款、等著出貨
+        } else if (o.paymentStatus) {
+          doneCount += 1;
+        } else {
+          pickupWaitingCount += 1;
         }
       });
 
@@ -2349,6 +2359,8 @@
         abandonedAmount,
         unshippedCount,
         readyToShipCount,
+        pickupWaitingCount,
+        doneCount,
         receivedRevenue,
         pendingRevenue
       };
@@ -5380,41 +5392,58 @@
                   </div>
                 </div>
 
-                {/* Stats：手機一排四格。四格都是「標題 / 數字 / 小字」三行、靠上對齊，看起來才會整齊 */}
-                <div className="grid grid-cols-4 gap-1.5 sm:gap-3">
-                  <button
-                    type="button"
-                    onClick={handleClearOrderFilters}
-                    className="flex flex-col items-start justify-start text-left bg-white px-2 py-2 sm:p-4 rounded-xl sm:rounded-2xl border border-slate-200/80 shadow-sm transition min-w-0"
-                  >
-                    <span className="text-xs sm:text-sm font-semibold text-slate-500 leading-4 truncate w-full">總訂單</span>
-                    <span className="text-lg sm:text-2xl font-bold text-slate-800 leading-7">{orderListStats.total}</span>
-                    <span className="text-[10px] text-slate-400 leading-4 truncate w-full">商品合計 ${(orderListStats.receivedRevenue + orderListStats.pendingRevenue).toLocaleString()}</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setFilterPayment(filterPayment === 'unpaid' ? 'all' : 'unpaid')}
-                    className={`flex flex-col items-start justify-start text-left bg-white px-2 py-2 sm:p-4 rounded-xl sm:rounded-2xl border shadow-sm transition min-w-0 ${filterPayment === 'unpaid' ? 'border-amber-400 ring-1 ring-amber-300' : 'border-slate-200/80'}`}
-                  >
-                    <span className="text-xs sm:text-sm font-semibold text-amber-600 leading-4 truncate w-full">未領貨</span>
-                    <span className="text-lg sm:text-2xl font-bold text-amber-600 leading-7">{orderListStats.unpaidCount}</span>
-                    <span className="text-[10px] text-slate-400 leading-4 truncate w-full">待收 ${orderListStats.pendingRevenue.toLocaleString()}</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setFilterShipment(filterShipment === 'unshipped' ? 'all' : 'unshipped')}
-                    className={`flex flex-col items-start justify-start text-left bg-white px-2 py-2 sm:p-4 rounded-xl sm:rounded-2xl border shadow-sm transition min-w-0 ${filterShipment === 'unshipped' ? 'border-blue-400 ring-1 ring-blue-300' : 'border-slate-200/80'}`}
-                  >
-                    <span className="text-xs sm:text-sm font-semibold text-blue-600 leading-4 truncate w-full">待出貨</span>
-                    <span className="text-lg sm:text-2xl font-bold text-blue-600 leading-7">{orderListStats.unshippedCount}</span>
-                    <span className="text-[10px] text-slate-400 leading-4 truncate w-full">已領貨 {orderListStats.readyToShipCount} 筆</span>
-                  </button>
-                  <div className="flex flex-col items-start justify-start bg-white px-2 py-2 sm:p-4 rounded-xl sm:rounded-2xl border border-slate-200/80 shadow-sm min-w-0">
-                    <span className="text-xs sm:text-sm font-semibold text-emerald-700 leading-4 truncate w-full">已實收</span>
-                    <span className="text-lg sm:text-2xl font-bold text-emerald-700 leading-7 truncate w-full tracking-tight">${orderListStats.receivedRevenue.toLocaleString()}</span>
-                    <span className="text-[10px] text-slate-400 leading-4 truncate w-full">{orderListStats.paidCount} 筆已領貨・不含運</span>
-                  </div>
-                </div>
+                {/* Stats [v2.14.34]：四個「互不重疊」的階段（待出貨／待領貨／已領貨／棄單），加起來＝總訂單；金額另放一行 */}
+                {(() => {
+                  const stageDefs = [
+                    { key: 'toShip', label: '待出貨', hint: '還沒出貨', count: orderListStats.unshippedCount, pay: 'all', ship: 'unshipped',
+                      text: 'text-blue-600', ring: 'border-blue-400 ring-1 ring-blue-300' },
+                    { key: 'pickup', label: '待領貨', hint: '已出貨・未領', count: orderListStats.pickupWaitingCount, pay: 'unpaid', ship: 'shipped',
+                      text: 'text-amber-600', ring: 'border-amber-400 ring-1 ring-amber-300' },
+                    { key: 'done', label: '已領貨', hint: '款項已入帳', count: orderListStats.doneCount, pay: 'paid', ship: 'shipped',
+                      text: 'text-green-600', ring: 'border-green-400 ring-1 ring-green-300' },
+                    { key: 'abandoned', label: '棄單', hint: '不計營收', count: orderListStats.abandonedCount, pay: 'abandoned', ship: 'all',
+                      text: 'text-slate-500', ring: 'border-slate-400 ring-1 ring-slate-300' }
+                  ];
+                  return (
+                    <div className="space-y-1.5 sm:space-y-3">
+                      <button
+                        type="button"
+                        onClick={handleClearOrderFilters}
+                        className="w-full flex items-baseline justify-between px-1 text-left"
+                      >
+                        <span className="text-sm font-bold text-slate-800">共 {orderListStats.total} 筆</span>
+                        <span className="text-xs text-slate-400">商品合計 ${(orderListStats.receivedRevenue + orderListStats.pendingRevenue).toLocaleString()}</span>
+                      </button>
+                      <div className="grid grid-cols-4 gap-1.5 sm:gap-3">
+                        {stageDefs.map(st => {
+                          const active = filterPayment === st.pay && filterShipment === st.ship;
+                          return (
+                            <button
+                              key={st.key}
+                              type="button"
+                              onClick={() => { if (active) { setFilterPayment('all'); setFilterShipment('all'); } else { setFilterPayment(st.pay); setFilterShipment(st.ship); } }}
+                              className={`flex flex-col items-start justify-start text-left bg-white px-2 py-2 sm:p-4 rounded-xl sm:rounded-2xl border shadow-sm transition min-w-0 ${active ? st.ring : 'border-slate-200/80'}`}
+                            >
+                              <span className={`text-xs sm:text-sm font-semibold leading-4 truncate w-full ${st.text}`}>{st.label}</span>
+                              <span className={`text-lg sm:text-2xl font-bold leading-7 ${st.text}`}>{st.count}</span>
+                              <span className="text-[10px] text-slate-400 leading-4 truncate w-full">{st.hint}</span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                      <div className="grid grid-cols-2 gap-1.5 sm:gap-3">
+                        <div className="flex items-baseline justify-between gap-2 bg-white px-3 py-2 rounded-xl border border-slate-200/80 shadow-sm min-w-0">
+                          <span className="text-xs text-slate-500 whitespace-nowrap">已實收</span>
+                          <span className="text-sm sm:text-base font-bold text-emerald-700 tabular-nums truncate">${orderListStats.receivedRevenue.toLocaleString()}</span>
+                        </div>
+                        <div className="flex items-baseline justify-between gap-2 bg-white px-3 py-2 rounded-xl border border-slate-200/80 shadow-sm min-w-0">
+                          <span className="text-xs text-slate-500 whitespace-nowrap">待收</span>
+                          <span className="text-sm sm:text-base font-bold text-amber-600 tabular-nums truncate">${orderListStats.pendingRevenue.toLocaleString()}</span>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })()}
 
                 {/* Search Bar & Filters */}
                 <div className="bg-white rounded-2xl p-3 sm:p-4 border border-slate-200/80 shadow-sm space-y-2.5">
@@ -9789,7 +9818,8 @@
 
           const matchShipment = 
             filterShipment === 'all' ? true :
-            filterShipment === 'shipped' ? o.shipmentStatus === 'shipped' : o.shipmentStatus === 'unshipped';
+            filterShipment === 'shipped' ? o.shipmentStatus === 'shipped'
+              : (o.shipmentStatus !== 'shipped' && !isAbandoned); // [v2.14.34] 「未出貨」不含棄單（棄單不用出貨），與統計卡「待出貨」同一個定義
 
           const matchDelivery =
             filterDelivery === 'all' ? true : (o.deliveryMethod || '').includes(filterDelivery);
