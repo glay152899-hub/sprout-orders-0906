@@ -59,7 +59,7 @@
     // ==========================================
     // config.js — 版本號 / Firebase設定 / 常數設定值
     // ==========================================
-    const APP_VERSION = '2.14.32';
+    const APP_VERSION = '2.14.33';
 
     // [v2.14.18] 尺寸系列：新增訂單與商品庫的尺寸快捷選項。存進資料庫的仍是「80, 90, 100」這種逗號字串，系列只是輸入輔助。
     // 要增減尺寸只改這裡；統一存大寫（與既有資料、sortSizes 的排序表一致）。
@@ -1517,8 +1517,129 @@
       return { ...draft, orderTimestamp: r.timestamp, yearSource: r.source };
     };
 
+    // ==========================================
+    // [v2.14.33] 訂購單「分頁顏色」→ 訂單狀態
+    // 老婆的慣例：黑＝已領貨、綠＝已出貨未領貨、紅＝已叫貨（廠商未到貨）未出貨、灰＝契丹（棄單），
+    // 其他顏色＝她拿來分類團購的（團購領貨後會改成黑色）。
+    // SheetJS 社群版不解析分頁顏色，但用 bookFiles:true 讀入時保留了原始 XML，這裡直接從 XML 取。
+    // 顏色可能是 RGB、佈景主題色（黑色通常是主題色 1）或索引色，統一換算成 #RRGGBB。
+    // ==========================================
+    const ORDER_IMPORT_DEFAULT_SHEET_NAME = /^(?:工作表|Sheet)\s*\d+$/i;   // Excel 自動命名的空白分頁，沒有商品時直接略過
+
+    const EXCEL_INDEXED_COLORS = {
+      8: '000000', 9: 'FFFFFF', 10: 'FF0000', 11: '00FF00', 12: '0000FF', 13: 'FFFF00', 14: 'FF00FF', 15: '00FFFF',
+      16: '800000', 17: '008000', 18: '000080', 19: '808000', 20: '800080', 21: '008080', 22: 'C0C0C0', 23: '808080', 64: '000000'
+    };
+
+    const applyColorTint = (hex6, tint) => {
+      const t = Number(tint) || 0;
+      if (!t) return hex6;
+      const ch = [0, 2, 4].map(i => parseInt(hex6.slice(i, i + 2), 16));
+      const out = ch.map(c => Math.max(0, Math.min(255, Math.round(t > 0 ? c + (255 - c) * t : c * (1 + t)))));
+      return out.map(c => c.toString(16).padStart(2, '0')).join('').toUpperCase();
+    };
+
+    // 回傳 { 分頁名稱: '#RRGGBB' | null }。活頁簿不是用 bookFiles:true 讀的（或是舊版 .xls）時回傳空物件。
+    const readSheetTabColors = (workbook) => {
+      const result = {};
+      try {
+        const files = workbook && workbook.files;
+        const sheetsMeta = workbook && workbook.Workbook && workbook.Workbook.Sheets;
+        if (!files || !sheetsMeta) return result;
+        const decoder = new TextDecoder('utf-8');
+        const text = (entry) => {
+          if (!entry) return '';
+          const c = entry.content !== undefined ? entry.content : entry;
+          return typeof c === 'string' ? c : decoder.decode(c);
+        };
+
+        // 分頁名稱 → 檔案路徑（xl/workbook.xml.rels）
+        const relMap = {};
+        const relsXml = text(files['xl/_rels/workbook.xml.rels']);
+        (relsXml.match(/<Relationship\b[^>]*>/g) || []).forEach((tag) => {
+          const id = /\bId="([^"]+)"/.exec(tag);
+          const target = /\bTarget="([^"]+)"/.exec(tag);
+          if (id && target) relMap[id[1]] = target[1].replace(/^\//, '').replace(/^(?!xl\/)/, 'xl/');
+        });
+
+        // 佈景主題色：索引 0 lt1、1 dk1、2 lt2、3 dk2、4～9 accent1～6
+        const themeXml = text(files['xl/theme/theme1.xml']);
+        const themeOrder = ['lt1', 'dk1', 'lt2', 'dk2', 'accent1', 'accent2', 'accent3', 'accent4', 'accent5', 'accent6'];
+        const themeColors = {};
+        const scheme = /<a:clrScheme[\s\S]*?<\/a:clrScheme>/.exec(themeXml);
+        if (scheme) {
+          themeOrder.forEach((name) => {
+            const m = new RegExp(`<a:${name}>([\\s\\S]*?)</a:${name}>`).exec(scheme[0]);
+            if (!m) return;
+            const v = /lastClr="([0-9A-Fa-f]{6})"/.exec(m[1]) || /val="([0-9A-Fa-f]{6})"/.exec(m[1]);
+            if (v) themeColors[name] = v[1].toUpperCase();
+          });
+        }
+
+        sheetsMeta.forEach((sheet) => {
+          const xml = text(files[relMap[sheet.id]]).slice(0, 4000);   // <sheetPr><tabColor/> 在檔案最前面
+          const m = /<tabColor\b([^>]*?)\/?>/.exec(xml);
+          let hex = null;
+          if (m) {
+            const attrs = m[1];
+            const rgb = /\brgb="([0-9A-Fa-f]{6,8})"/.exec(attrs);
+            const theme = /\btheme="(\d+)"/.exec(attrs);
+            const indexed = /\bindexed="(\d+)"/.exec(attrs);
+            const tint = /\btint="(-?[\d.]+)"/.exec(attrs);
+            let base = null;
+            if (rgb) base = rgb[1].slice(-6).toUpperCase();
+            else if (theme) base = themeColors[themeOrder[Number(theme[1])]] || null;
+            else if (indexed) base = EXCEL_INDEXED_COLORS[Number(indexed[1])] || null;
+            if (base) hex = '#' + applyColorTint(base, tint ? tint[1] : 0);
+          }
+          result[sheet.name] = hex;
+        });
+      } catch (err) {
+        console.warn('讀取分頁顏色失敗（略過，不影響匯入）：', err);
+      }
+      return result;
+    };
+
+    // 把分頁顏色歸類：黑／灰／綠／紅 是狀態色，其他顏色是團購分類色（每種顏色各自一組），沒有顏色＝none。
+    // 回傳 { key, label, hex }
+    const classifyTabColor = (hex) => {
+      const m = /^#?([0-9A-Fa-f]{6})$/.exec(String(hex || ''));
+      if (!m) return { key: 'none', label: '無顏色', hex: null };
+      const h = m[1].toUpperCase();
+      const [r, g, b] = [0, 2, 4].map(i => parseInt(h.slice(i, i + 2), 16));
+      const max = Math.max(r, g, b);
+      const min = Math.min(r, g, b);
+      const delta = max - min;
+      const sat = max === 0 ? 0 : delta / max;
+      const val = max / 255;
+      let hue = 0;
+      if (delta > 0) {
+        if (max === r) hue = 60 * (((g - b) / delta) % 6);
+        else if (max === g) hue = 60 * ((b - r) / delta + 2);
+        else hue = 60 * ((r - g) / delta + 4);
+        if (hue < 0) hue += 360;
+      }
+      const color = '#' + h;
+      if (min >= 0xE0 && sat < 0.1) return { key: 'none', label: '無顏色', hex: null };            // 白色＝沒上色
+      if (max <= 0x40) return { key: 'black', label: '黑', hex: color };
+      if (sat <= 0.12) return { key: 'gray', label: '灰', hex: color };
+      if (sat >= 0.35 && hue >= 70 && hue <= 170) return { key: 'green', label: '綠', hex: color };
+      if (sat >= 0.6 && val >= 0.5 && (hue <= 12 || hue >= 348)) return { key: 'red', label: '紅', hex: color };
+      return { key: `other:${h}`, label: '團購色', hex: color };
+    };
+
+    // 各種分頁顏色匯入時的預設訂單狀態（對應 modal-order.js 的 ORDER_IMPORT_STATUS）；使用者可在預覽視窗逐色更改
+    const defaultImportStatusForTabColor = (key) => {
+      if (key === 'black') return 'done';        // 已領貨
+      if (key === 'green') return 'shipped';     // 已出貨未領貨
+      if (key === 'red') return 'pending';       // 已叫貨、廠商未到貨、未出貨
+      if (key === 'gray') return 'abandoned';    // 契丹＝棄單
+      return 'pending';                          // 團購色：領貨後她會改成黑色，所以顏色還在就是還沒領貨
+    };
+
     const parseOrderExcelWorkbook = (workbook, defaultShippingFee = 38, options = {}) => {
       const drafts = [];
+      const tabColors = readSheetTabColors(workbook);   // [v2.14.33] { 分頁名稱: '#RRGGBB' | null }
 
       workbook.SheetNames.forEach(sheetName => {
         const cleanedSheetName = sheetName.trim();
@@ -1694,6 +1815,9 @@
             }));
           }
 
+          // [v2.14.33] Excel 自動命名的空白分頁（工作表28 之類）沒有商品就不要當成訂單
+          if (draftItems.length === 0 && ORDER_IMPORT_DEFAULT_SHEET_NAME.test(cleanedSheetName)) return;
+
           const sheetDate = parseSheetNameDate(cleanedSheetName, { assumedYear: options.assumedYear });
           drafts.push({
             orderNo: cleanedSheetName,
@@ -1711,7 +1835,8 @@
             // 以下兩個欄位僅供預覽與計算用，寫入資料庫前會移除
             excelTotal,
             orderTimestamp: sheetDate ? sheetDate.timestamp : null,
-            yearSource: sheetDate ? sheetDate.source : null   // [v2.14.4] full／roc／mmdd-chosen／mmdd-guessed／null
+            yearSource: sheetDate ? sheetDate.source : null,  // [v2.14.4] full／roc／mmdd-chosen／mmdd-guessed／null
+            tabColor: tabColors[sheetName] || null            // [v2.14.33] 分頁顏色 '#RRGGBB'，只供預覽決定訂單狀態，不寫入資料庫
           });
         }
       });
@@ -3133,8 +3258,11 @@
     const ORDER_IMPORT_STATUS = {
       pending: { key: 'pending', label: '待處理', desc: '未領貨、待出貨（新的訂單）', paymentStatus: false, shipmentStatus: 'unshipped' },
       shipped: { key: 'shipped', label: '已出貨', desc: '未領貨（已出貨，等客人取貨）', paymentStatus: false, shipmentStatus: 'shipped' },
-      done: { key: 'done', label: '已完成', desc: '已領貨、已出貨（舊訂單歸檔）', paymentStatus: true, shipmentStatus: 'shipped' }
+      done: { key: 'done', label: '已完成', desc: '已領貨、已出貨（舊訂單歸檔）', paymentStatus: true, shipmentStatus: 'shipped' },
+      // [v2.14.33] 只出現在「分頁顏色」下拉（灰色＝棄單），不放進上面三個大按鈕
+      abandoned: { key: 'abandoned', label: '棄單', desc: '已出貨但客人沒領（不計營收）', paymentStatus: false, shipmentStatus: 'shipped', closeStatus: 'abandoned' }
     };
+    const ORDER_IMPORT_GLOBAL_KEYS = ['pending', 'shipped', 'done'];
 
     // 訂單 Excel 匯入預覽 Modal（可勾選、標示重複單號 / 已對齊 Excel 總計）
     function OrderImportPreviewModal({ drafts, existingOrderNos, existingOrders, trashOrderNos, isSaving, onClose, onConfirm, suggestedYear }) {
@@ -3180,6 +3308,30 @@
         });
       }, [shownDrafts, existingOrderNos, existingOrders, trashOrderNos]);
 
+      // [v2.14.33] 分頁顏色 → 訂單狀態：黑＝已完成、綠＝已出貨、紅＝待處理、灰＝棄單、其他顏色（團購）＝待處理，可逐色更改；
+      // 沒有顏色的訂單用下面「匯入後的訂單狀態」。'skip' ＝這個顏色的訂單不匯入。
+      const [colorStatus, setColorStatus] = React.useState({});
+      const colorGroups = React.useMemo(() => {
+        const map = new Map();
+        rows.forEach((r) => {
+          if (r.isEmpty) return;
+          const c = classifyTabColor(r.d.tabColor);
+          if (c.key === 'none') return;
+          if (!map.has(c.key)) map.set(c.key, { ...c, count: 0, names: [] });
+          const g = map.get(c.key);
+          g.count += 1;
+          if (g.names.length < 3) g.names.push(r.d.customerName);
+        });
+        return Array.from(map.values());
+      }, [rows]);
+      const hasColorGroups = colorGroups.length > 0;
+      const colorStatusOf = (key) => colorStatus[key] || defaultImportStatusForTabColor(key);
+      // 每筆訂單實際會用的狀態 key（'skip'＝不匯入）
+      const statusKeyOfRow = (r) => {
+        const c = classifyTabColor(r.d.tabColor);
+        return c.key === 'none' ? statusKey : colorStatusOf(c.key);
+      };
+
       const [selected, setSelected] = React.useState(
         () => new Set(rows.filter(r => !r.isDuplicate && !r.similar && !r.isEmpty).map(r => r.idx))
       );
@@ -3193,7 +3345,7 @@
         });
       };
 
-      const importableIdx = rows.filter(r => !r.isEmpty).map(r => r.idx);
+      const importableIdx = rows.filter(r => !r.isEmpty && statusKeyOfRow(r) !== 'skip').map(r => r.idx);
       const allChecked = importableIdx.length > 0 && importableIdx.every(i => selected.has(i));
       const toggleAll = () => {
         setSelected(allChecked ? new Set() : new Set(importableIdx));
@@ -3201,7 +3353,9 @@
 
       const duplicateCount = rows.filter(r => r.isDuplicate || r.similar).length;
       const adjustedCount = rows.filter(r => r.adjustLine).length;
-      const selectedTotal = rows.filter(r => selected.has(r.idx)).reduce((s, r) => s + r.computed, 0);
+      // [v2.14.33] 顏色設成「不匯入」的訂單即使被勾選也不會匯入，也不計入已選筆數與合計
+      const chosenRows = rows.filter(r => selected.has(r.idx) && !r.isEmpty && statusKeyOfRow(r) !== 'skip');
+      const selectedTotal = chosenRows.reduce((s, r) => s + r.computed, 0);
 
       return (
         <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-sm flex items-center justify-center p-4 overflow-y-auto">
@@ -3242,10 +3396,36 @@
               </div>
             )}
 
+            {hasColorGroups && (
+              <div className="px-4 pt-3 space-y-1.5">
+                <div className="text-xs font-bold text-slate-600">分頁顏色 → 訂單狀態</div>
+                {colorGroups.map(g => (
+                  <div key={g.key} className="flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-2.5 py-2">
+                    <span className="w-4 h-4 rounded-full border border-slate-300 flex-shrink-0" style={{ background: g.hex }} />
+                    <div className="flex-1 min-w-0">
+                      <div className="text-xs font-bold text-slate-700">{g.label}　{g.count} 筆</div>
+                      <div className="text-[10px] text-slate-400 truncate">{g.names.join('、')}{g.count > g.names.length ? '…' : ''}</div>
+                    </div>
+                    <select
+                      value={colorStatusOf(g.key)}
+                      onChange={(e) => setColorStatus(prev => ({ ...prev, [g.key]: e.target.value }))}
+                      className="text-xs border border-slate-300 rounded-lg px-1.5 py-1.5 bg-white font-bold text-slate-700"
+                    >
+                      {Object.values(ORDER_IMPORT_STATUS).map(opt => <option key={opt.key} value={opt.key}>{opt.label}</option>)}
+                      <option value="skip">不匯入</option>
+                    </select>
+                  </div>
+                ))}
+                <p className="text-[11px] text-slate-500 leading-snug">
+                  預設：黑＝已完成（已領貨）、綠＝已出貨未領貨、紅＝待處理（已叫貨、廠商未到貨）、灰＝棄單；其他顏色是團購分類，領貨後才會改成黑色，所以預設待處理，請依實際狀況選擇。
+                </p>
+              </div>
+            )}
+
             <div className="px-4 pt-3 space-y-1.5">
-              <div className="text-xs font-bold text-slate-600">匯入後的訂單狀態</div>
+              <div className="text-xs font-bold text-slate-600">{hasColorGroups ? '沒有分頁顏色的訂單，匯入後的狀態' : '匯入後的訂單狀態'}</div>
               <div className="grid grid-cols-3 gap-1.5">
-                {Object.values(ORDER_IMPORT_STATUS).map(opt => (
+                {ORDER_IMPORT_GLOBAL_KEYS.map(k => ORDER_IMPORT_STATUS[k]).map(opt => (
                   <button
                     key={opt.key}
                     type="button"
@@ -3275,12 +3455,12 @@
                   key={r.idx}
                   className={`rounded-xl border p-3 text-xs sm:text-sm transition ${
                     selected.has(r.idx) ? 'border-emerald-300 bg-emerald-50/40' : 'border-slate-200 bg-white'
-                  } ${r.isEmpty ? 'opacity-60' : ''}`}
+                  } ${r.isEmpty || statusKeyOfRow(r) === 'skip' ? 'opacity-60' : ''}`}
                 >
                   <div className="flex items-start gap-3">
                     <input
                       type="checkbox"
-                      disabled={r.isEmpty}
+                      disabled={r.isEmpty || statusKeyOfRow(r) === 'skip'}
                       checked={selected.has(r.idx)}
                       onChange={() => toggleOne(r.idx)}
                       className="w-4 h-4 mt-1 accent-emerald-600"
@@ -3299,6 +3479,12 @@
                         {r.similar && <span className="text-[11px] bg-amber-100 text-amber-800 px-2 py-0.5 rounded-full font-bold">疑似已存在（{formatOrderStamp(r.similar)} 建立）</span>}
                         {r.inTrash && <span className="text-[11px] bg-slate-200 text-slate-600 px-2 py-0.5 rounded-full font-bold">回收桶有同單號</span>}
                         {r.isEmpty && <span className="text-[11px] bg-red-100 text-red-700 px-2 py-0.5 rounded-full font-bold">無商品</span>}
+                        {hasColorGroups && !r.isEmpty && (
+                          <span className="inline-flex items-center gap-1 text-[11px] bg-slate-100 text-slate-700 px-2 py-0.5 rounded-full font-bold">
+                            {r.d.tabColor && <span className="w-2.5 h-2.5 rounded-full border border-slate-300" style={{ background: r.d.tabColor }} />}
+                            {statusKeyOfRow(r) === 'skip' ? '不匯入' : ORDER_IMPORT_STATUS[statusKeyOfRow(r)].label}
+                          </span>
+                        )}
                         {r.adjustLine && <span className="text-[11px] bg-amber-100 text-amber-800 px-2 py-0.5 rounded-full font-bold">含差額調整</span>}
                       </div>
                       <div className="text-[11px] sm:text-xs text-slate-500 mt-0.5">
@@ -3343,7 +3529,7 @@
 
             <div className="p-4 bg-slate-50 border-t border-slate-100 flex items-center justify-between gap-2">
               <span className="text-xs text-slate-500">
-                已選 {selected.size} / {rows.length} 筆 · 合計 ${selectedTotal}
+                已選 {chosenRows.length} / {rows.length} 筆 · 合計 ${selectedTotal}
               </span>
               <div className="flex gap-2">
                 <button type="button" onClick={onClose} className="px-4 py-2 bg-slate-200 hover:bg-slate-300 text-slate-700 font-semibold rounded-xl text-xs sm:text-sm transition">
@@ -3351,12 +3537,12 @@
                 </button>
                 <button
                   type="button"
-                  disabled={selected.size === 0 || isSaving}
-                  onClick={() => onConfirm(rows.filter(r => selected.has(r.idx)).map(r => r.d), statusKey)}
+                  disabled={chosenRows.length === 0 || isSaving}
+                  onClick={() => onConfirm(chosenRows.map(r => r.d), statusKey, chosenRows.map(r => statusKeyOfRow(r)))}
                   className="px-5 py-2 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed text-white font-semibold rounded-xl text-xs sm:text-sm transition shadow flex items-center gap-1.5"
                 >
                   <IconCheck size={18} />
-                  {isSaving ? '寫入中...' : `確認匯入 ${selected.size} 筆`}
+                  {isSaving ? '寫入中...' : `確認匯入 ${chosenRows.length} 筆`}
                 </button>
               </div>
             </div>
@@ -8691,7 +8877,7 @@
         reader.onload = (evt) => {
           try {
             const data = new Uint8Array(evt.target.result);
-            const workbook = XLSX.read(data, { type: 'array' });
+            const workbook = XLSX.read(data, { type: 'array', bookFiles: true });   // [v2.14.33] bookFiles：保留原始 XML，才讀得到分頁顏色
             const drafts = parseOrderExcelWorkbook(workbook, shippingConfig.fees['7-11 取貨付款']);
 
             if (drafts.length === 0) {
@@ -8719,14 +8905,16 @@
       };
 
       // 確認匯入：以「附加」方式一次寫入雲端（不會覆蓋現有訂單）
-      const handleConfirmOrderImport = async (selectedDrafts, statusKey = 'pending') => {
+      const handleConfirmOrderImport = async (selectedDrafts, statusKey = 'pending', statusKeys = null) => {
         if (selectedDrafts.length === 0) {
           showToast('請至少勾選一筆訂單');
           return;
         }
         if (!requireConnection('匯入訂單')) return;
 
-        const importStatus = ORDER_IMPORT_STATUS[statusKey] || ORDER_IMPORT_STATUS.pending;
+        const defaultImportStatus = ORDER_IMPORT_STATUS[statusKey] || ORDER_IMPORT_STATUS.pending;
+        // [v2.14.33] 預覽視窗可依「分頁顏色」逐筆指定狀態（statusKeys 與 selectedDrafts 一一對應）；沒給就全部用 statusKey
+        const importStatusOf = (i) => (statusKeys && ORDER_IMPORT_STATUS[statusKeys[i]]) || defaultImportStatus;
 
         setIsOrderImporting(true);
         try {
@@ -8743,7 +8931,8 @@
 
           selectedDrafts.forEach((draft, i) => {
             const newKey = dbRef('orders').push().key;
-            const { excelTotal, orderTimestamp, yearSource, ...orderData } = draft; // yearSource 只供預覽用，不寫入資料庫
+            const { excelTotal, orderTimestamp, yearSource, tabColor, ...orderData } = draft; // yearSource、tabColor 只供預覽用，不寫入資料庫
+            const importStatus = importStatusOf(i);
             const baseTs = orderTimestamp || now; // [V2.4] 以工作表名稱推算的建單日期為準
             const linkedItems = orderData.items.map(item => {
               if (item.sku || isAdjustmentItem(item)) return item;
@@ -8753,7 +8942,8 @@
             updates[newKey] = {
               ...orderData,
               // [v2.14.12] 姓名／單號／備註含「棄單」「取消」（她 Excel 的慣例）→ 匯入時直接標成棄單，不算已領貨
-              ...(/棄單|取消/.test(`${orderData.customerName || ''} ${orderData.orderNo || ''} ${orderData.note || ''}`)
+              // [v2.14.33] 預覽選了「棄單」（例如灰色分頁）也一樣標成棄單
+              ...((importStatus.closeStatus === 'abandoned' || /棄單|取消/.test(`${orderData.customerName || ''} ${orderData.orderNo || ''} ${orderData.note || ''}`))
                 ? { paymentStatus: false, closeStatus: 'abandoned' }
                 : { paymentStatus: importStatus.paymentStatus }),     // [V2.8] 由使用者在預覽視窗指定
               shipmentStatus: importStatus.shipmentStatus,
@@ -8764,7 +8954,12 @@
           });
 
           await withSyncTracking(dbRef('orders').update(updates));
-          logAction('order_import', 'order', '', `匯入 Excel 訂單 ${selectedDrafts.length} 筆（${importStatus.label}）：${summarizeNames(selectedDrafts.map(d => d.customerName))}`);
+          // 狀態說明：全部同一種狀態維持原樣「（已完成）」；混合時列出各狀態筆數「（已完成 12、已出貨 3）」
+          const statusCounts = {};
+          selectedDrafts.forEach((_, i) => { const label = importStatusOf(i).label; statusCounts[label] = (statusCounts[label] || 0) + 1; });
+          const statusLabels = Object.keys(statusCounts);
+          const statusSummary = statusLabels.length === 1 ? statusLabels[0] : statusLabels.map(l => `${l} ${statusCounts[l]}`).join('、');
+          logAction('order_import', 'order', '', `匯入 Excel 訂單 ${selectedDrafts.length} 筆（${statusSummary}）：${summarizeNames(selectedDrafts.map(d => d.customerName))}`);
           showToast(`🎉 成功匯入 ${selectedDrafts.length} 筆訂單至雲端！`);
           setIsOrderImportModalOpen(false);
           setOrderImportDrafts([]);
