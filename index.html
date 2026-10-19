@@ -59,7 +59,7 @@
     // ==========================================
     // config.js — 版本號 / Firebase設定 / 常數設定值
     // ==========================================
-    const APP_VERSION = '2.14.35';
+    const APP_VERSION = '2.14.36';
 
     // [v2.14.18] 尺寸系列：新增訂單與商品庫的尺寸快捷選項。存進資料庫的仍是「80, 90, 100」這種逗號字串，系列只是輸入輔助。
     // 要增減尺寸只改這裡；統一存大寫（與既有資料、sortSizes 的排序表一致）。
@@ -7026,7 +7026,7 @@
           setView('year');
         } catch (err) {
           console.error('Finance import error:', err);
-          showToast('❌ 匯入失敗，請檢查網路或權限後再試（已寫入的部分重新匯入同一份即可，不會重複）');
+          showToast('❌ 匯入失敗，請檢查網路或權限後再試。已寫入的部分重新匯入同一份即可，不會重複。');
           setImp(cur => (cur ? { ...cur, busy: false } : cur));
         }
       };
@@ -7873,6 +7873,113 @@
     }
   </script>
   <script type="text/babel">
+    // ============================================================
+    // ui-feedback.js [v2.14.36]
+    // 提示訊息的畫面元件：短訊息（ToastBanner）、可復原的短訊息（UndoBanner）、自製確認視窗（SystemConfirmDialog）。
+    // 為什麼自己做：瀏覽器內建的 window.confirm 會在標題顯示網址（例：xxx.github.io 顯示），程式無法修改，
+    // 版面也無法調整；自製視窗統一顯示紅色「系統提示」。
+    // 相依：icons.js（IconAlertTriangle）。不放 Firebase／業務邏輯；狀態與 askConfirm 在 app-shell.js。
+    // ============================================================
+
+    // 把訊息開頭的 emoji 拆成「圖示欄」與「文字欄」，換行時第二行才會對齊文字（不會跑回最左邊）
+    const splitLeadingEmoji = (message) => {
+      const text = String(message == null ? '' : message);
+      const m = /^((?:\p{Extended_Pictographic}[\uFE0F\u200D]*)+)\s*([\s\S]*)$/u.exec(text);
+      return m ? { icon: m[1], text: m[2] } : { icon: '', text };
+    };
+
+    // 依開頭圖示判斷訊息類型（左邊色條）：錯誤紅、警告橘、成功綠、其他灰
+    const toastToneOf = (icon) => {
+      if (/[❌⛔🚫]/u.test(icon)) return 'error';
+      if (/[⚠📵⏳]/u.test(icon)) return 'warn';
+      if (/[✅🎉🧹↩📋📊🗑]/u.test(icon)) return 'ok';
+      return 'info';
+    };
+    const TOAST_TONE_BORDER = { error: 'border-red-500', warn: 'border-amber-400', ok: 'border-green-500', info: 'border-slate-400' };
+
+    // 訊息顯示時間（毫秒）：字越多停留越久，最少 2.5 秒、最多 6 秒
+    const toastDurationOf = (message) => Math.min(6000, Math.max(2500, 1800 + String(message == null ? '' : message).length * 80));
+
+    function ToastBanner({ message }) {
+      const { icon, text } = splitLeadingEmoji(message);
+      const tone = TOAST_TONE_BORDER[toastToneOf(icon)];
+      return (
+        <div className="fixed top-3 inset-x-0 z-[70] flex justify-center px-3 pointer-events-none">
+          <div role="status" className={`pointer-events-auto w-full max-w-md bg-slate-900 text-white rounded-2xl border-l-4 ${tone} shadow-2xl flex items-start gap-2 px-3.5 py-2.5 text-[13px] leading-relaxed`}>
+            {icon && <span className="flex-none w-5 text-center">{icon}</span>}
+            <span className="flex-1 min-w-0 break-words">{text}</span>
+          </div>
+        </div>
+      );
+    }
+
+    function UndoBanner({ message, onUndo }) {
+      const { icon, text } = splitLeadingEmoji(message);
+      const tone = TOAST_TONE_BORDER[toastToneOf(icon)];
+      return (
+        <div className="fixed bottom-24 md:bottom-8 inset-x-0 z-[70] flex justify-center px-3 pointer-events-none">
+          <div role="status" className={`pointer-events-auto w-full max-w-md bg-slate-900 text-white rounded-2xl border-l-4 ${tone} shadow-2xl flex items-center gap-2 pl-3.5 pr-2.5 py-2 text-[13px] leading-relaxed`}>
+            {icon && <span className="flex-none w-5 text-center">{icon}</span>}
+            <span className="flex-1 min-w-0 break-words">{text}</span>
+            <button type="button" onClick={onUndo} className="flex-none px-3.5 py-1.5 rounded-full bg-amber-400 text-slate-900 font-bold text-xs">復原</button>
+          </div>
+        </div>
+      );
+    }
+
+    // 重點加粗：「…」裡的名稱、金額、「無法復原」（紅色）
+    const emphasizeSystemLine = (line) => {
+      const parts = line.split(/(「[^」]*」|\$[\d,]+|無法復原)/g);
+      return parts.map((p, i) => {
+        if (!p) return null;
+        if (p === '無法復原') return <b key={i} className="text-red-600">{p}</b>;
+        if (/^(「[^」]*」|\$[\d,]+)$/.test(p)) return <b key={i}>{p}</b>;
+        return <React.Fragment key={i}>{p}</React.Fragment>;
+      });
+    };
+
+    // 訊息排版：每一行一段；空白行＝多一點間距；「・」開頭＝條列（換行對齊文字）；整行被括號包住＝小字備註
+    const renderSystemMessage = (message) => String(message == null ? '' : message).split('\n').map((line, i) => {
+      if (line.trim() === '') return <div key={i} className="h-2" />;
+      const bullet = /^[・•]\s*(.*)$/.exec(line);
+      if (bullet) {
+        return (
+          <div key={i} className="flex gap-1.5 text-sm leading-relaxed text-slate-800">
+            <span className="flex-none w-3 text-center">・</span>
+            <span className="flex-1 min-w-0 break-words">{emphasizeSystemLine(bullet[1])}</span>
+          </div>
+        );
+      }
+      if (/^[（(].*[）)]$/.test(line.trim())) {
+        return <p key={i} className="text-xs leading-relaxed text-slate-500 break-words">{line.trim()}</p>;
+      }
+      return <p key={i} className="text-sm leading-relaxed text-slate-800 break-words">{emphasizeSystemLine(line)}</p>;
+    });
+
+    function SystemConfirmDialog({ dialog, onClose }) {
+      React.useEffect(() => {
+        const onKey = (e) => { if (e.key === 'Escape') onClose(false); };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, [onClose]);
+      return (
+        <div className="fixed inset-0 z-[80] flex items-center justify-center bg-slate-900/55 p-5" role="dialog" aria-modal="true" onClick={() => onClose(false)}>
+          <div className="w-full max-w-sm bg-white rounded-3xl shadow-2xl p-5" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center gap-1.5 text-base font-bold text-red-600 mb-3">
+              <IconAlertTriangle size={18} />
+              系統提示
+            </div>
+            <div className="space-y-1">{renderSystemMessage(dialog.message)}</div>
+            <div className="flex gap-2 mt-5">
+              <button type="button" onClick={() => onClose(false)} className="flex-1 py-2.5 rounded-xl text-sm font-bold bg-slate-100 text-slate-700 border border-slate-200 active:scale-[0.98]">{dialog.cancelLabel}</button>
+              <button type="button" onClick={() => onClose(true)} className={`flex-1 py-2.5 rounded-xl text-sm font-bold text-white active:scale-[0.98] ${dialog.danger ? 'bg-red-600' : 'bg-emerald-600'}`}>{dialog.confirmLabel}</button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+  </script>
+  <script type="text/babel">
     // ==========================================
     // Main Component: SproutOrderAssistant
     // ==========================================
@@ -7910,6 +8017,10 @@
       const [isSavingShippingConfig, setIsSavingShippingConfig] = React.useState(false); // [V2.5] 已登入但帳號不在規則白名單內
 
       const [toastMessage, setToastMessage] = React.useState('');
+      const toastTimerRef = React.useRef(null);
+      // [v2.14.36] 自製確認視窗（取代瀏覽器內建 window.confirm，標題統一為紅色「系統提示」）
+      const [confirmDialog, setConfirmDialog] = React.useState(null);
+      const confirmResolverRef = React.useRef(null);
       const [confirmDeleteId, setConfirmDeleteId] = React.useState(null);
 
       // Product Library Enhanced States V5.1
@@ -7977,8 +8088,24 @@
       const [isFinanceOpen, setIsFinanceOpen] = React.useState(false);
 
       const showToast = (msg) => {
+        // [v2.14.36] 連續出現訊息時，舊的計時器要取消（否則會提早把新訊息關掉）；字越多停留越久
+        if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
         setToastMessage(msg);
-        setTimeout(() => setToastMessage(''), 2500);
+        toastTimerRef.current = setTimeout(() => setToastMessage(''), toastDurationOf(msg));
+      };
+
+      // [v2.14.36] 用法：`if (!(await askConfirm('訊息', { confirmLabel: '永久刪除', danger: true }))) return;`（呼叫它的函式必須是 async）
+      // 訊息每個 \n 一行；開頭「・」＝條列；整行被（）包住＝小字備註。同時只會有一個視窗：新的出現時，舊的視為「取消」。
+      const askConfirm = (message, { confirmLabel = '確定', cancelLabel = '取消', danger = false } = {}) => new Promise((resolve) => {
+        if (confirmResolverRef.current) confirmResolverRef.current(false);
+        confirmResolverRef.current = resolve;
+        setConfirmDialog({ message, confirmLabel, cancelLabel, danger });
+      });
+      const closeConfirm = (result) => {
+        const resolve = confirmResolverRef.current;
+        confirmResolverRef.current = null;
+        setConfirmDialog(null);
+        if (resolve) resolve(Boolean(result));
       };
 
       // [v2.14.30] 可「復原」的提示：領貨狀態標錯時，6 秒內點一下就回到原本的狀態（含領貨日）
@@ -8457,7 +8584,7 @@
           const skuKey = sku.toUpperCase();
           const clash = products.find(p => String(p.sku || '').trim().toUpperCase() === skuKey);
           if (clash) {
-            showToast(`款號 ${sku} 已被「${clash.name}」使用，這次先不建立新商品，請自行到商品庫處理`);
+            showToast(`款號 ${sku} 已被「${clash.name}」使用。這次先不建立新商品，請到商品庫自行處理。`);
             return;
           }
         }
@@ -8764,10 +8891,10 @@
         setIsSubmittingOrder(true);
         // 已經知道沒網路 → 立刻說明；網路慢 → 8 秒後才提示，避免一般情況下干擾
         if (!isConnected) {
-          showToast('📵 沒有網路：訂單先暫存在手機，請保持網頁開著，連上網路後會自動送出');
+          showToast('📵 沒有網路，訂單先暫存在手機。請保持網頁開著，連上網路後會自動送出。');
         }
         const slowTimer = isConnected ? setTimeout(() => {
-          showToast('⏳ 網路較慢，仍在送出中…請不要重複按，恢復連線後會自動完成');
+          showToast('⏳ 網路較慢，仍在送出中。請不要重複按，恢復連線後會自動完成。');
         }, 8000) : null;
 
         try {
@@ -8798,7 +8925,7 @@
           setActiveTab('list');
         } catch (err) {
           console.error("Add order error:", err);
-          showToast('❌ 新增訂單失敗，請檢查權限或網路連線（內容還在，可以再按一次送出）');
+          showToast('❌ 新增訂單失敗，請檢查權限或網路連線。內容還在，可以再按一次送出。');
         } finally {
           if (slowTimer) clearTimeout(slowTimer);
           setIsSubmittingOrder(false);
@@ -8817,7 +8944,7 @@
             ? `收支報表會把這張的 ${amountText} 從收入改成「待入帳」。`
             : `這張是舊訂單，收支報表仍視為已入帳，只有訂單列表的狀態會改變。`;
           const paidInfo = target.paidDate ? `（領貨日 ${target.paidDate}）` : '';
-          if (!window.confirm(`把「${name}」從「已領貨」改回「未領貨」？${paidInfo}\n\n${impact}\n\n如果是不小心點到，請按「取消」。`)) return;
+          if (!(await askConfirm(`把「${name}」從「已領貨」改回「未領貨」？${paidInfo}\n\n${impact}\n\n如果是不小心點到，請按「取消」。`, { confirmLabel: '確定改回' }))) return;
         }
         const prev = {
           paymentStatus: Boolean(target?.paymentStatus),
@@ -8855,9 +8982,9 @@
       const handleToggleAbandon = async (orderId, isAbandoned) => {
         const target = orders.find(o => o.id === orderId);
         const name = target?.customerName || '';
-        const ok = window.confirm(isAbandoned
+        const ok = await askConfirm(isAbandoned
           ? `把「${name}」的棄單還原成「未領貨」？`
-          : `把「${name}」標記為「棄單」？\n\n棄單的訂單不會計入營收，之後可以再還原。`);
+          : `把「${name}」標記為「棄單」？\n\n棄單的訂單不會計入營收，之後可以再還原。`, { confirmLabel: isAbandoned ? '確定還原' : '標記為棄單' });
         if (!ok) return;
         try {
           await withSyncTracking(dbRef(`orders/${orderId}`).update(isAbandoned
@@ -9208,7 +9335,7 @@
           const msg = isOrder
             ? `目前已經有一筆看起來相同的訂單：\n${dup.customerName}　$${calcOrderTotal(dup)}　${formatOrderStamp(dup)} 建立\n\n仍要還原嗎？（還原後會有兩筆）`
             : `目前已經有同名的商品：「${dup.name}」\n\n仍要還原嗎？（還原後會有兩個同名商品）`;
-          if (!window.confirm(msg)) return;
+          if (!(await askConfirm(msg, { confirmLabel: '仍要還原' }))) return;
         }
 
         try {
@@ -9228,7 +9355,7 @@
       const handlePurgeTrash = async (kind, item) => {
         const isOrder = kind === 'orders';
         const label = isOrder ? item.customerName : item.name;
-        if (!window.confirm(`確定要永久刪除「${label}」嗎？\n這個動作無法復原。`)) return;
+        if (!(await askConfirm(`確定要永久刪除「${label}」嗎？\n這個動作無法復原。`, { confirmLabel: '永久刪除', danger: true }))) return;
         try {
           await withSyncTracking(dbRoot().update({ [`trash/${kind}/${item.id}`]: null }));
           logAction(isOrder ? 'order_purge' : 'product_purge', isOrder ? 'order' : 'product', item.id, `永久刪除${isOrder ? '訂單' : '商品'}：${label}`);
@@ -9243,7 +9370,7 @@
         const total = trashOrders.length + trashProducts.length;
         if (total === 0) return;
         if (!requireConnection('清空回收桶')) return;
-        if (!window.confirm(`確定要清空回收桶嗎？\n共 ${total} 筆資料會被永久刪除，無法復原。`)) return;
+        if (!(await askConfirm(`確定要清空回收桶嗎？\n共 ${total} 筆資料會被永久刪除，無法復原。`, { confirmLabel: '永久刪除', danger: true }))) return;
         try {
           await withSyncTracking(dbRoot().update({ trash: null }));
           logAction('trash_purge_all', 'system', '', `清空回收桶（${trashOrders.length} 筆訂單、${trashProducts.length} 項商品）`);
@@ -9326,7 +9453,7 @@
         }
         if (!entry.before) return;
         const labels = Object.keys(entry.before).filter(k => !(k === 'createdAt' && 'timestamp' in entry.before)).map(k => ORDER_FIELD_LABELS[k] || k);
-        if (!window.confirm(`要把「${order.customerName}」的這些欄位還原到修改前嗎？\n${labels.join('、')}\n（之後又改過的內容會被蓋回去）`)) return;
+        if (!(await askConfirm(`要把「${order.customerName}」的這些欄位還原到修改前嗎？\n${labels.join('、')}\n（之後又改過的內容會被蓋回去）`, { confirmLabel: '還原修改' }))) return;
 
         try {
           const current = {};
@@ -9397,7 +9524,7 @@
 
       const handleDeleteBlacklist = async (entry) => {
         const label = entry.name || entry.phone || entry.ig || entry.line || '（未填資料）';
-        if (!window.confirm(`確定要將「${label}」從黑名單移除嗎？\n（黑名單移除不進回收桶，如需要可以再手動加回來）`)) return;
+        if (!(await askConfirm(`確定要將「${label}」從黑名單移除嗎？\n（黑名單移除不進回收桶，如需要可以再手動加回來）`, { confirmLabel: '移除', danger: true }))) return;
         try {
           await withSyncTracking(dbRef(`blacklist/${entry.id}`).remove());
           logAction('blacklist_delete', 'system', entry.id, `移除黑名單：${label}`);
@@ -9419,7 +9546,7 @@
       const handleResetTestData = async () => {
         if (!IS_TEST_MODE) return; // 安全鎖：只有測試模式才能整批清空
         if (!requireConnection('清空測試資料')) return;
-        if (!window.confirm('確定要清空「測試模式」的所有資料嗎？\n（正式資料不會受影響）')) return;
+        if (!(await askConfirm('確定要清空「測試模式」的所有資料嗎？\n（正式資料不會受影響）', { confirmLabel: '清空', danger: true }))) return;
         try {
           await db.ref('test').remove();
           showToast('🧹 測試資料已全部清空（商品庫會回到範例商品）');
@@ -9631,7 +9758,7 @@
       };
 
       const handleDeleteProduct = async (prodId) => {
-        if (!window.confirm('確定要刪除此商品嗎？\n（會移到回收桶，之後可以還原）')) return;
+        if (!(await askConfirm('確定要刪除此商品嗎？\n（會移到回收桶，之後可以還原）', { confirmLabel: '刪除商品', danger: true }))) return;
         const target = products.find(p => p.id === prodId);
         try {
           if (target) {
@@ -9729,7 +9856,7 @@
           return;
         }
         const replaceCount = toUpdate.filter(x => x.mode === 'replace').length;
-        if (replaceCount > 0 && !window.confirm(`「取代」會用 Excel 的顏色與尺寸覆蓋 ${replaceCount} 項現有商品的規格（原本的規格無法自動還原）。確定要匯入嗎？`)) {
+        if (replaceCount > 0 && !(await askConfirm(`「取代」會用 Excel 的顏色與尺寸覆蓋 ${replaceCount} 項現有商品的規格。\n（原本的規格無法自動還原）\n\n確定要匯入嗎？`, { confirmLabel: '確定匯入', danger: true }))) {
           return;
         }
         if (!requireConnection('匯入商品')) return;
@@ -10181,21 +10308,14 @@
 
       return (
         <div className="min-h-screen bg-slate-50 text-slate-800 pb-24 md:pb-12 font-sans flex flex-col">
-          {/* Toast Notification */}
-          {toastMessage && (
-            <div className="fixed top-4 left-1/2 -translate-x-1/2 z-[60] bg-slate-900/90 text-white px-5 py-2.5 rounded-full text-xs sm:text-sm font-medium shadow-2xl backdrop-blur-sm transition-all animate-bounce flex items-center gap-2">
-              <IconSparkles size={16} className="text-amber-400" />
-              {toastMessage}
-            </div>
-          )}
+          {/* Toast Notification [v2.14.36：換成 ui-feedback.js 的 ToastBanner，寬度可換行、依類型換色條] */}
+          {toastMessage && <ToastBanner message={toastMessage} />}
 
-          {/* [v2.14.30] 領貨狀態「復原」提示（6 秒） */}
-          {undoToast && (
-            <div className="fixed bottom-24 md:bottom-8 left-1/2 -translate-x-1/2 z-[60] bg-slate-900/90 text-white pl-5 pr-3 py-2 rounded-full text-xs sm:text-sm font-medium shadow-2xl backdrop-blur-sm flex items-center gap-3 max-w-[92vw]">
-              <span className="truncate">{undoToast.msg}</span>
-              <button type="button" onClick={undoToast.onUndo} className="flex-none px-3 py-1 rounded-full bg-amber-400 text-slate-900 font-bold">復原</button>
-            </div>
-          )}
+          {/* [v2.14.36] 自製確認視窗（取代 window.confirm） */}
+          {confirmDialog && <SystemConfirmDialog dialog={confirmDialog} onClose={closeConfirm} />}
+
+          {/* [v2.14.30] 領貨狀態「復原」提示（6 秒）；[v2.14.36] 改用 UndoBanner */}
+          {undoToast && <UndoBanner message={undoToast.msg} onUndo={undoToast.onUndo} />}
 
           {/* [v2.13.5] 還原JSON備份 Modal */}
           {isRestoreModalOpen && (
