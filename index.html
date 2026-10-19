@@ -59,7 +59,7 @@
     // ==========================================
     // config.js — 版本號 / Firebase設定 / 常數設定值
     // ==========================================
-    const APP_VERSION = '2.14.37';
+    const APP_VERSION = '2.14.38';
 
     // [v2.14.18] 尺寸系列：新增訂單與商品庫的尺寸快捷選項。存進資料庫的仍是「80, 90, 100」這種逗號字串，系列只是輸入輔助。
     // 要增減尺寸只改這裡；統一存大寫（與既有資料、sortSizes 的排序表一致）。
@@ -660,11 +660,13 @@
 
     // ==========================================
     // [v2.14.37] 併單（前單併到後單）：純函式，不碰 state／Firebase
-    // 規則：取件人姓名、手機、門市（宅配＝地址）、取貨方式都要一樣，而且每一張都「未出貨、未領貨、不是棄單」。
+    // 規則：取件人姓名、聯絡方式（手機／LINE／IG，見 checkOrdersMergeable）、門市（宅配＝地址）、取貨方式都要一樣，而且每一張都「未出貨、未領貨、不是棄單」。
     // 勾選幾張都可以：全部併進「下單時間最晚」的那張（後單）；後單保留自己的下單日期與其他欄位。
     // ==========================================
     const normalizeMergeText = (v) => String(v == null ? '' : v).replace(/\s+/g, '').toLowerCase();
     const normalizeMergePhone = (v) => String(v == null ? '' : v).replace(/\D/g, '');
+    // LINE／IG：去頭尾空白與空白字元、拿掉開頭的 @、不分大小寫
+    const normalizeMergeHandle = (v) => String(v == null ? '' : v).trim().replace(/^@/, '').replace(/\s+/g, '').toLowerCase();
 
     const checkOrdersMergeable = (selected) => {
       const list = [...(selected || [])].sort((a, b) => (Number(a.timestamp) || 0) - (Number(b.timestamp) || 0)); // 舊 → 新
@@ -700,9 +702,21 @@
       const methods = distinct(o => o.deliveryMethod, normalizeMergeText);
       if (methods.size > 1) reasons.push(`取貨方式不一樣：${joinShown(methods)}`);
 
-      const phones = distinct(o => o.customerPhone, normalizeMergePhone);
-      if (phones.size > 1) reasons.push(`手機不一樣：${joinShown(phones)}`);
-      else if (anyBlank(o => o.customerPhone, normalizeMergePhone)) warnings.push('phone-blank');
+      // [v2.14.38] 聯絡方式＝手機、LINE、IG 三者之一（客人不一定留電話，可能只留 LINE 或 IG）。
+      // ① 任何一項「有兩種以上不同的值」→ 不是同一位，擋下；② 沒有衝突時，要有「每一張都有填、且相同」的一項才算確認；
+      // 否則（例如一張只有電話、另一張只有 IG，或全部空白）→ 警告，由使用者確認。
+      let contactConflict = false;
+      let hasCommonContact = false;
+      [
+        { key: 'customerPhone', label: '手機', normalize: normalizeMergePhone },
+        { key: 'customerLine', label: 'LINE', normalize: normalizeMergeHandle },
+        { key: 'customerIg', label: 'IG', normalize: normalizeMergeHandle }
+      ].forEach(f => {
+        const values = distinct(o => o[f.key], f.normalize);
+        if (values.size > 1) { contactConflict = true; reasons.push(`${f.label}不一樣：${joinShown(values)}`); }
+        else if (values.size === 1 && !anyBlank(o => o[f.key], f.normalize)) hasCommonContact = true;
+      });
+      if (!contactConflict && !hasCommonContact) warnings.push('contact-none');
 
       const isHome = (o) => o.deliveryMethod === '宅配到府';
       const placeOf = (o) => (isHome(o) ? o.storeAddress : o.storeName);
@@ -746,7 +760,7 @@
       });
       noteLines.push(mergeLine);
 
-      // LINE／IG：後單沒填、前單有填時補上（由新到舊找第一個有值的）
+      // 聯絡方式（手機／LINE／IG）：後單沒填、前單有填時補上（由新到舊找第一個有值的）
       const pick = (field) => (String(base[field] || '').trim()
         ? String(base[field]).trim()
         : ([...earlier].reverse().map(o => String(o[field] || '').trim()).find(Boolean) || ''));
@@ -757,7 +771,7 @@
         warnings: check.warnings,
         base,
         earlier,
-        merged: { items, note: noteLines.join('\n'), shippingFee: newShipping, customerLine: pick('customerLine'), customerIg: pick('customerIg') },
+        merged: { items, note: noteLines.join('\n'), shippingFee: newShipping, customerPhone: pick('customerPhone'), customerLine: pick('customerLine'), customerIg: pick('customerIg') },
         preview: {
           rows: ordered.map(o => ({ id: o.id, date: formatOrderDateShort(o.createdAt), itemCount: (o.items || []).length, subtotal: calcOrderSubtotal(o), isBase: o.id === base.id })),
           mergedItemCount: items.length,
@@ -3731,19 +3745,23 @@
               </div>
             ))}
           </div>
-          <p className="text-xs leading-relaxed text-slate-400">併單條件：姓名、手機、門市都相同，且都還沒出貨、都未領貨。</p>
+          <p className="text-xs leading-relaxed text-slate-400">併單條件：姓名、聯絡方式（電話、LINE 或 IG）、門市都相同，且都還沒出貨、都未領貨。</p>
         </div>
       );
     }
 
     function OrderMergeWarningBody({ warnings, name }) {
-      const phoneBlank = warnings.includes('phone-blank');
+      const contactNone = warnings.includes('contact-none');
       const storeBlank = warnings.includes('store-blank');
-      const blankText = [phoneBlank ? '電話' : '', storeBlank ? '門市（地址）' : ''].filter(Boolean).join('與');
-      const basis = phoneBlank && storeBlank ? `姓名「${name}」` : phoneBlank ? `姓名「${name}」和門市` : `姓名「${name}」和電話`;
+      const lead = contactNone && storeBlank
+        ? '聯絡方式與門市（地址）都不完整，無法確認是同一位客人'
+        : contactNone
+          ? '沒有共同的聯絡方式（電話、LINE、IG），無法確認是同一位客人'
+          : '門市（地址）是空白，無法確認是同一位客人';
+      const basis = contactNone && storeBlank ? `姓名「${name}」` : contactNone ? `姓名「${name}」和門市` : `姓名「${name}」和聯絡方式`;
       return (
         <div>
-          <p className="text-base font-bold leading-snug text-slate-800 mb-2">{blankText}是空白，無法確認是同一位客人</p>
+          <p className="text-base font-bold leading-snug text-slate-800 mb-2">{lead}</p>
           <p className="text-sm leading-relaxed text-slate-500">目前只靠{basis}比對。賣貨便的姓名有遮罩，不同的人可能長得一樣。</p>
         </div>
       );
@@ -9504,6 +9522,7 @@
             [`orders/${base.id}/note`]: merged.note,
             [`orders/${base.id}/shippingFee`]: merged.shippingFee
           };
+          if (merged.customerPhone !== String(base.customerPhone || '').trim()) updates[`orders/${base.id}/customerPhone`] = merged.customerPhone;
           if (merged.customerLine !== String(base.customerLine || '').trim()) updates[`orders/${base.id}/customerLine`] = merged.customerLine;
           if (merged.customerIg !== String(base.customerIg || '').trim()) updates[`orders/${base.id}/customerIg`] = merged.customerIg;
           earlier.forEach(o => {
@@ -9523,6 +9542,7 @@
                 [`orders/${base.id}/items`]: cleanForDb(rawBase.items ?? null),
                 [`orders/${base.id}/note`]: rawBase.note ?? null,
                 [`orders/${base.id}/shippingFee`]: rawBase.shippingFee ?? null,
+                [`orders/${base.id}/customerPhone`]: rawBase.customerPhone ?? null,
                 [`orders/${base.id}/customerLine`]: rawBase.customerLine ?? null,
                 [`orders/${base.id}/customerIg`]: rawBase.customerIg ?? null
               };
