@@ -59,7 +59,7 @@
     // ==========================================
     // config.js — 版本號 / Firebase設定 / 常數設定值
     // ==========================================
-    const APP_VERSION = '2.14.36';
+    const APP_VERSION = '2.14.37';
 
     // [v2.14.18] 尺寸系列：新增訂單與商品庫的尺寸快捷選項。存進資料庫的仍是「80, 90, 100」這種逗號字串，系列只是輸入輔助。
     // 要增減尺寸只改這裡；統一存大寫（與既有資料、sortSizes 的排序表一致）。
@@ -657,6 +657,119 @@
 
     const calcOrderSubtotal = (order) =>
       (order?.items || []).reduce((sum, i) => sum + (Number(i.price) || 0) * (Number(i.qty) || 0), 0);
+
+    // ==========================================
+    // [v2.14.37] 併單（前單併到後單）：純函式，不碰 state／Firebase
+    // 規則：取件人姓名、手機、門市（宅配＝地址）、取貨方式都要一樣，而且每一張都「未出貨、未領貨、不是棄單」。
+    // 勾選幾張都可以：全部併進「下單時間最晚」的那張（後單）；後單保留自己的下單日期與其他欄位。
+    // ==========================================
+    const normalizeMergeText = (v) => String(v == null ? '' : v).replace(/\s+/g, '').toLowerCase();
+    const normalizeMergePhone = (v) => String(v == null ? '' : v).replace(/\D/g, '');
+
+    const checkOrdersMergeable = (selected) => {
+      const list = [...(selected || [])].sort((a, b) => (Number(a.timestamp) || 0) - (Number(b.timestamp) || 0)); // 舊 → 新
+      const reasons = [];
+      const warnings = [];
+      if (list.length < 2) return { ok: false, reasons: ['請至少勾選兩張訂單'], warnings, base: null, earlier: [] };
+      const base = list[list.length - 1];
+      const earlier = list.slice(0, -1);
+      const tag = (o) => `「${o.customerName || '（未填姓名）'} ${formatOrderDateShort(o.createdAt)}」`;
+
+      list.forEach(o => {
+        if (o.closeStatus === 'abandoned') reasons.push(`${tag(o)}是棄單，無法併單`);
+        else if (o.shipmentStatus === 'shipped') reasons.push(`${tag(o)}已出貨，貨已寄出，無法再併`);
+        else if (o.paymentStatus) reasons.push(`${tag(o)}已領貨（款項已入帳），無法再併`);
+      });
+
+      // 逐項比對：把每一張在這一項的值正規化後放進 Map，超過一種就是「不一樣」
+      const distinct = (getter, normalize) => {
+        const m = new Map();
+        list.forEach(o => {
+          const raw = getter(o);
+          const key = normalize(raw);
+          if (key !== '' && !m.has(key)) m.set(key, String(raw).trim());
+        });
+        return m;
+      };
+      const joinShown = (m) => Array.from(m.values()).map(v => `「${v}」`).join('、');
+      const anyBlank = (getter, normalize) => list.some(o => normalize(getter(o)) === '');
+
+      const names = distinct(o => o.customerName, normalizeMergeText);
+      if (names.size > 1) reasons.push(`姓名不一樣：${joinShown(names)}`);
+
+      const methods = distinct(o => o.deliveryMethod, normalizeMergeText);
+      if (methods.size > 1) reasons.push(`取貨方式不一樣：${joinShown(methods)}`);
+
+      const phones = distinct(o => o.customerPhone, normalizeMergePhone);
+      if (phones.size > 1) reasons.push(`手機不一樣：${joinShown(phones)}`);
+      else if (anyBlank(o => o.customerPhone, normalizeMergePhone)) warnings.push('phone-blank');
+
+      const isHome = (o) => o.deliveryMethod === '宅配到府';
+      const placeOf = (o) => (isHome(o) ? o.storeAddress : o.storeName);
+      const places = distinct(placeOf, normalizeMergeText);
+      if (places.size > 1) reasons.push(`${list.every(isHome) ? '收件地址' : '門市'}不一樣：${joinShown(places)}`);
+      else if (anyBlank(placeOf, normalizeMergeText)) warnings.push('store-blank');
+
+      return { ok: reasons.length === 0, reasons, warnings, base, earlier };
+    };
+
+    const MERGE_COUNT_WORDS = { 2: '兩', 3: '三', 4: '四', 5: '五', 6: '六', 7: '七', 8: '八', 9: '九' };
+
+    const buildMergedOrderPlan = (selected, shippingConfig) => {
+      const check = checkOrdersMergeable(selected);
+      if (!check.ok) return check;
+      const { base, earlier } = check;
+      const ordered = [...earlier, base]; // 舊 → 新
+      const dates = ordered.map(o => formatOrderDateShort(o.createdAt));
+
+      // 商品：前單的接在前面、後單的在後面，不分來源、不自動合計數量；id 若重複就加尾碼，避免畫面 key 衝突
+      const seen = new Set();
+      const items = [];
+      ordered.forEach(o => (o.items || []).forEach(it => {
+        let id = String(it.id || '');
+        if (!id || seen.has(id)) { let n = 1; while (seen.has(`${id}_m${n}`)) n += 1; id = `${id}_m${n}`; }
+        seen.add(id);
+        items.push({ ...it, id });
+      }));
+
+      const subtotal = calcOrderSubtotal({ items });
+      const oldShipping = ordered.reduce((s, o) => s + (Number(o.shippingFee) || 0), 0);
+      const newShipping = suggestShippingFee(base.deliveryMethod, subtotal, shippingConfig);
+
+      // 備註：後單原本的備註保留；前單的備註（內容不同才加）接在後面；最後加一行併單紀錄（兩筆訂單的日期）
+      const mergeLine = `併單：${dates.join('、')} ${MERGE_COUNT_WORDS[ordered.length] || ordered.length}筆合併`;
+      const noteLines = [];
+      if (String(base.note || '').trim()) noteLines.push(String(base.note).trim());
+      earlier.forEach(o => {
+        const n = String(o.note || '').trim();
+        if (n && n !== String(base.note || '').trim()) noteLines.push(`前單（${formatOrderDateShort(o.createdAt)}）備註：${n}`);
+      });
+      noteLines.push(mergeLine);
+
+      // LINE／IG：後單沒填、前單有填時補上（由新到舊找第一個有值的）
+      const pick = (field) => (String(base[field] || '').trim()
+        ? String(base[field]).trim()
+        : ([...earlier].reverse().map(o => String(o[field] || '').trim()).find(Boolean) || ''));
+
+      return {
+        ok: true,
+        reasons: [],
+        warnings: check.warnings,
+        base,
+        earlier,
+        merged: { items, note: noteLines.join('\n'), shippingFee: newShipping, customerLine: pick('customerLine'), customerIg: pick('customerIg') },
+        preview: {
+          rows: ordered.map(o => ({ id: o.id, date: formatOrderDateShort(o.createdAt), itemCount: (o.items || []).length, subtotal: calcOrderSubtotal(o), isBase: o.id === base.id })),
+          mergedItemCount: items.length,
+          subtotal,
+          oldShipping,
+          newShipping,
+          mergeLine,
+          earlierDates: earlier.map(o => formatOrderDateShort(o.createdAt)),
+          baseDate: formatOrderDateShort(base.createdAt)
+        }
+      };
+    };
 
     // 統一四捨五入成整數，避免小數單價造成 99.99999 之類的顯示
     const calcOrderTotal = (order) =>
@@ -3568,6 +3681,74 @@
     // OrderMessageModal：顯示依訂單產生的訊息，可微調後一鍵複製（複製一定要在使用者點按鈕的當下，手機/LINE瀏覽器才不會被擋）
     // MessageTemplateModal：維護前綴、後綴、優惠規則、自訂優惠行，並有即時預覽
     // ==========================================
+    // ==========================================
+    // [v2.14.37] 併單的視窗內容（放進 askConfirm 的 body；外框、標題「系統提示」、按鈕由 SystemConfirmDialog 負責）
+    // ==========================================
+    function OrderMergePreviewBody({ plan }) {
+      const p = plan.preview;
+      const earlierText = p.earlierDates.join('、');
+      return (
+        <div>
+          <p className="text-base font-bold leading-snug text-slate-800 mb-2 break-words">把「{plan.base.customerName}」的 {p.rows.length} 筆訂單合併成 1 筆？</p>
+          <div className="bg-slate-50 rounded-xl px-3 py-2.5 mb-2.5">
+            {p.rows.map(r => (
+              <div key={r.id} className="flex items-baseline gap-2 text-sm leading-8">
+                <span className="flex-none w-11 font-bold text-slate-800">{r.date}</span>
+                <span className="flex-1 min-w-0 text-xs text-slate-500">
+                  <span className={`inline-block px-1.5 mr-1 rounded text-[11px] ${r.isBase ? 'bg-emerald-100 text-emerald-800' : 'bg-amber-100 text-amber-800'}`}>{r.isBase ? '後單' : '前單'}</span>
+                  {r.itemCount} 項・{r.isBase ? '保留這筆' : '併入後單'}
+                </span>
+                <span className="flex-none font-bold tabular-nums text-slate-800">${r.subtotal.toLocaleString()}</span>
+              </div>
+            ))}
+            <div className="h-px bg-slate-200 my-1.5" />
+            <div className="flex items-baseline gap-2 text-sm leading-8">
+              <span className="flex-1 min-w-0 font-bold text-slate-800">合併後 {p.mergedItemCount} 項商品</span>
+              <span className="flex-none font-bold tabular-nums text-slate-800">${p.subtotal.toLocaleString()}</span>
+            </div>
+            <div className="flex items-baseline gap-2 text-sm leading-8">
+              <span className="flex-1 min-w-0 text-slate-500">運費{p.oldShipping === p.newShipping ? '（不變）' : '（依運費設定重算）'}</span>
+              <span className="flex-none tabular-nums text-slate-700">
+                {p.oldShipping === p.newShipping ? `$${p.newShipping}` : `$${p.oldShipping} → $${p.newShipping}`}
+              </span>
+            </div>
+          </div>
+          <p className="text-xs leading-relaxed text-slate-400 break-words">・備註會加上「{p.mergeLine}」</p>
+          <p className="text-xs leading-relaxed text-slate-400 break-words">・{earlierText} 那{p.earlierDates.length > 1 ? ` ${p.earlierDates.length} ` : ''}筆會移到回收桶，併單後 6 秒內可按「復原」</p>
+        </div>
+      );
+    }
+
+    function OrderMergeBlockedBody({ reasons }) {
+      return (
+        <div>
+          <p className="text-base font-bold leading-snug text-slate-800 mb-2">這幾筆訂單不能併單</p>
+          <div className="space-y-1.5 mb-2">
+            {reasons.map((r, i) => (
+              <div key={i} className="flex gap-2 text-sm leading-relaxed text-slate-800">
+                <span className="flex-none w-5 text-center text-red-600 font-bold">✕</span>
+                <span className="flex-1 min-w-0 break-words">{r}</span>
+              </div>
+            ))}
+          </div>
+          <p className="text-xs leading-relaxed text-slate-400">併單條件：姓名、手機、門市都相同，且都還沒出貨、都未領貨。</p>
+        </div>
+      );
+    }
+
+    function OrderMergeWarningBody({ warnings, name }) {
+      const phoneBlank = warnings.includes('phone-blank');
+      const storeBlank = warnings.includes('store-blank');
+      const blankText = [phoneBlank ? '電話' : '', storeBlank ? '門市（地址）' : ''].filter(Boolean).join('與');
+      const basis = phoneBlank && storeBlank ? `姓名「${name}」` : phoneBlank ? `姓名「${name}」和門市` : `姓名「${name}」和電話`;
+      return (
+        <div>
+          <p className="text-base font-bold leading-snug text-slate-800 mb-2">{blankText}是空白，無法確認是同一位客人</p>
+          <p className="text-sm leading-relaxed text-slate-500">目前只靠{basis}比對。賣貨便的姓名有遮罩，不同的人可能長得一樣。</p>
+        </div>
+      );
+    }
+
     function OrderMessageModal({ order, template, onClose, showToast }) {
       const [text, setText] = React.useState(() => buildOrderMessage(order, template));
       const [copied, setCopied] = React.useState(false);
@@ -5035,6 +5216,7 @@
         handleSetAllExpanded,
         handleSelectAllFiltered,
         handleSelectExcelImported,
+        handleMergeSelectedOrders,
         handleTogglePayment,
         handleToggleShipment,
         handleToggleAbandon,
@@ -5653,6 +5835,14 @@
                         className="px-3 py-1.5 bg-white hover:bg-red-100 text-red-700 border border-red-200 font-semibold text-xs rounded-lg transition"
                       >
                         只選「Excel 匯入」的訂單
+                      </button>
+                      <button
+                        type="button"
+                        disabled={selectedVisibleCount < 2}
+                        onClick={handleMergeSelectedOrders}
+                        className="px-4 py-1.5 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-40 disabled:cursor-not-allowed text-white font-bold text-xs sm:text-sm rounded-lg shadow transition"
+                      >
+                        {selectedVisibleCount >= 2 ? `併單 (${selectedVisibleCount})` : '併單'}
                       </button>
                       <button
                         type="button"
@@ -7939,8 +8129,15 @@
     };
 
     // 訊息排版：每一行一段；空白行＝多一點間距；「・」開頭＝條列（換行對齊文字）；整行被括號包住＝小字備註
-    const renderSystemMessage = (message) => String(message == null ? '' : message).split('\n').map((line, i) => {
+    const renderSystemMessage = (message, opts = {}) => {
+      let leadDone = false;
+      return String(message == null ? '' : message).split('\n').map((line, i) => {
       if (line.trim() === '') return <div key={i} className="h-2" />;
+      // [v2.14.37] lead：第一個有字的行放大加粗（先講重點），其餘改成較淡的說明
+      if (opts.lead && !leadDone) {
+        leadDone = true;
+        return <p key={i} className="text-base font-bold leading-snug text-slate-800 break-words mb-1">{emphasizeSystemLine(line)}</p>;
+      }
       const bullet = /^[・•]\s*(.*)$/.exec(line);
       if (bullet) {
         return (
@@ -7953,10 +8150,13 @@
       if (/^[（(].*[）)]$/.test(line.trim())) {
         return <p key={i} className="text-xs leading-relaxed text-slate-500 break-words">{line.trim()}</p>;
       }
-      return <p key={i} className="text-sm leading-relaxed text-slate-800 break-words">{emphasizeSystemLine(line)}</p>;
-    });
+      return <p key={i} className={`text-sm leading-relaxed break-words ${opts.lead ? 'text-slate-500' : 'text-slate-800'}`}>{emphasizeSystemLine(line)}</p>;
+      });
+    };
 
     function SystemConfirmDialog({ dialog, onClose }) {
+      const longestLabel = Math.max([...String(dialog.confirmLabel || '')].length, dialog.hideCancel ? 0 : [...String(dialog.cancelLabel || '')].length);
+      const stackButtons = !dialog.hideCancel && longestLabel > 6;
       React.useEffect(() => {
         const onKey = (e) => { if (e.key === 'Escape') onClose(false); };
         window.addEventListener('keydown', onKey);
@@ -7969,10 +8169,13 @@
               <IconAlertTriangle size={18} />
               系統提示
             </div>
-            <div className="space-y-1">{renderSystemMessage(dialog.message)}</div>
-            <div className="flex gap-2 mt-5">
-              <button type="button" onClick={() => onClose(false)} className="flex-1 py-2.5 rounded-xl text-sm font-bold bg-slate-100 text-slate-700 border border-slate-200 active:scale-[0.98]">{dialog.cancelLabel}</button>
-              <button type="button" onClick={() => onClose(true)} className={`flex-1 py-2.5 rounded-xl text-sm font-bold text-white active:scale-[0.98] ${dialog.danger ? 'bg-red-600' : 'bg-emerald-600'}`}>{dialog.confirmLabel}</button>
+            {dialog.body ? dialog.body : <div className="space-y-1">{renderSystemMessage(dialog.message, { lead: dialog.lead })}</div>}
+            {/* [v2.14.37] 按鈕：加高（46px）、不換行；標籤超過 6 個字就改成上下排列（主要動作在上），只有一顆時（hideCancel）全寬 */}
+            <div className={`mt-5 flex ${stackButtons ? 'flex-col-reverse gap-2' : 'gap-2.5'}`}>
+              {!dialog.hideCancel && (
+                <button type="button" onClick={() => onClose(false)} className="flex-1 flex items-center justify-center min-h-[46px] px-3 rounded-2xl text-[15px] font-bold whitespace-nowrap bg-slate-100 text-slate-700 border border-slate-200 active:scale-[0.98]">{dialog.cancelLabel}</button>
+              )}
+              <button type="button" onClick={() => onClose(true)} className={`flex-1 flex items-center justify-center min-h-[46px] px-3 rounded-2xl text-[15px] font-bold whitespace-nowrap text-white active:scale-[0.98] ${dialog.danger ? 'bg-red-600' : 'bg-emerald-600'}`}>{dialog.confirmLabel}</button>
             </div>
           </div>
         </div>
@@ -8021,6 +8224,7 @@
       // [v2.14.36] 自製確認視窗（取代瀏覽器內建 window.confirm，標題統一為紅色「系統提示」）
       const [confirmDialog, setConfirmDialog] = React.useState(null);
       const confirmResolverRef = React.useRef(null);
+      const mergingOrdersRef = React.useRef(false); // [v2.14.37] 併單進行中（含等待視窗），避免重複觸發
       const [confirmDeleteId, setConfirmDeleteId] = React.useState(null);
 
       // Product Library Enhanced States V5.1
@@ -8096,10 +8300,11 @@
 
       // [v2.14.36] 用法：`if (!(await askConfirm('訊息', { confirmLabel: '永久刪除', danger: true }))) return;`（呼叫它的函式必須是 async）
       // 訊息每個 \n 一行；開頭「・」＝條列；整行被（）包住＝小字備註。同時只會有一個視窗：新的出現時，舊的視為「取消」。
-      const askConfirm = (message, { confirmLabel = '確定', cancelLabel = '取消', danger = false } = {}) => new Promise((resolve) => {
+      // [v2.14.37] 新選項：body（直接給畫面內容，取代 message）、lead（第一行放大加粗）、hideCancel（只有一顆按鈕的「知道了」）
+      const askConfirm = (message, { confirmLabel = '確定', cancelLabel = '取消', danger = false, body = null, lead = false, hideCancel = false } = {}) => new Promise((resolve) => {
         if (confirmResolverRef.current) confirmResolverRef.current(false);
         confirmResolverRef.current = resolve;
-        setConfirmDialog({ message, confirmLabel, cancelLabel, danger });
+        setConfirmDialog({ message, confirmLabel, cancelLabel, danger, body, lead, hideCancel });
       });
       const closeConfirm = (result) => {
         const resolve = confirmResolverRef.current;
@@ -9251,6 +9456,94 @@
           showToast('❌ 批次刪除失敗，請檢查權限或網路連線');
         } finally {
           setIsBatchDeleting(false);
+        }
+      };
+
+      // ---------- [v2.14.37] 併單：把勾選的訂單（同一位客人）合併成一張，前單併到「下單時間最晚的後單」 ----------
+      const handleMergeSelectedOrders = async () => {
+        if (mergingOrdersRef.current) return;
+        const selected = filteredOrders.filter(o => selectedOrderIds.has(o.id)); // 只算畫面上看得到、且有勾選的
+        if (selected.length < 2) {
+          showToast('請至少勾選兩張要合併的訂單');
+          return;
+        }
+        mergingOrdersRef.current = true;
+        try {
+          const plan = buildMergedOrderPlan(selected, shippingConfig);
+          if (!plan.ok) {
+            await askConfirm('', { body: <OrderMergeBlockedBody reasons={plan.reasons} />, confirmLabel: '知道了', hideCancel: true });
+            return;
+          }
+          if (plan.warnings.length > 0) {
+            const go = await askConfirm('', { body: <OrderMergeWarningBody warnings={plan.warnings} name={plan.base.customerName} />, confirmLabel: '繼續併單' });
+            if (!go) return;
+          }
+          const confirmed = await askConfirm('', { body: <OrderMergePreviewBody plan={plan} />, confirmLabel: '確定併單' });
+          if (!confirmed) return;
+          if (!requireConnection('併單')) return;
+
+          // 視窗開著的期間，其他裝置可能改過這幾張：寫入前重新讀一次最新資料，條件不成立就取消
+          const ids = selected.map(o => o.id);
+          const snaps = await Promise.all(ids.map(id => dbRef(`orders/${id}`).once('value')));
+          if (snaps.some(sn => !sn.exists())) {
+            showToast('❌ 有訂單剛剛被刪除或移動，已取消併單，請重新選擇。');
+            return;
+          }
+          const rawById = {};
+          const fresh = snaps.map((sn, i) => { rawById[ids[i]] = sn.val(); return sanitizeOrder({ ...sn.val(), id: ids[i] }); });
+          const latest = buildMergedOrderPlan(fresh, shippingConfig);
+          if (!latest.ok) {
+            showToast('⚠️ 訂單狀態剛剛有變動，已取消併單，請重新選擇。');
+            return;
+          }
+
+          const { base, earlier, merged, preview } = latest;
+          const rawBase = rawById[base.id];
+          const updates = {
+            [`orders/${base.id}/items`]: cleanForDb(merged.items),
+            [`orders/${base.id}/note`]: merged.note,
+            [`orders/${base.id}/shippingFee`]: merged.shippingFee
+          };
+          if (merged.customerLine !== String(base.customerLine || '').trim()) updates[`orders/${base.id}/customerLine`] = merged.customerLine;
+          if (merged.customerIg !== String(base.customerIg || '').trim()) updates[`orders/${base.id}/customerIg`] = merged.customerIg;
+          earlier.forEach(o => {
+            updates[`orders/${o.id}`] = null;                    // 前單從訂單移除
+            updates[`trash/orders/${o.id}`] = trashEntry(o);     // 同時放進回收桶（一次寫入，要嘛全成功、要嘛全不動）
+          });
+          await withSyncTracking(dbRoot().update(updates));
+
+          const name = base.customerName;
+          logAction('order_merge', 'order', base.id, `併單：${name}　${preview.earlierDates.join('、')} 併入 ${preview.baseDate}（${preview.rows.length} 筆併成 1 筆，${preview.mergedItemCount} 項，商品合計 $${preview.subtotal.toLocaleString()}）`);
+          setSelectedOrderIds(new Set());
+          setSelectMode(false);
+
+          showUndoToast(`✅ 已併單：${name}（${preview.earlierDates.join('、')} 併入 ${preview.baseDate}）`, async () => {
+            try {
+              const undo = {
+                [`orders/${base.id}/items`]: cleanForDb(rawBase.items ?? null),
+                [`orders/${base.id}/note`]: rawBase.note ?? null,
+                [`orders/${base.id}/shippingFee`]: rawBase.shippingFee ?? null,
+                [`orders/${base.id}/customerLine`]: rawBase.customerLine ?? null,
+                [`orders/${base.id}/customerIg`]: rawBase.customerIg ?? null
+              };
+              earlier.forEach(o => {
+                undo[`orders/${o.id}`] = cleanForDb(rawById[o.id]);  // 把前單原樣放回
+                undo[`trash/orders/${o.id}`] = null;                  // 並從回收桶拿掉
+              });
+              await withSyncTracking(dbRoot().update(undo));
+              logAction('order_merge', 'order', base.id, `復原併單：${name}（${preview.earlierDates.join('、')} 已還原）`);
+              setUndoToast(null);
+              showToast('↩️ 已復原併單');
+            } catch (err) {
+              console.error('Undo merge error:', err);
+              showToast('❌ 復原失敗，請到「更多 → 回收桶」手動還原前單。');
+            }
+          });
+        } catch (err) {
+          console.error('Merge orders error:', err);
+          showToast('❌ 併單失敗，請檢查權限或網路連線。訂單沒有被改動。');
+        } finally {
+          mergingOrdersRef.current = false;
         }
       };
 
@@ -11156,6 +11449,7 @@
                   handleSetAllExpanded,
                   handleSelectAllFiltered,
                   handleSelectExcelImported,
+                  handleMergeSelectedOrders,
                   handleTogglePayment,
                   handleToggleShipment,
                   handleToggleAbandon,
