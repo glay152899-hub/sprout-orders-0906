@@ -59,7 +59,7 @@
     // ==========================================
     // config.js — 版本號 / Firebase設定 / 常數設定值
     // ==========================================
-    const APP_VERSION = '2.14.38';
+    const APP_VERSION = '2.14.39';
 
     // [v2.14.18] 尺寸系列：新增訂單與商品庫的尺寸快捷選項。存進資料庫的仍是「80, 90, 100」這種逗號字串，系列只是輸入輔助。
     // 要增減尺寸只改這裡；統一存大寫（與既有資料、sortSizes 的排序表一致）。
@@ -222,6 +222,14 @@
         <path d="M21 19c0 1.66-4 3-9 3s-9-1.34-9-3"></path>
         <path d="M3 5v14"></path>
         <path d="M21 5v14"></path>
+      </svg>
+    );
+
+    const IconMerge = ({ size = 20, className = "" }) => (
+      <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}>
+        <circle cx="18" cy="18" r="3"></circle>
+        <circle cx="6" cy="6" r="3"></circle>
+        <path d="M6 21V9a9 9 0 0 0 9 9"></path>
       </svg>
     );
 
@@ -783,6 +791,88 @@
           baseDate: formatOrderDateShort(base.createdAt)
         }
       };
+    };
+
+    // ---------- [v2.14.39] 併單選擇視窗用：自動找出「同一位客人有兩張以上、都還能併」的組別 ----------
+    // 能併的單＝未出貨、未領貨、非棄單。分組只看「姓名＋取貨方式＋門市（宅配＝地址）」；聯絡方式的比對留到按下去之後（checkOrdersMergeable），
+    // 因為客人可能只留 LINE 或 IG，分組太嚴會漏掉可併的單。
+    const isMergeEligibleOrder = (o) => o.closeStatus !== 'abandoned' && o.shipmentStatus !== 'shipped' && !o.paymentStatus;
+    const mergePlaceOf = (o) => (o.deliveryMethod === '宅配到府' ? o.storeAddress : o.storeName);
+
+    const orderMatchesMergeQuery = (o, query) => {
+      const q = normalizeMergeText(query);
+      if (!q) return true;
+      const hay = [o.customerName, o.customerLine, o.customerIg, o.storeName, o.storeAddress, o.orderNo].map(normalizeMergeText);
+      if (hay.some(h => h.includes(q))) return true;
+      const digits = normalizeMergePhone(query);
+      if (digits.length >= 3 && normalizeMergePhone(o.customerPhone).includes(digits)) return true;
+      const handle = normalizeMergeHandle(query);
+      return Boolean(handle) && [o.customerLine, o.customerIg].some(v => normalizeMergeHandle(v).includes(handle));
+    };
+
+    const findMergeCandidateGroups = (orders, query) => {
+      const map = new Map();
+      (orders || []).filter(isMergeEligibleOrder).forEach(o => {
+        const key = [normalizeMergeText(o.customerName), normalizeMergeText(o.deliveryMethod), normalizeMergeText(mergePlaceOf(o))].join('|');
+        if (!map.has(key)) map.set(key, []);
+        map.get(key).push(o);
+      });
+      const groups = [];
+      map.forEach((list, key) => {
+        if (list.length < 2) return;
+        if (normalizeMergeText(query) && !list.some(o => orderMatchesMergeQuery(o, query))) return;
+        const sorted = [...list].sort((a, b) => (Number(a.timestamp) || 0) - (Number(b.timestamp) || 0)); // 舊 → 新
+        const check = checkOrdersMergeable(sorted);
+        const newest = sorted[sorted.length - 1];
+        const contactOrder = [...sorted].reverse().find(o => String(o.customerIg || o.customerLine || o.customerPhone || '').trim());
+        const contact = contactOrder
+          ? (String(contactOrder.customerIg || '').trim() ? `IG:${String(contactOrder.customerIg).trim()}`
+            : String(contactOrder.customerLine || '').trim() ? `LINE:${String(contactOrder.customerLine).trim()}`
+            : String(contactOrder.customerPhone).trim())
+          : '';
+        groups.push({
+          key,
+          name: newest.customerName,
+          orders: sorted,
+          dates: sorted.map(o => formatOrderDateShort(o.createdAt)),
+          deliveryMethod: newest.deliveryMethod,
+          place: String(mergePlaceOf(newest) || '').trim(),
+          contact,
+          status: !check.ok ? 'conflict' : (check.warnings.length > 0 ? 'confirm' : 'ok'),
+          latestTs: Number(newest.timestamp) || 0
+        });
+      });
+      return groups.sort((a, b) => b.latestTs - a.latestTs);
+    };
+
+    // 搜尋不到可併的組別時，說明原因（而不是一片空白）
+    const explainMergeSearch = (orders, query) => {
+      const matched = (orders || []).filter(o => orderMatchesMergeQuery(o, query));
+      if (matched.length === 0) return [`找不到符合「${String(query).trim()}」的訂單`];
+      const byName = new Map();
+      matched.forEach(o => {
+        const k = normalizeMergeText(o.customerName);
+        if (!byName.has(k)) byName.set(k, { name: o.customerName, list: [] });
+        byName.get(k).list.push(o);
+      });
+      const lines = [];
+      Array.from(byName.values()).slice(0, 3).forEach(({ name, list }) => {
+        const count = (fn) => list.filter(fn).length;
+        const eligible = count(isMergeEligibleOrder);
+        const parts = [];
+        const done = count(o => o.closeStatus !== 'abandoned' && o.shipmentStatus === 'shipped' && o.paymentStatus);
+        const shippedWaiting = count(o => o.closeStatus !== 'abandoned' && o.shipmentStatus === 'shipped' && !o.paymentStatus);
+        const paidUnshipped = count(o => o.closeStatus !== 'abandoned' && o.shipmentStatus !== 'shipped' && o.paymentStatus);
+        const abandoned = count(o => o.closeStatus === 'abandoned');
+        if (done) parts.push(`${done} 筆已領貨`);
+        if (shippedWaiting) parts.push(`${shippedWaiting} 筆已出貨`);
+        if (paidUnshipped) parts.push(`${paidUnshipped} 筆已付款`);
+        if (abandoned) parts.push(`${abandoned} 筆棄單`);
+        if (eligible === 0) lines.push(`「${name}」共 ${list.length} 筆，但 ${parts.join('、')}，都不能再併`);
+        else if (eligible === 1) lines.push(`「${name}」共 ${list.length} 筆，只有 1 筆還沒出貨、未領貨，至少要兩筆才能併${parts.length ? `（其餘：${parts.join('、')}）` : ''}`);
+        else lines.push(`「${name}」有 ${eligible} 筆還能併，但門市或取貨方式不同，不是同一組`);
+      });
+      return lines;
     };
 
     // 統一四捨五入成整數，避免小數單價造成 99.99999 之類的顯示
@@ -3767,6 +3857,135 @@
       );
     }
 
+    // ==========================================
+    // [v2.14.39] 併單選擇視窗：自動列出「可以併單的客人」，可搜尋姓名／IG／LINE／電話／門市；點客人展開、勾選要併的單，按「併單」
+    // 之後的檢查、警告、預覽、寫入、復原都在 app-shell.js 的 handleMergeOrders（這裡只負責挑選，onMerge 回傳 true 代表併單成功）。
+    // 這個視窗自己放「搜尋字、展開哪一組、取消勾選的單」三個純畫面 state（規則 B 的例外，同 ProductEditModal 的做法）。
+    // ==========================================
+    function OrderMergePickerModal({ orders, onClose, onMerge }) {
+      const [query, setQuery] = React.useState('');
+      const [openKey, setOpenKey] = React.useState('');
+      const [unchecked, setUnchecked] = React.useState(() => new Set());
+      const [busy, setBusy] = React.useState(false);
+      const groups = React.useMemo(() => findMergeCandidateGroups(orders, query), [orders, query]);
+      const emptyHints = React.useMemo(() => (groups.length === 0 && query.trim() ? explainMergeSearch(orders, query) : []), [groups, orders, query]);
+      const toggle = (id) => setUnchecked(prev => { const n = new Set(prev); if (n.has(id)) n.delete(id); else n.add(id); return n; });
+      const runMerge = async (selected) => {
+        if (busy) return;
+        setBusy(true);
+        try { await onMerge(selected); } finally { setBusy(false); }
+      };
+      const statusBadge = { conflict: ['聯絡方式不一致，請確認勾選', 'bg-red-100 text-red-700'], confirm: ['聯絡方式不足，需確認', 'bg-amber-100 text-amber-800'] };
+
+      return (
+        <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-sm flex items-end sm:items-center justify-center" onClick={onClose}>
+          <div className={MORE_SHEET_CLASS} onClick={(e) => e.stopPropagation()}>
+            <div className="px-5 pt-4 pb-3 flex items-center justify-between border-b border-slate-100">
+              <div className="min-w-0">
+                <h3 className="font-bold text-base text-slate-800">🔗 併單</h3>
+                <p className="text-[11px] text-slate-400">把同一位客人還沒出貨的單合併成一張（前單併到最晚的那張）</p>
+              </div>
+              <button type="button" onClick={onClose} className="p-1.5 text-slate-400 hover:text-slate-700 rounded-lg hover:bg-slate-100">
+                <IconX size={22} />
+              </button>
+            </div>
+
+            <div className="px-4 pt-3">
+              <div className="relative">
+                <IconSearch size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
+                <input
+                  type="text"
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                  placeholder="搜尋姓名、IG、LINE、電話、門市…"
+                  className="w-full pl-9 pr-9 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500/30 focus:border-emerald-500"
+                />
+                {query && (
+                  <button type="button" onClick={() => setQuery('')} className="absolute right-2 top-1/2 -translate-y-1/2 p-1 text-slate-400 hover:text-slate-700">
+                    <IconX size={16} />
+                  </button>
+                )}
+              </div>
+            </div>
+
+            <div className="flex-1 overflow-y-auto px-4 pt-3 pb-5 space-y-2">
+              {groups.length > 0 && (
+                <p className="text-xs text-slate-500 px-0.5">{query.trim() ? '符合的客人' : '可以併單的客人'}（{groups.length} 位）</p>
+              )}
+              {groups.length === 0 && !query.trim() && (
+                <div className="text-center text-xs text-slate-400 py-10 leading-relaxed">
+                  目前沒有可以併的訂單。<br />同一位客人要有兩張以上「未出貨、未領貨」的單才會出現在這裡。
+                </div>
+              )}
+              {groups.length === 0 && query.trim() && (
+                <div className="text-sm text-slate-600 py-4 px-1 space-y-2 leading-relaxed">
+                  <p className="font-bold text-slate-700">找不到可以併的訂單。</p>
+                  {emptyHints.map((h, i) => <p key={i} className="text-xs text-slate-500">{h}</p>)}
+                </div>
+              )}
+
+              {groups.map(g => {
+                const open = openKey === g.key;
+                const selected = g.orders.filter(o => !unchecked.has(o.id));
+                const baseId = selected.length > 0 ? selected[selected.length - 1].id : '';
+                const live = open && selected.length >= 2 ? checkOrdersMergeable(selected) : null;
+                const badge = statusBadge[g.status];
+                return (
+                  <div key={g.key} className={`rounded-2xl border bg-white ${open ? 'border-emerald-400 shadow-sm' : 'border-slate-200'}`}>
+                    <button type="button" onClick={() => setOpenKey(open ? '' : g.key)} className="w-full text-left px-3.5 py-3">
+                      <div className="flex items-baseline justify-between gap-2">
+                        <span className="font-bold text-sm text-slate-800 truncate">{g.name}</span>
+                        <span className="flex-none text-xs font-bold text-emerald-700">{g.orders.length} 筆可併</span>
+                      </div>
+                      <p className="text-xs text-slate-500 mt-0.5 leading-relaxed break-words">
+                        {g.dates.join('、')}・{g.deliveryMethod}{g.place ? ` ${g.place}` : ''}{g.contact ? `・${g.contact}` : ''}
+                      </p>
+                      {badge && <span className={`inline-block mt-1 px-2 py-0.5 rounded-md text-[11px] font-bold ${badge[1]}`}>{badge[0]}</span>}
+                    </button>
+
+                    {open && (
+                      <div className="px-3.5 pb-3.5">
+                        {g.orders.map(o => {
+                          const checked = !unchecked.has(o.id);
+                          const first = (o.items || [])[0];
+                          const itemText = first ? `${first.name}${first.qty > 1 ? ` ×${first.qty}` : ''}${(o.items || []).length > 1 ? ` 等 ${(o.items || []).length} 項` : ''}` : '（沒有商品）';
+                          return (
+                            <button key={o.id} type="button" onClick={() => toggle(o.id)} className="w-full flex items-center gap-2.5 py-2.5 border-t border-slate-100 text-left">
+                              <span className={`flex-none w-[18px] h-[18px] rounded-[5px] flex items-center justify-center text-[12px] leading-none ${checked ? 'bg-emerald-600 text-white' : 'border-[1.5px] border-slate-300'}`}>{checked ? '✓' : ''}</span>
+                              <span className="flex-none w-11 text-sm font-bold text-slate-800">{formatOrderDateShort(o.createdAt)}</span>
+                              <span className="flex-1 min-w-0 text-xs text-slate-500 truncate">
+                                {itemText}
+                                {o.id === baseId && <span className="ml-1 px-1.5 rounded bg-emerald-100 text-emerald-800 text-[11px] font-bold">後單</span>}
+                              </span>
+                              <span className="flex-none text-sm font-bold tabular-nums text-slate-800">${calcOrderSubtotal(o).toLocaleString()}</span>
+                            </button>
+                          );
+                        })}
+                        {live && !live.ok && (
+                          <p className="text-xs text-red-600 leading-relaxed mt-1.5">目前勾選的單不能一起併：{live.reasons.join('；')}</p>
+                        )}
+                        {live && live.ok && live.warnings.length > 0 && (
+                          <p className="text-xs text-amber-700 leading-relaxed mt-1.5">聯絡方式或門市資料不完整，按下去後會再請你確認。</p>
+                        )}
+                        <button
+                          type="button"
+                          disabled={selected.length < 2 || busy}
+                          onClick={() => runMerge(selected)}
+                          className="mt-2.5 w-full flex items-center justify-center min-h-[44px] rounded-2xl bg-emerald-600 hover:bg-emerald-700 disabled:opacity-40 disabled:cursor-not-allowed text-white text-[15px] font-bold transition"
+                        >
+                          {selected.length >= 2 ? `併單（${selected.length} 筆）` : '請至少勾選 2 筆'}
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
     function OrderMessageModal({ order, template, onClose, showToast }) {
       const [text, setText] = React.useState(() => buildOrderMessage(order, template));
       const [copied, setCopied] = React.useState(false);
@@ -5234,7 +5453,7 @@
         handleSetAllExpanded,
         handleSelectAllFiltered,
         handleSelectExcelImported,
-        handleMergeSelectedOrders,
+        openMergePicker,
         handleTogglePayment,
         handleToggleShipment,
         handleToggleAbandon,
@@ -5607,15 +5826,16 @@
       return (
               <div className="space-y-3">
                 {/* Action Bar */}
-                <div className="flex items-center justify-between gap-2">
+                {/* [v2.14.39] 手機：標題一行＋四顆等寬按鈕；電腦版（sm 以上）維持標題在左、按鈕在右 */}
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
                   <div className="min-w-0">
                     <h2 className="text-sm sm:text-base font-bold text-slate-800">訂單列表</h2>
                     <p className="hidden sm:block text-xs text-slate-400">Excel 匯入：每個工作表視為一筆訂購單，匯入前可預覽與勾選</p>
                   </div>
-                  <div className="flex items-center gap-1.5 sm:gap-2">
+                  <div className="grid grid-cols-4 gap-1.5 sm:flex sm:items-center sm:gap-2">
                     <label
                       title="匯入 Excel 訂單"
-                      className={`cursor-pointer px-2.5 py-1.5 sm:px-3 sm:py-2 bg-slate-800 hover:bg-slate-900 text-white font-semibold text-xs sm:text-sm rounded-xl shadow transition flex items-center gap-1 whitespace-nowrap ${isOrderParsing ? 'opacity-50 pointer-events-none' : ''}`}
+                      className={`cursor-pointer px-2.5 py-1.5 sm:px-3 sm:py-2 bg-slate-800 hover:bg-slate-900 text-white font-semibold text-xs sm:text-sm rounded-xl shadow transition flex items-center justify-center gap-1 whitespace-nowrap ${isOrderParsing ? 'opacity-50 pointer-events-none' : ''}`}
                     >
                       <IconDownload size={15} />
                       {isOrderParsing ? '解析中...' : '匯入訂單'}
@@ -5624,7 +5844,7 @@
                     <button
                       type="button"
                       onClick={handleExportOrdersExcel}
-                      className="px-2.5 py-1.5 sm:px-3 sm:py-2 bg-white hover:bg-slate-50 text-slate-700 font-semibold text-xs sm:text-sm rounded-xl border border-slate-200 shadow-sm transition flex items-center gap-1 whitespace-nowrap"
+                      className="px-2.5 py-1.5 sm:px-3 sm:py-2 bg-white hover:bg-slate-50 text-slate-700 font-semibold text-xs sm:text-sm rounded-xl border border-slate-200 shadow-sm transition flex items-center justify-center gap-1 whitespace-nowrap"
                       title="匯出目前篩選結果"
                     >
                       <IconUpload size={15} />
@@ -5632,8 +5852,17 @@
                     </button>
                     <button
                       type="button"
+                      onClick={openMergePicker}
+                      className="px-2.5 py-1.5 sm:px-3 sm:py-2 bg-emerald-600 hover:bg-emerald-700 text-white font-semibold text-xs sm:text-sm rounded-xl shadow transition flex items-center justify-center gap-1 whitespace-nowrap"
+                      title="把同一位客人還沒出貨的單合併成一張"
+                    >
+                      <IconMerge size={15} />
+                      併單
+                    </button>
+                    <button
+                      type="button"
                       onClick={toggleSelectMode}
-                      className={`px-2.5 py-1.5 sm:px-3 sm:py-2 font-semibold text-xs sm:text-sm rounded-xl border shadow-sm transition flex items-center gap-1 whitespace-nowrap ${
+                      className={`px-2.5 py-1.5 sm:px-3 sm:py-2 font-semibold text-xs sm:text-sm rounded-xl border shadow-sm transition flex items-center justify-center gap-1 whitespace-nowrap ${
                         selectMode
                           ? 'bg-red-600 text-white border-red-600'
                           : 'bg-white hover:bg-slate-50 text-slate-700 border-slate-200'
@@ -5853,14 +6082,6 @@
                         className="px-3 py-1.5 bg-white hover:bg-red-100 text-red-700 border border-red-200 font-semibold text-xs rounded-lg transition"
                       >
                         只選「Excel 匯入」的訂單
-                      </button>
-                      <button
-                        type="button"
-                        disabled={selectedVisibleCount < 2}
-                        onClick={handleMergeSelectedOrders}
-                        className="px-4 py-1.5 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-40 disabled:cursor-not-allowed text-white font-bold text-xs sm:text-sm rounded-lg shadow transition"
-                      >
-                        {selectedVisibleCount >= 2 ? `併單 (${selectedVisibleCount})` : '併單'}
                       </button>
                       <button
                         type="button"
@@ -8308,6 +8529,7 @@
 
       // ---------- [收支報表 v2.14.10] 狀態全在 screen-finance.js 內部，這裡只管開關 ----------
       const [isFinanceOpen, setIsFinanceOpen] = React.useState(false);
+      const [isMergePickerOpen, setIsMergePickerOpen] = React.useState(false); // [v2.14.39] 併單選擇視窗
 
       const showToast = (msg) => {
         // [v2.14.36] 連續出現訊息時，舊的計時器要取消（否則會提早把新訊息關掉）；字越多停留越久
@@ -9477,42 +9699,43 @@
         }
       };
 
-      // ---------- [v2.14.37] 併單：把勾選的訂單（同一位客人）合併成一張，前單併到「下單時間最晚的後單」 ----------
-      const handleMergeSelectedOrders = async () => {
-        if (mergingOrdersRef.current) return;
-        const selected = filteredOrders.filter(o => selectedOrderIds.has(o.id)); // 只算畫面上看得到、且有勾選的
+      // ---------- [v2.14.37] 併單：把選好的訂單（同一位客人）合併成一張，前單併到「下單時間最晚的後單」 ----------
+      // [v2.14.39] 改由「併單選擇視窗」傳入要併的訂單；回傳 true＝併單完成（視窗才關閉），false＝取消或失敗（視窗留著讓使用者調整）
+      const handleMergeOrders = async (selectedOrders) => {
+        if (mergingOrdersRef.current) return false;
+        const selected = selectedOrders || [];
         if (selected.length < 2) {
-          showToast('請至少勾選兩張要合併的訂單');
-          return;
+          showToast('請至少選兩張要合併的訂單');
+          return false;
         }
         mergingOrdersRef.current = true;
         try {
           const plan = buildMergedOrderPlan(selected, shippingConfig);
           if (!plan.ok) {
             await askConfirm('', { body: <OrderMergeBlockedBody reasons={plan.reasons} />, confirmLabel: '知道了', hideCancel: true });
-            return;
+            return false;
           }
           if (plan.warnings.length > 0) {
             const go = await askConfirm('', { body: <OrderMergeWarningBody warnings={plan.warnings} name={plan.base.customerName} />, confirmLabel: '繼續併單' });
-            if (!go) return;
+            if (!go) return false;
           }
           const confirmed = await askConfirm('', { body: <OrderMergePreviewBody plan={plan} />, confirmLabel: '確定併單' });
-          if (!confirmed) return;
-          if (!requireConnection('併單')) return;
+          if (!confirmed) return false;
+          if (!requireConnection('併單')) return false;
 
           // 視窗開著的期間，其他裝置可能改過這幾張：寫入前重新讀一次最新資料，條件不成立就取消
           const ids = selected.map(o => o.id);
           const snaps = await Promise.all(ids.map(id => dbRef(`orders/${id}`).once('value')));
           if (snaps.some(sn => !sn.exists())) {
             showToast('❌ 有訂單剛剛被刪除或移動，已取消併單，請重新選擇。');
-            return;
+            return false;
           }
           const rawById = {};
           const fresh = snaps.map((sn, i) => { rawById[ids[i]] = sn.val(); return sanitizeOrder({ ...sn.val(), id: ids[i] }); });
           const latest = buildMergedOrderPlan(fresh, shippingConfig);
           if (!latest.ok) {
             showToast('⚠️ 訂單狀態剛剛有變動，已取消併單，請重新選擇。');
-            return;
+            return false;
           }
 
           const { base, earlier, merged, preview } = latest;
@@ -9533,8 +9756,6 @@
 
           const name = base.customerName;
           logAction('order_merge', 'order', base.id, `併單：${name}　${preview.earlierDates.join('、')} 併入 ${preview.baseDate}（${preview.rows.length} 筆併成 1 筆，${preview.mergedItemCount} 項，商品合計 $${preview.subtotal.toLocaleString()}）`);
-          setSelectedOrderIds(new Set());
-          setSelectMode(false);
 
           showUndoToast(`✅ 已併單：${name}（${preview.earlierDates.join('、')} 併入 ${preview.baseDate}）`, async () => {
             try {
@@ -9559,9 +9780,11 @@
               showToast('❌ 復原失敗，請到「更多 → 回收桶」手動還原前單。');
             }
           });
+          return true;
         } catch (err) {
           console.error('Merge orders error:', err);
           showToast('❌ 併單失敗，請檢查權限或網路連線。訂單沒有被改動。');
+          return false;
         } finally {
           mergingOrdersRef.current = false;
         }
@@ -10687,6 +10910,19 @@
             </div>
           )}
 
+          {/* [v2.14.39] 併單選擇視窗 */}
+          {isMergePickerOpen && (
+            <OrderMergePickerModal
+              orders={orders}
+              onClose={() => setIsMergePickerOpen(false)}
+              onMerge={async (selected) => {
+                const ok = await handleMergeOrders(selected);
+                if (ok) setIsMergePickerOpen(false);
+                return ok;
+              }}
+            />
+          )}
+
           {/* [V2.7] Trash + Log modals */}
           {isTrashOpen && (
             <TrashModal
@@ -11469,7 +11705,7 @@
                   handleSetAllExpanded,
                   handleSelectAllFiltered,
                   handleSelectExcelImported,
-                  handleMergeSelectedOrders,
+                  openMergePicker: () => setIsMergePickerOpen(true),
                   handleTogglePayment,
                   handleToggleShipment,
                   handleToggleAbandon,
