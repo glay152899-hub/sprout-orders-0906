@@ -59,7 +59,7 @@
     // ==========================================
     // config.js — 版本號 / Firebase設定 / 常數設定值
     // ==========================================
-    const APP_VERSION = '2.14.40';
+    const APP_VERSION = '2.14.41';
 
     // [v2.14.18] 尺寸系列：新增訂單與商品庫的尺寸快捷選項。存進資料庫的仍是「80, 90, 100」這種逗號字串，系列只是輸入輔助。
     // 要增減尺寸只改這裡；統一存大寫（與既有資料、sortSizes 的排序表一致）。
@@ -11127,17 +11127,21 @@
 
           {/* Header */}
           <header className="bg-emerald-600 text-white sticky top-0 z-40 shadow-md">
-            <div className="max-w-6xl xl:max-w-7xl 2xl:max-w-[1600px] mx-auto px-4 sm:px-6 lg:px-8 py-3 flex items-center justify-between">
-              <div className="flex items-center gap-2.5">
-                <div className="bg-white/20 p-2 rounded-xl backdrop-blur-md">
+            <div className="max-w-6xl xl:max-w-7xl 2xl:max-w-[1600px] mx-auto pl-4 pr-3 sm:px-6 lg:px-8 py-3.5 sm:py-3 flex items-center justify-between gap-4">
+              <div className="flex items-center gap-3 min-w-0">
+                <div className="bg-white/20 p-2 rounded-xl backdrop-blur-md shrink-0">
                   <IconShoppingBag className="w-5 h-5 sm:w-6 sm:h-6 text-white" />
                 </div>
-                <div>
-                  <h1 className="text-base sm:text-lg lg:text-xl font-bold leading-tight flex items-center gap-2">
-                    小豆苗訂單助手
-                    <span className="text-[10px] sm:text-xs bg-emerald-700 text-emerald-100 px-2 py-0.5 rounded-full font-mono">v{APP_VERSION} RTDB</span>
+                <div className="min-w-0">
+                  {/* [v2.14.41] 標題列版面：
+                      手機＝兩欄格線（左：標題；右：版本徽章，測試模式時下方再接「測試模式」徽章，兩顆自動等寬、文字置中）。
+                      測試模式時標題跨兩列、垂直置中；一般模式只有一列，標題與版本徽章同一條水平線。
+                      sm 以上＝回到原本的單行排列（標題＋徽章），格線與跨列設定自動失效。 */}
+                  <h1 className="text-base sm:text-lg lg:text-xl font-bold leading-tight grid grid-cols-[auto_auto] items-center gap-x-3 gap-y-1.5 sm:flex sm:flex-wrap sm:gap-x-2 sm:gap-y-1">
+                    <span className={`col-start-1 row-start-1 whitespace-nowrap ${IS_TEST_MODE ? 'row-span-2' : ''}`}>小豆苗訂單助手</span>
+                    <span className="col-start-2 row-start-1 whitespace-nowrap text-center text-[10px] sm:text-xs bg-emerald-700 text-emerald-100 px-2.5 py-0.5 rounded-full font-mono">v{APP_VERSION}</span>
                     {IS_TEST_MODE && (
-                      <span className="text-[10px] sm:text-xs bg-amber-400 text-slate-900 px-2 py-0.5 rounded-full font-bold">🧪 測試模式</span>
+                      <span className="col-start-2 row-start-2 whitespace-nowrap text-center text-[10px] sm:text-xs bg-amber-400 text-slate-900 px-2.5 py-0.5 rounded-full font-bold">🧪 測試模式</span>
                     )}
                   </h1>
                   <p className="text-[11px] sm:text-xs text-emerald-100 opacity-90 hidden sm:flex items-center gap-1.5">
@@ -11177,7 +11181,7 @@
               </nav>
 
               {/* Cloud Sync Status Indicator */}
-              <div className="flex items-center gap-1.5 text-xs bg-emerald-700/50 px-3 py-1.5 rounded-xl border border-emerald-500/30">
+              <div className="flex items-center gap-1.5 text-xs bg-emerald-700/50 px-2 sm:px-3 py-1.5 rounded-xl border border-emerald-500/30 shrink-0">
                 <IconCloud size={16} className={pendingSyncCount > 0 ? "animate-bounce text-amber-300" : isSyncing ? "animate-bounce text-amber-300" : isConnected ? "text-emerald-200" : "text-amber-300"} />
                 <span className="font-bold text-emerald-100 hidden sm:inline">
                   {pendingSyncCount > 0 ? `⏳ ${pendingSyncCount} 筆同步中` : isSyncing ? "連線中..." : isConnected ? "🟢 實時同步中" : "⚠️ 連線受阻"}
