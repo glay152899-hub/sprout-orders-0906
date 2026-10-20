@@ -59,7 +59,7 @@
     // ==========================================
     // config.js — 版本號 / Firebase設定 / 常數設定值
     // ==========================================
-    const APP_VERSION = '2.14.39';
+    const APP_VERSION = '2.14.40';
 
     // [v2.14.18] 尺寸系列：新增訂單與商品庫的尺寸快捷選項。存進資料庫的仍是「80, 90, 100」這種逗號字串，系列只是輸入輔助。
     // 要增減尺寸只改這裡；統一存大寫（與既有資料、sortSizes 的排序表一致）。
@@ -5837,8 +5837,9 @@
                       title="匯入 Excel 訂單"
                       className={`cursor-pointer px-2.5 py-1.5 sm:px-3 sm:py-2 bg-slate-800 hover:bg-slate-900 text-white font-semibold text-xs sm:text-sm rounded-xl shadow transition flex items-center justify-center gap-1 whitespace-nowrap ${isOrderParsing ? 'opacity-50 pointer-events-none' : ''}`}
                     >
-                      <IconDownload size={15} />
-                      {isOrderParsing ? '解析中...' : '匯入訂單'}
+                      {/* [v2.14.40] 標籤縮成「匯入」；解析中改成轉圈圖示＋「解析中」，不會被擠出按鈕 */}
+                      {isOrderParsing ? <span className="inline-block w-3.5 h-3.5 border-2 border-white/40 border-t-white rounded-full animate-spin" /> : <IconDownload size={15} />}
+                      {isOrderParsing ? '解析中' : '匯入'}
                       <input type="file" accept=".xlsx, .xls" onChange={handleOrderFileUpload} className="hidden" />
                     </label>
                     <button
