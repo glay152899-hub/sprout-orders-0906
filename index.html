@@ -59,7 +59,7 @@
     // ==========================================
     // config.js — 版本號 / Firebase設定 / 常數設定值
     // ==========================================
-    const APP_VERSION = '2.14.41';
+    const APP_VERSION = '2.14.42';
 
     // [v2.14.18] 尺寸系列：新增訂單與商品庫的尺寸快捷選項。存進資料庫的仍是「80, 90, 100」這種逗號字串，系列只是輸入輔助。
     // 要增減尺寸只改這裡；統一存大寫（與既有資料、sortSizes 的排序表一致）。
@@ -633,6 +633,9 @@
       // [v2.14.12] paymentStatus 的畫面名稱改為「已領貨／未領貨」（取貨付款：領貨＝款項入帳；轉帳：收到款就算）。
       // paidDate＝領貨（入帳）日 YYYY-MM-DD，空白＝舊資料沒記，收支報表退回用訂單日期；closeStatus＝'abandoned' 代表棄單（不計營收）
       paidDate: /^\d{4}-\d{2}-\d{2}$/.test(String(order?.paidDate || '')) ? order.paidDate : '',
+      // [v2.14.42] prepaidDate＝款項已收日 YYYY-MM-DD（客人先匯款、貨還沒出／還沒領）；空白＝沒預付。與 paymentStatus（客人已領貨）是兩件事：
+      // 取貨付款的客人「領貨＝入帳」同時發生，先匯款的客人「下單就入帳、之後才領貨」，所以拆成兩個欄位。舊資料沒有這欄，讀進來補空字串。
+      prepaidDate: /^\d{4}-\d{2}-\d{2}$/.test(String(order?.prepaidDate || '')) ? order.prepaidDate : '',
       closeStatus: order?.closeStatus === 'abandoned' ? 'abandoned' : '',
       items: Array.isArray(order?.items) ? order.items.map(sanitizeItem) : [],
       note: order?.note || '',
@@ -690,6 +693,12 @@
         else if (o.shipmentStatus === 'shipped') reasons.push(`${tag(o)}已出貨，貨已寄出，無法再併`);
         else if (o.paymentStatus) reasons.push(`${tag(o)}已領貨（款項已入帳），無法再併`);
       });
+
+      // [v2.14.42] 款項已收（客人先匯款）的狀態要一致：有的已預付、有的沒有，併起來帳會對不上，擋下
+      const prepaidList = list.filter(o => o.prepaidDate);
+      if (prepaidList.length > 0 && prepaidList.length < list.length) {
+        reasons.push(`款項狀態不同：${prepaidList.map(tag).join('、')}客人已先匯款，其他筆還沒`);
+      }
 
       // 逐項比對：把每一張在這一項的值正規化後放進 Map，超過一種就是「不一樣」
       const distinct = (getter, normalize) => {
@@ -787,6 +796,10 @@
           oldShipping,
           newShipping,
           mergeLine,
+          // [v2.14.42] 兩張都已預付時：客人原本付的金額 vs 併單後應付，運費重算可能造成差額（只警告，不擋）
+          prepaid: ordered.every(o => Boolean(o.prepaidDate)),
+          paidAmount: ordered.reduce((sum, o) => sum + calcOrderTotal(o), 0),
+          newTotal: Math.round(subtotal + newShipping),
           earlierDates: earlier.map(o => formatOrderDateShort(o.createdAt)),
           baseDate: formatOrderDateShort(base.createdAt)
         }
@@ -924,6 +937,7 @@
       shippingFee: '運費',
       paymentStatus: '領貨狀態',
       paidDate: '領貨日',
+      prepaidDate: '款項已收日', // [v2.14.42]
       closeStatus: '棄單',
       shipmentStatus: '出貨狀態',
       note: '備註',
@@ -2426,6 +2440,7 @@
         '門市名稱': deriveStoreDisplay(o).name,
         '地址': deriveStoreDisplay(o).address,
         '領貨狀態': o.closeStatus === 'abandoned' ? '棄單' : (o.paymentStatus ? '已領貨' : '未領貨'),
+        '款項已收日': o.prepaidDate || '', // [v2.14.42]
         '出貨狀態': o.shipmentStatus === 'shipped' ? '已出貨' : '待出貨',
         '商品明細': o.items.map(i =>
           isAdjustmentItem(i)
@@ -2462,7 +2477,7 @@
     // 訂單 CSV 全文（含 BOM）（handleExportCSV 用）
     const buildOrdersCsv = (orders) => {
       let csvContent = '\uFEFF';
-      csvContent += '訂單編號,顧客姓名,電話,LINE,IG,配送方式,門市名稱,地址,購買品項細項,商品小計,運費,訂單總金額,領貨狀態,出貨狀態,備註事項,建立時間\n';
+      csvContent += '訂單編號,顧客姓名,電話,LINE,IG,配送方式,門市名稱,地址,購買品項細項,商品小計,運費,訂單總金額,領貨狀態,出貨狀態,備註事項,建立時間,款項已收日\n';
 
       orders.forEach(o => {
         const itemsDetail = o.items.map(i => `[${i.sku}]${i.name}-${i.color}/${i.size} x${i.qty}`).join('; ');
@@ -2486,7 +2501,8 @@
           o.closeStatus === 'abandoned' ? '棄單' : (o.paymentStatus ? '已領貨' : '未領貨'),
           o.shipmentStatus === 'shipped' ? '已出貨' : '待出貨',
           `"${(o.note || '').replace(/"/g, '""')}"`,
-          `"${o.createdAt}"`
+          `"${o.createdAt}"`,
+          `"${o.prepaidDate || ''}"` // [v2.14.42] 放在最後，不影響既有欄位順序
         ];
         csvContent += row.join(',') + '\n';
       });
@@ -2551,16 +2567,14 @@
           abandonedAmount += total;
           return;
         }
-        if (o.paymentStatus) {
-          paidCount += 1;
-          receivedRevenue += total;
-        } else {
-          unpaidCount += 1;
-          pendingRevenue += total;
-        }
+        // [v2.14.42] 「領貨」（paymentStatus）與「款項已收」（prepaidDate）分開：已實收＝已領貨 或 先匯款；待收＝兩者都沒有；
+        // 階段（待出貨／待領貨／已領貨）只看領貨與出貨——先匯款的單，未出貨算待出貨、已出貨未領算待領貨。
+        const moneyIn = Boolean(o.paymentStatus || o.prepaidDate);
+        if (o.paymentStatus) paidCount += 1; else unpaidCount += 1;
+        if (moneyIn) receivedRevenue += total; else pendingRevenue += total;
         if (o.shipmentStatus !== 'shipped') {
           unshippedCount += 1;
-          if (o.paymentStatus) readyToShipCount += 1; // 已付款、等著出貨
+          if (moneyIn) readyToShipCount += 1; // 款項已收、等著出貨
         } else if (o.paymentStatus) {
           doneCount += 1;
         } else {
@@ -2731,7 +2745,7 @@
         const amount = Math.round(calcOrderSubtotal(o));
         if (isAbandonedOrder(o)) { excluded.push({ id: o.id, date, amount }); return; }
         if (amount === 0) return;
-        if (isLive && date >= pickupStart && !o.paymentStatus) { pending.push({ id: o.id, date, amount }); return; } // 還沒領貨：先不入帳
+        if (isLive && date >= pickupStart && !(o.paymentStatus || o.prepaidDate)) { pending.push({ id: o.id, date, amount }); return; } // [v2.14.42] 沒領貨、也沒先匯款：先不入帳（先匯款的單錢已收到，不是待入帳，照樣算收入）
         if (!days[date]) days[date] = { amount: 0, count: 0 };
         days[date].amount += amount;
         days[date].count += 1;
@@ -3185,7 +3199,8 @@
         storeAddress: storeParts.address, // [v2.13.0新增] 若是舊資料，這裡已經用括號規則拆過一次，存檔時就會變成新格式
         shippingFee: order.shippingFee,
         paymentStatus: Boolean(order.paymentStatus),
-        paidDate: order.paidDate || '', // [v2.14.12] 領貨（入帳）日；空白＝舊資料沒記
+        paidDate: order.paidDate || '', // [v2.14.12] 領貨日；空白＝舊資料沒記
+        prepaidDate: order.prepaidDate || '', // [v2.14.42] 款項已收日（客人先匯款）；空白＝沒預付
         closeStatus: order.closeStatus === 'abandoned' ? 'abandoned' : '',
         shipmentStatus: order.shipmentStatus || 'unshipped',
         note: order.note || '',
@@ -3234,6 +3249,7 @@
         // [v2.14.7] 只在日期「被改動」時才檢查，原本就是未來日期的舊訂單仍可只改其他欄位
         if (form.orderDate && form.orderDate !== initialOrderDate.current && form.orderDate > todayStr) { setError('訂單日期不能是未來的日期'); return; }
         if (form.paymentStatus && form.paidDate && form.paidDate > todayStr) { setError('領貨日不能是未來的日期'); return; }
+        if (form.prepaidDate && form.prepaidDate > todayStr) { setError('款項已收日不能是未來的日期'); return; }
 
         const edited = {
           orderNo: form.orderNo.trim(),
@@ -3247,6 +3263,7 @@
           shippingFee: Number(form.shippingFee) || 0,
           paymentStatus: Boolean(form.paymentStatus),
           paidDate: form.paymentStatus ? (form.paidDate || '') : '',
+          prepaidDate: form.prepaidDate || '', // [v2.14.42] 棄單時不清除（營收本來就排除棄單；還原棄單時預付狀態自動回來）
           closeStatus: form.paymentStatus ? '' : form.closeStatus,
           shipmentStatus: form.shipmentStatus,
           note: form.note.trim(),
@@ -3448,9 +3465,27 @@
                   棄單
                 </label>
               </div>
+              {/* [v2.14.42] 款項已收（客人先匯款）：跟「已領貨」是兩件事——先匯款的客人下單就入帳，領貨是之後的事 */}
+              <div className="space-y-2">
+                <label className="flex items-start gap-2 cursor-pointer text-xs sm:text-sm font-semibold text-slate-700">
+                  <input
+                    type="checkbox"
+                    checked={Boolean(form.prepaidDate)}
+                    onChange={(e) => setForm(prev => ({ ...prev, prepaidDate: e.target.checked ? (prev.prepaidDate || (prev.orderDate && prev.orderDate <= todayStr ? prev.orderDate : todayStr)) : '' }))}
+                    className="w-4 h-4 mt-0.5 accent-indigo-600"
+                  />
+                  <span>款項已收<span className="font-normal text-slate-500">（客人已先匯款，收支報表算收入、不算待入帳）</span></span>
+                </label>
+                {form.prepaidDate && (
+                  <div>
+                    <label className="text-xs font-semibold text-slate-600 mb-1 block">款項已收日</label>
+                    <input type="date" value={form.prepaidDate} max={todayStr} onChange={(e) => setField('prepaidDate', e.target.value)} className={inputCls} />
+                  </div>
+                )}
+              </div>
               {form.paymentStatus && (
                 <div>
-                  <label className="text-xs font-semibold text-slate-600 mb-1 block">領貨日（款項入帳日）</label>
+                  <label className="text-xs font-semibold text-slate-600 mb-1 block">領貨日（客人領貨的日子）</label>
                   <input type="date" value={form.paidDate} max={todayStr} onChange={(e) => setField('paidDate', e.target.value)} className={inputCls} />
                   {!form.paidDate && <p className="text-[11px] text-slate-400 mt-1">舊訂單沒有記錄領貨日，收支報表會暫用訂單日期；想校正可在這裡選日期。</p>}
                 </div>
@@ -3817,6 +3852,14 @@
               </span>
             </div>
           </div>
+          {p.prepaid && (
+            <div className="bg-indigo-50 rounded-xl px-3 py-2 mb-2.5 text-xs leading-relaxed text-indigo-900">
+              這幾筆客人都已先匯款：原本共付 <b>${p.paidAmount.toLocaleString()}</b>，併單後應付 <b>${p.newTotal.toLocaleString()}</b>。
+              {p.newTotal !== p.paidAmount && (
+                <span className="block text-amber-700 font-bold mt-0.5">差 {p.newTotal > p.paidAmount ? '+' : '-'}${Math.abs(p.newTotal - p.paidAmount).toLocaleString()}（{p.newTotal > p.paidAmount ? '需向客人補收' : '要退還客人'}），請自行處理。</span>
+              )}
+            </div>
+          )}
           <p className="text-xs leading-relaxed text-slate-400 break-words">・備註會加上「{p.mergeLine}」</p>
           <p className="text-xs leading-relaxed text-slate-400 break-words">・{earlierText} 那{p.earlierDates.length > 1 ? ` ${p.earlierDates.length} ` : ''}筆會移到回收桶，併單後 6 秒內可按「復原」</p>
         </div>
@@ -5663,10 +5706,14 @@
                                   className={`px-2 py-1 rounded-full text-[11px] sm:text-xs font-bold transition whitespace-nowrap ${
                                     order.paymentStatus
                                       ? 'bg-green-100 text-green-700'
-                                      : 'bg-amber-100 text-amber-700'
+                                      : order.prepaidDate
+                                        ? 'bg-indigo-100 text-indigo-700'
+                                        : 'bg-amber-100 text-amber-700'
                                   }`}
+                                  title={!order.paymentStatus && order.prepaidDate ? `客人已先匯款（${order.prepaidDate}），還沒領貨；點一下標為已領貨` : undefined}
                                 >
-                                  {order.paymentStatus ? '✓ 已領貨' : '✕ 未領貨'}
+                                  {/* [v2.14.42] 先匯款、還沒領貨 → 靛藍「已預付」（顏色避開綠＝已領貨、琥珀＝未付款）；點一下仍是標示已領貨 */}
+                                  {order.paymentStatus ? '✓ 已領貨' : order.prepaidDate ? '💰 已預付' : '✕ 未領貨'}
                                 </button>
                               )}
 
@@ -8743,7 +8790,7 @@
       const [orderDate, setOrderDate] = React.useState(''); // [v2.14.5] 新增訂單的日期（YYYY-MM-DD）；空白＝今天
       const [sizeSeries, setSizeSeriesState] = React.useState(loadSizeSeries); // [v2.14.18] 新增訂單手動輸入時的尺寸系列（記住上次選擇）
       const setSizeSeries = (key) => { setSizeSeriesState(key); saveSizeSeries(key); };
-      const [isPrepaidNew, setIsPrepaidNew] = React.useState(false); // [v2.14.12] 客人已全額轉帳：建單即「已領貨（入帳）」
+      const [isPrepaidNew, setIsPrepaidNew] = React.useState(false); // [v2.14.42] 客人已先匯款：建單時寫 prepaidDate（款項已收），不再直接標「已領貨」
       
       const [orderItems, setOrderItems] = React.useState([]);
 
@@ -9296,8 +9343,9 @@
           storeName,
           storeAddress: storeAddress.trim(),
           shippingFee: Number(shippingFee),
-          paymentStatus: isPrepaidNew, // [v2.14.12] 已全額轉帳＝建單即入帳；其餘為「未領貨」，客人領貨後再按已領貨
-          paidDate: isPrepaidNew ? toDateInputValue(orderStamp.timestamp) : '',
+          paymentStatus: false, // [v2.14.42] 勾「客人已先匯款」不再直接算已領貨：領貨還沒發生，客人領貨後再按已領貨
+          paidDate: '',
+          prepaidDate: isPrepaidNew ? toDateInputValue(orderStamp.timestamp) : '', // 款項已收日（＝建單當天）；營收照樣算（下單日），不算待入帳
           closeStatus: '',
           shipmentStatus: 'unshipped',
           items: orderItems,
@@ -9386,9 +9434,11 @@
         if (currentStatus && target) {
           const orderDay = toDateInputValue(target.timestamp);
           const amountText = `$${calcOrderSubtotal(target).toLocaleString()}`;
-          const impact = orderDay >= FINANCE_PICKUP_START
-            ? `收支報表會把這張的 ${amountText} 從收入改成「待入帳」。`
-            : `這張是舊訂單，收支報表仍視為已入帳，只有訂單列表的狀態會改變。`;
+          const impact = target.prepaidDate
+            ? `這張客人已先匯款（款項已收），收支報表的收入不會變，只是狀態改回「未領貨」。`
+            : orderDay >= FINANCE_PICKUP_START
+              ? `收支報表會把這張的 ${amountText} 從收入改成「待入帳」。`
+              : `這張是舊訂單，收支報表仍視為已入帳，只有訂單列表的狀態會改變。`;
           const paidInfo = target.paidDate ? `（領貨日 ${target.paidDate}）` : '';
           if (!(await askConfirm(`把「${name}」從「已領貨」改回「未領貨」？${paidInfo}\n\n${impact}\n\n如果是不小心點到，請按「取消」。`, { confirmLabel: '確定改回' }))) return;
         }
@@ -9430,7 +9480,7 @@
         const name = target?.customerName || '';
         const ok = await askConfirm(isAbandoned
           ? `把「${name}」的棄單還原成「未領貨」？`
-          : `把「${name}」標記為「棄單」？\n\n棄單的訂單不會計入營收，之後可以再還原。`, { confirmLabel: isAbandoned ? '確定還原' : '標記為棄單' });
+          : `把「${name}」標記為「棄單」？\n\n棄單的訂單不會計入營收，之後可以再還原。${target?.prepaidDate ? '\n\n這位客人已先匯款，記得退款。（系統不會自動記帳，退款請到收支報表「記一筆」。）' : ''}`, { confirmLabel: isAbandoned ? '確定還原' : '標記為棄單' });
         if (!ok) return;
         try {
           await withSyncTracking(dbRef(`orders/${orderId}`).update(isAbandoned
@@ -11458,7 +11508,7 @@
 
                     <label className="flex items-start gap-2 cursor-pointer text-xs sm:text-sm text-slate-700">
                       <input type="checkbox" checked={isPrepaidNew} onChange={(e) => setIsPrepaidNew(e.target.checked)} className="w-4 h-4 mt-0.5 accent-emerald-600" />
-                      <span><span className="font-semibold">客人已全額轉帳</span>（建單就算已領貨、款項入帳）</span>
+                      <span><span className="font-semibold">客人已先匯款</span>（款項已入帳，尚未領貨）</span>
                     </label>
 
                     <div>
