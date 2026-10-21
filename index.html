@@ -59,7 +59,7 @@
     // ==========================================
     // config.js — 版本號 / Firebase設定 / 常數設定值
     // ==========================================
-    const APP_VERSION = '2.14.44';
+    const APP_VERSION = '2.14.45';
 
     // [v2.14.18] 尺寸系列：新增訂單與商品庫的尺寸快捷選項。存進資料庫的仍是「80, 90, 100」這種逗號字串，系列只是輸入輔助。
     // 要增減尺寸只改這裡；統一存大寫（與既有資料、sortSizes 的排序表一致）。
@@ -2535,6 +2535,7 @@
 
       orders.forEach(order => {
         if (order.shipmentStatus === 'shipped') return;
+        if (order.closeStatus === 'abandoned') return; // [v2.14.45] 棄單不用叫貨／揀貨，不列入理貨清單
 
         order.items.forEach(item => {
           // [V2.1] 折抵 / 內退項目不是實體商品，不列入理貨清單
@@ -2562,6 +2563,58 @@
       });
 
       return Object.values(map);
+    };
+
+    // [v2.14.45] 理貨清單依「商品」分組：同一商品（有款號用款號，沒有就用品名）的不同顏色／尺寸排在同一組，
+    // 對應批發叫貨系統「同商品的規格列在一起」的畫面。只做分組與排序，勾選的 key 仍是 tallyMatrix 的 item.key（不變）。
+    // 傳入 computeTallyMatrix 的結果與商品庫（用來帶出縮圖；對不到或沒圖就是空字串）。
+    const computeTallyGroups = (tallyMatrix, products = []) => {
+      const bySku = {};
+      const byName = {};
+      (products || []).forEach(p => {
+        if (!p) return;
+        if (p.sku && !bySku[p.sku]) bySku[p.sku] = p;
+        if (p.name && !byName[p.name]) byName[p.name] = p;
+      });
+
+      const groups = {};
+      tallyMatrix.forEach(item => {
+        const gKey = item.sku ? `sku:${item.sku}` : `name:${item.name}`;
+        if (!groups[gKey]) {
+          const prod = (item.sku && bySku[item.sku]) || byName[item.name] || null;
+          groups[gKey] = {
+            key: gKey,
+            sku: item.sku || '',
+            name: item.name,
+            imageUrl: (prod && prod.imageUrl) || '',
+            totalQty: 0,
+            rows: []
+          };
+        }
+        groups[gKey].totalQty += item.totalQty;
+        groups[gKey].rows.push(item);
+      });
+
+      const list = Object.values(groups);
+      list.forEach(g => {
+        // 列的順序：顏色（中文排序，沒填的放最後）→ 尺寸（用 sortSizes 的規則）
+        const sizeRank = {};
+        sortSizes(Array.from(new Set(g.rows.map(r => String(r.size || ''))))).forEach((sz, i) => { sizeRank[sz] = i; });
+        g.rows.sort((a, b) => {
+          const ca = a.color || '';
+          const cb = b.color || '';
+          if (!ca !== !cb) return ca ? -1 : 1;
+          const byColor = ca.localeCompare(cb, 'zh-Hant');
+          if (byColor !== 0) return byColor;
+          return (sizeRank[String(a.size || '')] || 0) - (sizeRank[String(b.size || '')] || 0);
+        });
+      });
+      // 組的順序：有款號的先（依款號），沒款號的後（依品名）
+      list.sort((a, b) => {
+        if (!a.sku !== !b.sku) return a.sku ? -1 : 1;
+        return (a.sku || a.name).localeCompare(b.sku || b.name, 'zh-Hant');
+      });
+      return list;
     };
 
     // 訂單列表統計卡（orderListStats 的 useMemo 內容）
@@ -2626,7 +2679,7 @@
         return sum + o.items.reduce((s, i) => s + (isAdjustmentItem(i) ? 0 : i.qty), 0);
       }, 0);
       const unpaidCount = orders.filter(o => !o.paymentStatus && o.closeStatus !== 'abandoned').length;
-      const unshippedCount = orders.filter(o => o.shipmentStatus !== 'shipped').length;
+      const unshippedCount = orders.filter(o => o.shipmentStatus !== 'shipped' && o.closeStatus !== 'abandoned').length; // [v2.14.45] 理貨清單徽章不含棄單
 
       const stagnantAlertCount = enrichedProducts.filter(p => {
         const inf = getStagnantInfo(p);
@@ -6838,13 +6891,106 @@
   </script>
   <script type="text/babel">
     // ==========================================
-    // tab-tally.js  (v2.14.1 Phase 1)
-    // 理貨清單分頁畫面（從 app-shell.js 原樣搬出）；tallyMatrix 等仍在 app-shell.js 計算
+    // tab-tally.js  (v2.14.40)
+    // 理貨清單分頁畫面。tallyMatrix／tallyGroups 在 app-shell.js 計算（computeTallyMatrix／computeTallyGroups，utils-export.js）
+    // [v2.14.45] 依「商品」分組：同一商品的不同顏色／尺寸排在同一組（像批發叫貨系統的畫面），勾選 key 不變。
     // ==========================================
+
+    // 一個商品群組：標題（縮圖、款號品名、進度、全部勾選）＋每個規格一列（顏色、尺寸、數量、勾選）。
+    // 含「哪一列展開客人名單」的畫面 state（純畫面，不存資料庫；與 DragScrollPane／FilterCollapse 同樣屬規則 B 的小元件例外）。
+    function TallyGroupCard({ group, tallyChecked, onToggle, onSetAll }) {
+      const [openRows, setOpenRows] = React.useState({});
+      const keys = group.rows.map(r => r.key);
+      const doneCount = keys.filter(k => tallyChecked[k]).length;
+      const allDone = doneCount === keys.length;
+
+      return (
+        <div className={`rounded-2xl border overflow-hidden transition ${allDone ? 'bg-slate-50 border-slate-200' : 'bg-white border-slate-200/80 shadow-sm'}`}>
+          {/* 群組標題 */}
+          <div className="flex items-center gap-3 p-3 bg-slate-50/80 border-b border-slate-100">
+            {group.imageUrl && (
+              <img
+                src={group.imageUrl}
+                alt=""
+                loading="lazy"
+                className="w-12 h-12 rounded-lg object-cover flex-shrink-0 border border-slate-200 bg-slate-100"
+              />
+            )}
+            <div className="flex-1 min-w-0">
+              <div className={`text-sm font-bold text-slate-800 break-words ${allDone ? 'opacity-60' : ''}`}>
+                {group.sku && <span className="font-mono text-emerald-600 mr-1.5">[{group.sku}]</span>}
+                {group.name}
+              </div>
+              <div className="text-xs text-slate-500 mt-0.5">
+                共 <span className="font-bold text-amber-600">{group.totalQty}</span> 件・已核對 {doneCount}/{keys.length} 項
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => onSetAll(keys, !allDone)}
+              className={`flex-shrink-0 px-3 py-1.5 rounded-xl text-xs font-bold border transition ${
+                allDone
+                  ? 'bg-white text-slate-500 border-slate-300 hover:bg-slate-100'
+                  : 'bg-emerald-600 text-white border-emerald-600 hover:bg-emerald-700'
+              }`}
+            >
+              {allDone ? '取消全部' : '全部勾選'}
+            </button>
+          </div>
+
+          {/* 規格列 */}
+          <div className="divide-y divide-slate-100">
+            {group.rows.map((row) => {
+              const isChecked = !!tallyChecked[row.key];
+              const isOpen = !!openRows[row.key];
+              return (
+                <div key={row.key} className={isChecked ? 'bg-slate-100/70' : ''}>
+                  <div
+                    onClick={() => onToggle(row.key)}
+                    className="flex items-center gap-3 px-3 py-3 cursor-pointer select-none"
+                  >
+                    <div className={`w-6 h-6 rounded-full flex items-center justify-center border flex-shrink-0 transition ${
+                      isChecked ? 'bg-slate-700 text-white border-slate-700' : 'bg-white border-slate-300'
+                    }`}>
+                      {isChecked && <IconCheck size={14} />}
+                    </div>
+                    <div className={`flex-1 min-w-0 text-sm text-slate-700 ${isChecked ? 'line-through opacity-60' : ''}`}>
+                      <span className="font-semibold">{row.color || '預設'}</span>
+                      <span className="text-slate-400 mx-1.5">;</span>
+                      <span className="font-semibold">{row.size || 'F'}</span>
+                    </div>
+                    <div className={`text-right flex-shrink-0 ${isChecked ? 'opacity-60' : ''}`}>
+                      <span className="text-xl font-black text-amber-600">×{row.totalQty}</span>
+                    </div>
+                    <button
+                      type="button"
+                      aria-label={isOpen ? '收起客人名單' : '展開客人名單'}
+                      onClick={(e) => { e.stopPropagation(); setOpenRows(prev => ({ ...prev, [row.key]: !prev[row.key] })); }}
+                      className="flex-shrink-0 w-8 h-8 -mr-1 rounded-lg flex items-center justify-center text-slate-400 hover:bg-slate-100"
+                    >
+                      {isOpen ? <IconChevronUp size={18} /> : <IconChevronDown size={18} />}
+                    </button>
+                  </div>
+                  {isOpen && (
+                    <div className="px-3 pb-3 pl-12 flex flex-wrap gap-1.5">
+                      {row.buyers.map((b, idx) => (
+                        <span key={idx} className="text-xs bg-slate-100 text-slate-600 px-2 py-0.5 rounded-md">
+                          {b.customerName} x{b.qty}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
 
     // [Phase 1] 理貨清單分頁
     function TallyTab({ tally }) {
-      const { activeTab, handleToggleTallyCheck, tallyChecked, tallyMatrix } = tally;
+      const { activeTab, handleToggleTallyCheck, handleSetTallyChecks, tallyChecked, tallyGroups } = tally;
       return (
         <>
             {/* Tab 3: Picking List */}
@@ -6853,66 +6999,27 @@
                 <div className="bg-amber-50 border border-amber-200/80 rounded-2xl p-4 text-xs sm:text-sm text-amber-800 flex items-start gap-3">
                   <IconCheckSquare size={20} className="text-amber-600 flex-shrink-0 mt-0.5" />
                   <div>
-                    <span className="font-bold block mb-0.5">即時理貨與揀貨模式</span>
-                    自動加總所有「待出貨」訂單的商品與數量。點擊卡片即可即時勾銷，多人持手機在倉庫理貨狀態也會即時同步！
+                    <span className="font-bold block mb-0.5">即時理貨與叫貨核對</span>
+                    自動加總所有「待出貨」訂單的商品與數量（不含棄單），同一商品的不同顏色、尺寸排在同一組。點一列即可勾銷，展開箭頭可看是哪些客人要的；多人持手機理貨也會即時同步！
                   </div>
                 </div>
 
-                {tallyMatrix.length === 0 ? (
+                {tallyGroups.length === 0 ? (
                   <div className="text-center py-16 text-slate-400 bg-white rounded-2xl border border-dashed border-slate-200">
                     <IconCheckCircle2 size={48} className="mx-auto mb-3 text-emerald-500 opacity-60" />
                     <p className="text-sm sm:text-base font-medium">太棒了！所有訂單皆已揀貨出貨完成！</p>
                   </div>
                 ) : (
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                    {tallyMatrix.map((item) => {
-                      const isChecked = tallyChecked[item.key] || false;
-
-                      return (
-                        <div
-                          key={item.key}
-                          onClick={() => handleToggleTallyCheck(item.key)}
-                          className={`p-4 rounded-2xl border transition cursor-pointer select-none flex flex-col justify-between ${
-                            isChecked
-                              ? 'bg-slate-100 border-slate-300 opacity-60 line-through'
-                              : 'bg-white border-slate-200/80 shadow-sm hover:border-emerald-300'
-                          }`}
-                        >
-                          <div className="flex items-center justify-between">
-                            <div className="flex items-center gap-3">
-                              <div className={`w-6 h-6 rounded-lg flex items-center justify-center border transition ${
-                                isChecked ? 'bg-slate-700 text-white border-slate-700' : 'bg-white border-slate-300'
-                              }`}>
-                                {isChecked && <IconCheck size={16} />}
-                              </div>
-
-                              <div>
-                                <div className="text-sm sm:text-base font-bold text-slate-800">
-                                  {item.sku && <span className="font-mono text-emerald-600 mr-1.5">[{item.sku}]</span>}
-                                  {item.name}
-                                </div>
-                                <div className="text-xs sm:text-sm text-slate-500">
-                                  款式：<span className="font-semibold text-slate-700">{item.color || '預設'}</span> | 尺寸：<span className="font-semibold text-slate-700">{item.size}</span>
-                                </div>
-                              </div>
-                            </div>
-
-                            <div className="text-right">
-                              <span className="text-xs text-slate-400 block">總需求</span>
-                              <span className="text-lg sm:text-xl font-black text-amber-600">{item.totalQty} 件</span>
-                            </div>
-                          </div>
-
-                          <div className="mt-3 pt-2.5 border-t border-slate-100 flex flex-wrap gap-1.5">
-                            {item.buyers.map((b, idx) => (
-                              <span key={idx} className="text-xs bg-slate-100 text-slate-600 px-2 py-0.5 rounded-md">
-                                {b.customerName} x{b.qty}
-                              </span>
-                            ))}
-                          </div>
-                        </div>
-                      );
-                    })}
+                  <div className="grid grid-cols-1 xl:grid-cols-2 gap-3 items-start">
+                    {tallyGroups.map((group) => (
+                      <TallyGroupCard
+                        key={group.key}
+                        group={group}
+                        tallyChecked={tallyChecked}
+                        onToggle={handleToggleTallyCheck}
+                        onSetAll={handleSetTallyChecks}
+                      />
+                    ))}
                   </div>
                 )}
               </div>
@@ -9573,6 +9680,18 @@
         }
       };
 
+      // [v2.14.45] 一次勾選／取消一組商品的所有規格（單次寫入，避免逐筆寫入互相覆蓋）
+      const handleSetTallyChecks = async (keys, value) => {
+        const updated = { ...tallyChecked };
+        keys.forEach(k => { if (value) updated[k] = true; else delete updated[k]; });
+        setTallyChecked(updated);
+        try {
+          await withSyncTracking(dbRef('settings/tally').set(updated));
+        } catch (err) {
+          console.error("Tally sync error:", err);
+        }
+      };
+
       // ==========================================
       // [V2.1] Order List Upgrade Actions
       // ==========================================
@@ -10678,6 +10797,8 @@
 
       // Picking List Matrix
       const tallyMatrix = React.useMemo(() => computeTallyMatrix(orders), [orders]);
+      // [v2.14.45] 理貨清單依商品分組（含商品縮圖）
+      const tallyGroups = React.useMemo(() => computeTallyGroups(tallyMatrix, enrichedProducts), [tallyMatrix, enrichedProducts]);
 
       // Export Orders CSV
       const handleExportCSV = () => {
@@ -11808,7 +11929,7 @@
 
             {/* Tab 3: Picking List → tab-tally.js */}
             <TallyTab
-              tally={{ activeTab, handleToggleTallyCheck, tallyChecked, tallyMatrix }}
+              tally={{ activeTab, handleToggleTallyCheck, handleSetTallyChecks, tallyChecked, tallyGroups }}
             />
 
             {/* Tab 4: Upgraded Product Library V5.1 → tab-products.js */}
