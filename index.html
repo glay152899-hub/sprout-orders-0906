@@ -59,7 +59,7 @@
     // ==========================================
     // config.js — 版本號 / Firebase設定 / 常數設定值
     // ==========================================
-    const APP_VERSION = '2.14.45';
+    const APP_VERSION = '2.14.46';
 
     // [v2.14.18] 尺寸系列：新增訂單與商品庫的尺寸快捷選項。存進資料庫的仍是「80, 90, 100」這種逗號字串，系列只是輸入輔助。
     // 要增減尺寸只改這裡；統一存大寫（與既有資料、sortSizes 的排序表一致）。
@@ -2615,6 +2615,115 @@
         return (a.sku || a.name).localeCompare(b.sku || b.name, 'zh-Hant');
       });
       return list;
+    };
+
+    // [v2.14.46] 叫貨批次：資料在 settings/tallyBatches/{batchId} = { createdAt, createdBy, lines: { l0: { o:訂單id, k:規格key, c:客人, q:件數, sku,name,color,size, arrived } } }
+    // 「叫貨」＝把當下待叫貨的「每張訂單 × 每個規格」的件數記進一個批次；之後訂單出貨、棄單、加量都不會讓已叫的件數重複計算。
+    const tallyCoverKey = (orderId, specKey) => `${orderId}\u0001${specKey}`;
+
+    // 資料庫物件 → 依叫貨時間由舊到新排序的陣列（沒有任何明細的批次略過）
+    const computeTallyBatchList = (batchesObj) => Object.entries(batchesObj || {})
+      .map(([id, b]) => ({
+        id,
+        createdAt: Number(b?.createdAt) || 0,
+        createdBy: b?.createdBy || '',
+        lines: Object.entries(b?.lines || {}).map(([lid, l]) => ({
+          lid,
+          orderId: l?.o || '',
+          key: l?.k || '',
+          customerName: l?.c || '',
+          qty: Number(l?.q) || 0,
+          sku: l?.sku || '',
+          name: l?.name || '',
+          color: l?.color || '',
+          size: l?.size || '',
+          arrived: !!l?.arrived
+        }))
+      }))
+      .filter(b => b.lines.length > 0)
+      .sort((a, b) => a.createdAt - b.createdAt);
+
+    // 待叫貨：目前理貨彙總（computeTallyMatrix）扣掉「已叫貨批次」涵蓋的件數（以 訂單×規格 為單位）
+    const computeTallyPending = (tallyMatrix, batchList) => {
+      const covered = {};
+      batchList.forEach(b => b.lines.forEach(l => {
+        const k = tallyCoverKey(l.orderId, l.key);
+        covered[k] = (covered[k] || 0) + l.qty;
+      }));
+      const out = [];
+      tallyMatrix.forEach(item => {
+        const byOrder = {};
+        item.buyers.forEach(b => {
+          const e = byOrder[b.orderId] || (byOrder[b.orderId] = { orderId: b.orderId, customerName: b.customerName, qty: 0 });
+          e.qty += Number(b.qty || 1);
+        });
+        const buyers = [];
+        let total = 0;
+        Object.values(byOrder).forEach(e => {
+          const left = e.qty - (covered[tallyCoverKey(e.orderId, item.key)] || 0);
+          if (left > 0) { buyers.push({ ...e, qty: left }); total += left; }
+        });
+        if (total > 0) out.push({ ...item, totalQty: total, buyers });
+      });
+      return out;
+    };
+
+    // 已叫貨頁：每個批次 → 依商品分組（沿用 computeTallyGroups）。回傳由新到舊。
+    // 每個規格列帶 lineIds（這列對應的明細 id）、arrivedCount／arrived（到貨狀態：整列的明細都到貨才算到貨）。
+    const computeTallyBatchViews = (batchList, products = []) => batchList.map((b, idx) => {
+      const map = {};
+      b.lines.forEach(l => {
+        const m = map[l.key] || (map[l.key] = { key: l.key, sku: l.sku, name: l.name, color: l.color, size: l.size, totalQty: 0, buyers: [], lineIds: [], arrivedCount: 0 });
+        m.totalQty += l.qty;
+        m.buyers.push({ orderId: l.orderId, customerName: l.customerName, qty: l.qty });
+        m.lineIds.push(l.lid);
+        if (l.arrived) m.arrivedCount += 1;
+      });
+      const items = Object.values(map).map(m => ({ ...m, arrived: m.arrivedCount === m.lineIds.length }));
+      return {
+        id: b.id,
+        no: idx + 1,
+        createdAt: b.createdAt,
+        itemCount: items.length,
+        arrivedItemCount: items.filter(i => i.arrived).length,
+        totalQty: items.reduce((sum, i) => sum + i.totalQty, 0),
+        groups: computeTallyGroups(items, products)
+      };
+    }).reverse();
+
+    // [v2.14.46] 多叫提醒：已叫貨的「訂單×規格」件數 > 該訂單現在實際需要的件數（訂單棄單、刪除、改少、改規格）。
+    // 已出貨的訂單不提醒（貨已用掉）。只回傳提醒資料，不自動改任何帳。依規格合併，回傳 [{ key, sku, name, color, size, over, customers }]。
+    const computeTallySurplus = (orders, batchList) => {
+      const specKeyOf = (it) => `${it.sku || 'NOSKU'}_${it.name}_${it.color}_${it.size}`;
+      const now = {};
+      const shipped = new Set();
+      orders.forEach(o => {
+        if (o.shipmentStatus === 'shipped') { shipped.add(o.id); return; }
+        if (o.closeStatus === 'abandoned') return;
+        o.items.forEach(it => {
+          if (isAdjustmentItem(it)) return;
+          const ck = tallyCoverKey(o.id, specKeyOf(it));
+          now[ck] = (now[ck] || 0) + Number(it.qty || 1);
+        });
+      });
+      const covered = {};
+      const meta = {};
+      batchList.forEach(b => b.lines.forEach(l => {
+        if (shipped.has(l.orderId)) return;
+        const ck = tallyCoverKey(l.orderId, l.key);
+        covered[ck] = (covered[ck] || 0) + l.qty;
+        meta[ck] = l;
+      }));
+      const bySpec = {};
+      Object.keys(covered).forEach(ck => {
+        const over = covered[ck] - (now[ck] || 0);
+        if (over <= 0) return;
+        const l = meta[ck];
+        const e = bySpec[l.key] || (bySpec[l.key] = { key: l.key, sku: l.sku, name: l.name, color: l.color, size: l.size, over: 0, customers: [] });
+        e.over += over;
+        if (l.customerName) e.customers.push(l.customerName);
+      });
+      return Object.values(bySpec);
     };
 
     // 訂單列表統計卡（orderListStats 的 useMemo 內容）
@@ -6891,95 +7000,86 @@
   </script>
   <script type="text/babel">
     // ==========================================
-    // tab-tally.js  (v2.14.40)
-    // 理貨清單分頁畫面。tallyMatrix／tallyGroups 在 app-shell.js 計算（computeTallyMatrix／computeTallyGroups，utils-export.js）
-    // [v2.14.45] 依「商品」分組：同一商品的不同顏色／尺寸排在同一組（像批發叫貨系統的畫面），勾選 key 不變。
+    // tab-tally.js  (v2.14.41)
+    // 理貨清單分頁畫面，分成兩頁：「待叫貨」（扣掉已叫貨批次後的件數，可選取後叫貨）與「已叫貨」（依批次列出）。
+    // 資料與計算在 app-shell.js／utils-export.js（computeTallyPending／computeTallyBatchViews 等）。
+    // 版面：手機與電腦都是單欄（電腦版內容限制寬度置中），同一商品的規格排在同一組。
     // ==========================================
 
-    // 一個商品群組：標題（縮圖、款號品名、進度、全部勾選）＋每個規格一列（顏色、尺寸、數量、勾選）。
-    // 含「哪一列展開客人名單」的畫面 state（純畫面，不存資料庫；與 DragScrollPane／FilterCollapse 同樣屬規則 B 的小元件例外）。
-    function TallyGroupCard({ group, tallyChecked, onToggle, onSetAll }) {
+    const formatTallyBatchTime = (ts) => {
+      const d = new Date(ts);
+      if (!ts || isNaN(d.getTime())) return '';
+      const pad = (n) => String(n).padStart(2, '0');
+      return `${d.getMonth() + 1}/${d.getDate()} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    };
+
+    // 群組標題（縮圖、款號品名、說明、右側按鈕）：待叫貨與已叫貨共用
+    function TallyGroupHeader({ group, subText, children }) {
+      return (
+        <div className="flex items-center gap-3 p-3 bg-slate-50/80 border-b border-slate-100">
+          {group.imageUrl && (
+            <img src={group.imageUrl} alt="" loading="lazy" className="w-12 h-12 rounded-lg object-cover flex-shrink-0 border border-slate-200 bg-slate-100" />
+          )}
+          <div className="flex-1 min-w-0">
+            <div className="text-sm font-bold text-slate-800 break-words">
+              {group.sku && <span className="font-mono text-emerald-600 mr-1.5">[{group.sku}]</span>}
+              {group.name}
+            </div>
+            <div className="text-xs text-slate-500 mt-0.5">{subText}</div>
+          </div>
+          {children}
+        </div>
+      );
+    }
+
+    // 展開的客人名單（純展示）
+    function TallyBuyers({ buyers, className = '' }) {
+      return (
+        <div className={`flex flex-wrap gap-1.5 ${className}`}>
+          {buyers.map((b, idx) => (
+            <span key={idx} className="text-xs bg-slate-100 text-slate-600 px-2 py-0.5 rounded-md">{b.customerName} x{b.qty}</span>
+          ))}
+        </div>
+      );
+    }
+
+    // 待叫貨：一個商品群組，每列可選取。含「哪一列展開客人名單」的純畫面 state（規則 B 的小元件例外）。
+    function TallyGroupCard({ group, tallySelected, onToggle, onSetAll }) {
       const [openRows, setOpenRows] = React.useState({});
       const keys = group.rows.map(r => r.key);
-      const doneCount = keys.filter(k => tallyChecked[k]).length;
-      const allDone = doneCount === keys.length;
-
+      const selCount = keys.filter(k => tallySelected[k]).length;
+      const allSel = selCount === keys.length;
       return (
-        <div className={`rounded-2xl border overflow-hidden transition ${allDone ? 'bg-slate-50 border-slate-200' : 'bg-white border-slate-200/80 shadow-sm'}`}>
-          {/* 群組標題 */}
-          <div className="flex items-center gap-3 p-3 bg-slate-50/80 border-b border-slate-100">
-            {group.imageUrl && (
-              <img
-                src={group.imageUrl}
-                alt=""
-                loading="lazy"
-                className="w-12 h-12 rounded-lg object-cover flex-shrink-0 border border-slate-200 bg-slate-100"
-              />
-            )}
-            <div className="flex-1 min-w-0">
-              <div className={`text-sm font-bold text-slate-800 break-words ${allDone ? 'opacity-60' : ''}`}>
-                {group.sku && <span className="font-mono text-emerald-600 mr-1.5">[{group.sku}]</span>}
-                {group.name}
-              </div>
-              <div className="text-xs text-slate-500 mt-0.5">
-                共 <span className="font-bold text-amber-600">{group.totalQty}</span> 件・已核對 {doneCount}/{keys.length} 項
-              </div>
-            </div>
-            <button
-              type="button"
-              onClick={() => onSetAll(keys, !allDone)}
-              className={`flex-shrink-0 px-3 py-1.5 rounded-xl text-xs font-bold border transition ${
-                allDone
-                  ? 'bg-white text-slate-500 border-slate-300 hover:bg-slate-100'
-                  : 'bg-emerald-600 text-white border-emerald-600 hover:bg-emerald-700'
-              }`}
-            >
-              {allDone ? '取消全部' : '全部勾選'}
+        <div className="rounded-2xl border border-slate-200/80 bg-white shadow-sm overflow-hidden">
+          <TallyGroupHeader group={group} subText={<>待叫 <span className="font-bold text-amber-600">{group.totalQty}</span> 件・已選 {selCount}/{keys.length} 項</>}>
+            <button type="button" onClick={() => onSetAll(keys, !allSel)}
+              className={`flex-shrink-0 px-3 py-1.5 rounded-xl text-xs font-bold border transition ${allSel ? 'bg-white text-slate-500 border-slate-300 hover:bg-slate-100' : 'bg-white text-emerald-700 border-emerald-600 hover:bg-emerald-50'}`}>
+              {allSel ? '取消全選' : '全部選取'}
             </button>
-          </div>
-
-          {/* 規格列 */}
+          </TallyGroupHeader>
           <div className="divide-y divide-slate-100">
             {group.rows.map((row) => {
-              const isChecked = !!tallyChecked[row.key];
+              const isSel = !!tallySelected[row.key];
               const isOpen = !!openRows[row.key];
               return (
-                <div key={row.key} className={isChecked ? 'bg-slate-100/70' : ''}>
-                  <div
-                    onClick={() => onToggle(row.key)}
-                    className="flex items-center gap-3 px-3 py-3 cursor-pointer select-none"
-                  >
-                    <div className={`w-6 h-6 rounded-full flex items-center justify-center border flex-shrink-0 transition ${
-                      isChecked ? 'bg-slate-700 text-white border-slate-700' : 'bg-white border-slate-300'
-                    }`}>
-                      {isChecked && <IconCheck size={14} />}
+                <div key={row.key} className={isSel ? 'bg-emerald-50' : ''}>
+                  <div onClick={() => onToggle(row.key)} className="flex items-center gap-3 px-3 py-3 cursor-pointer select-none">
+                    <div className={`w-6 h-6 rounded-full flex items-center justify-center border-2 flex-shrink-0 transition ${isSel ? 'bg-emerald-600 text-white border-emerald-600' : 'bg-white border-slate-300'}`}>
+                      {isSel && <IconCheck size={14} />}
                     </div>
-                    <div className={`flex-1 min-w-0 text-sm text-slate-700 ${isChecked ? 'line-through opacity-60' : ''}`}>
+                    <div className="flex-1 min-w-0 text-sm text-slate-700">
                       <span className="font-semibold">{row.color || '預設'}</span>
                       <span className="text-slate-400 mx-1.5">;</span>
                       <span className="font-semibold">{row.size || 'F'}</span>
                     </div>
-                    <div className={`text-right flex-shrink-0 ${isChecked ? 'opacity-60' : ''}`}>
-                      <span className="text-xl font-black text-amber-600">×{row.totalQty}</span>
-                    </div>
-                    <button
-                      type="button"
-                      aria-label={isOpen ? '收起客人名單' : '展開客人名單'}
+                    <span className="text-xl font-black text-amber-600 flex-shrink-0">×{row.totalQty}</span>
+                    <button type="button" aria-label={isOpen ? '收起客人名單' : '展開客人名單'}
                       onClick={(e) => { e.stopPropagation(); setOpenRows(prev => ({ ...prev, [row.key]: !prev[row.key] })); }}
-                      className="flex-shrink-0 w-8 h-8 -mr-1 rounded-lg flex items-center justify-center text-slate-400 hover:bg-slate-100"
-                    >
+                      className="flex-shrink-0 w-8 h-8 -mr-1 rounded-lg flex items-center justify-center text-slate-400 hover:bg-slate-100">
                       {isOpen ? <IconChevronUp size={18} /> : <IconChevronDown size={18} />}
                     </button>
                   </div>
-                  {isOpen && (
-                    <div className="px-3 pb-3 pl-12 flex flex-wrap gap-1.5">
-                      {row.buyers.map((b, idx) => (
-                        <span key={idx} className="text-xs bg-slate-100 text-slate-600 px-2 py-0.5 rounded-md">
-                          {b.customerName} x{b.qty}
-                        </span>
-                      ))}
-                    </div>
-                  )}
+                  {isOpen && <TallyBuyers buyers={row.buyers} className="px-3 pb-3 pl-12" />}
                 </div>
               );
             })}
@@ -6988,42 +7088,209 @@
       );
     }
 
+    // 已叫貨：一個批次（依商品分組）。每列有「未到貨／已到貨」按鈕；整批到貨；未到貨的可取消叫貨（已到貨的要先改回未到貨）。
+    // 全部到貨的批次預設收成一行，點「展開」才看明細（篩選「未到貨／已到貨」時一律展開）。
+    function TallyBatchCard({ batch, filter, onCancel, onSetArrival }) {
+      const [openRows, setOpenRows] = React.useState({});
+      const fullyArrived = batch.arrivedItemCount === batch.itemCount;
+      const [expanded, setExpanded] = React.useState(!fullyArrived);
+      const showBody = filter !== 'all' || expanded;
+      const pendingLineIds = [];
+      batch.groups.forEach(g => g.rows.forEach(r => r.lineIds.forEach(id => {
+        if (!r.arrived) pendingLineIds.push(id);
+      })));
+      const batchName = `第 ${batch.no} 批`;
+      return (
+        <div className="rounded-2xl border border-slate-200/80 bg-white shadow-sm overflow-hidden">
+          <div className={`flex items-center gap-3 p-3 border-b ${fullyArrived ? 'bg-green-50 border-green-100' : 'bg-emerald-50/60 border-emerald-100'}`}>
+            <div className="flex-1 min-w-0">
+              <div className="text-sm font-bold text-slate-800">{batchName}・{formatTallyBatchTime(batch.createdAt)} 叫貨</div>
+              <div className={`text-xs mt-0.5 ${fullyArrived ? 'text-green-700 font-bold' : 'text-slate-500'}`}>
+                {fullyArrived ? `已全部到貨 ${batch.itemCount}/${batch.itemCount} 項` : `未到貨 ${batch.itemCount - batch.arrivedItemCount}／共 ${batch.itemCount} 項・${batch.totalQty} 件`}
+              </div>
+            </div>
+            {!fullyArrived ? (
+              <button type="button" onClick={() => onSetArrival(batch.id, pendingLineIds, true, `${batchName}整批`, true)}
+                className="flex-shrink-0 px-3 py-1.5 rounded-xl text-xs font-bold border border-green-700 text-green-700 bg-white hover:bg-green-50">整批到貨</button>
+            ) : (
+              <button type="button" onClick={() => setExpanded(v => !v)}
+                className="flex-shrink-0 px-3 py-1.5 rounded-xl text-xs font-bold border border-slate-300 text-slate-600 bg-white hover:bg-slate-50">{showBody ? '收合' : '展開'}</button>
+            )}
+          </div>
+          {showBody && (
+            <>
+              {batch.groups.map(group => (
+                <div key={group.key} className="border-t border-slate-100 first:border-t-0">
+                  <TallyGroupHeader group={group} subText={<>共 <span className="font-bold text-amber-600">{group.totalQty}</span> 件</>} />
+                  <div className="divide-y divide-slate-100">
+                    {group.rows.map(row => {
+                      const rk = `${batch.id}|${row.key}`;
+                      const isOpen = !!openRows[rk];
+                      const rowLabel = `${group.name} ${row.color || '預設'}；${row.size || 'F'}`;
+                      return (
+                        <div key={rk}>
+                          <div className="flex items-center gap-2 px-3 py-3">
+                            <div className="flex-1 min-w-0 text-sm text-slate-700">
+                              <span className="font-semibold">{row.color || '預設'}</span>
+                              <span className="text-slate-400 mx-1.5">;</span>
+                              <span className="font-semibold">{row.size || 'F'}</span>
+                            </div>
+                            <span className="text-xl font-black text-amber-600 flex-shrink-0">×{row.totalQty}</span>
+                            <button type="button" onClick={() => onSetArrival(batch.id, row.lineIds, !row.arrived, rowLabel)}
+                              className={`flex-shrink-0 h-9 min-w-[4.5rem] px-2 rounded-xl text-[13px] font-bold border ${row.arrived ? 'bg-green-700 text-white border-green-700' : 'bg-amber-50 text-amber-800 border-amber-700'}`}>
+                              {row.arrived ? '已到貨' : '未到貨'}
+                            </button>
+                            <button type="button" aria-label={isOpen ? '收起客人名單' : '展開客人名單'}
+                              onClick={() => setOpenRows(prev => ({ ...prev, [rk]: !prev[rk] }))}
+                              className="flex-shrink-0 w-8 h-8 -mr-1 rounded-lg flex items-center justify-center text-slate-400 hover:bg-slate-100">
+                              {isOpen ? <IconChevronUp size={18} /> : <IconChevronDown size={18} />}
+                            </button>
+                          </div>
+                          {isOpen && (
+                            <div className="px-3 pb-3">
+                              <TallyBuyers buyers={row.buyers} />
+                              {!row.arrived && (
+                                <button type="button" onClick={() => onCancel(batch.id, row.lineIds, rowLabel)}
+                                  className="mt-2 h-8 px-3 rounded-lg text-xs font-bold text-red-600 border border-red-200 bg-white hover:bg-red-50">取消這項叫貨</button>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              ))}
+              {pendingLineIds.length > 0 && (
+                <div className="flex justify-end p-3 border-t border-slate-100">
+                  <button type="button" onClick={() => onCancel(batch.id, pendingLineIds, `${batchName}未到貨的項目`)}
+                    className="h-9 px-3 rounded-xl text-xs font-bold text-red-600 border border-red-200 bg-white hover:bg-red-50">
+                    {batch.arrivedItemCount === 0 ? '取消整批' : '取消未到貨的叫貨'}
+                  </button>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      );
+    }
+
+    // 已叫貨頁：多叫提醒＋「全部／未到貨／已到貨」篩選＋各批次。篩選是畫面 state（規則 B 的小元件例外）。
+    function TallyOrderedPanel({ batchViews, surplus, onCancel, onSetArrival }) {
+      const [filter, setFilter] = React.useState('all'); // 'all' | 'pending' | 'arrived'
+      let pendingCount = 0;
+      let arrivedCount = 0;
+      batchViews.forEach(b => { arrivedCount += b.arrivedItemCount; pendingCount += b.itemCount - b.arrivedItemCount; });
+
+      // 篩選時只留下符合的規格列（沒有任何符合列的商品組、批次整個略過）
+      const views = filter === 'all' ? batchViews : batchViews.map(b => {
+        const groups = b.groups
+          .map(g => ({ ...g, rows: g.rows.filter(r => (filter === 'arrived' ? r.arrived : !r.arrived)) }))
+          .filter(g => g.rows.length > 0)
+          .map(g => ({ ...g, totalQty: g.rows.reduce((sum, r) => sum + r.totalQty, 0) }));
+        return { ...b, groups };
+      }).filter(b => b.groups.length > 0);
+
+      const chip = (id, label) => (
+        <button key={id} type="button" onClick={() => setFilter(id)}
+          className={`h-9 px-4 rounded-full border text-[13px] font-bold ${filter === id ? 'bg-emerald-600 text-white border-emerald-600' : 'bg-white text-slate-600 border-slate-300'}`}>{label}</button>
+      );
+      return (
+        <>
+          <div className="flex gap-2 flex-wrap">
+            {chip('all', '全部')}
+            {chip('pending', `未到貨 ${pendingCount}`)}
+            {chip('arrived', `已到貨 ${arrivedCount}`)}
+          </div>
+          {surplus.length > 0 && (
+            <div className="rounded-2xl border border-amber-200 bg-amber-50 p-3 text-xs text-amber-800 space-y-1">
+              <div className="font-bold">多叫提醒（僅提醒，不會自動更改）</div>
+              {surplus.map(sp => (
+                <div key={sp.key}>・{sp.sku ? `[${sp.sku}] ` : ''}{sp.name} {sp.color || '預設'}；{sp.size || 'F'}：多叫 {sp.over} 件（訂單已棄單、刪除或改少）</div>
+              ))}
+            </div>
+          )}
+          {views.length === 0 ? (
+            <div className="text-center py-12 text-slate-400 bg-white rounded-2xl border border-dashed border-slate-200 text-sm">
+              {filter === 'pending' ? '沒有未到貨的項目' : '沒有已到貨的項目'}
+            </div>
+          ) : (
+            <div className="space-y-3">
+              {views.map((batch) => (
+                <TallyBatchCard key={batch.id} batch={batch} filter={filter} onCancel={onCancel} onSetArrival={onSetArrival} />
+              ))}
+            </div>
+          )}
+        </>
+      );
+    }
+
     // [Phase 1] 理貨清單分頁
     function TallyTab({ tally }) {
-      const { activeTab, handleToggleTallyCheck, handleSetTallyChecks, tallyChecked, tallyGroups } = tally;
+      const { activeTab, tallyView, setTallyView, tallyGroups, tallySelected, handleToggleTallySelect, handleSetTallySelect, handleClearTallySelect, handleOrderTallySelected, tallyBatchViews, tallySurplus, handleCancelTallyLines, handleSetTallyArrival } = tally;
+      if (activeTab !== 'tally') return <></>;
+
+      let selItems = 0;
+      let selQty = 0;
+      tallyGroups.forEach(g => g.rows.forEach(r => { if (tallySelected[r.key]) { selItems += 1; selQty += r.totalQty; } }));
+      const isPending = tallyView === 'pending';
+
       return (
         <>
             {/* Tab 3: Picking List */}
-            {activeTab === 'tally' && (
-              <div className="space-y-4">
-                <div className="bg-amber-50 border border-amber-200/80 rounded-2xl p-4 text-xs sm:text-sm text-amber-800 flex items-start gap-3">
-                  <IconCheckSquare size={20} className="text-amber-600 flex-shrink-0 mt-0.5" />
-                  <div>
-                    <span className="font-bold block mb-0.5">即時理貨與叫貨核對</span>
-                    自動加總所有「待出貨」訂單的商品與數量（不含棄單），同一商品的不同顏色、尺寸排在同一組。點一列即可勾銷，展開箭頭可看是哪些客人要的；多人持手機理貨也會即時同步！
-                  </div>
-                </div>
-
-                {tallyGroups.length === 0 ? (
-                  <div className="text-center py-16 text-slate-400 bg-white rounded-2xl border border-dashed border-slate-200">
-                    <IconCheckCircle2 size={48} className="mx-auto mb-3 text-emerald-500 opacity-60" />
-                    <p className="text-sm sm:text-base font-medium">太棒了！所有訂單皆已揀貨出貨完成！</p>
-                  </div>
-                ) : (
-                  <div className="grid grid-cols-1 xl:grid-cols-2 gap-3 items-start">
-                    {tallyGroups.map((group) => (
-                      <TallyGroupCard
-                        key={group.key}
-                        group={group}
-                        tallyChecked={tallyChecked}
-                        onToggle={handleToggleTallyCheck}
-                        onSetAll={handleSetTallyChecks}
-                      />
-                    ))}
-                  </div>
-                )}
+            <div className="space-y-4 max-w-3xl mx-auto w-full">
+              {/* 兩頁切換 */}
+              <div className="flex gap-2">
+                <button type="button" onClick={() => setTallyView('pending')}
+                  className={`flex-1 h-11 rounded-xl border text-sm font-bold transition ${isPending ? 'bg-emerald-600 text-white border-emerald-600' : 'bg-white text-slate-600 border-slate-300 hover:bg-slate-50'}`}>待叫貨</button>
+                <button type="button" onClick={() => setTallyView('ordered')}
+                  className={`flex-1 h-11 rounded-xl border text-sm font-bold transition ${!isPending ? 'bg-emerald-600 text-white border-emerald-600' : 'bg-white text-slate-600 border-slate-300 hover:bg-slate-50'}`}>已叫貨</button>
               </div>
-            )}
+
+              {isPending ? (
+                <>
+                  <div className="bg-amber-50 border border-amber-200/80 rounded-2xl p-4 text-xs sm:text-sm text-amber-800 flex items-start gap-3">
+                    <IconCheckSquare size={20} className="text-amber-600 flex-shrink-0 mt-0.5" />
+                    <div>
+                      <span className="font-bold block mb-0.5">待叫貨</span>
+                      自動加總「待出貨」訂單（不含棄單）還沒叫過的件數，同一商品排在同一組。點一列選取，再按下方「叫貨」；叫過的會移到「已叫貨」，之後新增的訂單才會再出現在這裡。
+                    </div>
+                  </div>
+
+                  {tallyGroups.length === 0 ? (
+                    <div className="text-center py-16 text-slate-400 bg-white rounded-2xl border border-dashed border-slate-200">
+                      <IconCheckCircle2 size={48} className="mx-auto mb-3 text-emerald-500 opacity-60" />
+                      <p className="text-sm sm:text-base font-medium">{tallyBatchViews.length > 0 ? '目前沒有待叫貨的商品' : '太棒了！所有訂單皆已揀貨出貨完成！'}</p>
+                    </div>
+                  ) : (
+                    <div className="space-y-3">
+                      {tallyGroups.map((group) => (
+                        <TallyGroupCard key={group.key} group={group} tallySelected={tallySelected} onToggle={handleToggleTallySelect} onSetAll={handleSetTallySelect} />
+                      ))}
+                    </div>
+                  )}
+
+                  {selItems > 0 && (
+                    <div className="sticky bottom-20 md:bottom-4 z-30 flex gap-2 bg-white/95 backdrop-blur border border-slate-200 rounded-2xl p-2 shadow-lg">
+                      <button type="button" onClick={handleClearTallySelect} className="h-12 px-4 rounded-xl border border-slate-300 bg-white text-slate-600 text-sm font-medium">清除</button>
+                      <button type="button" onClick={handleOrderTallySelected} className="flex-1 h-12 rounded-xl bg-emerald-600 text-white text-[15px] font-bold hover:bg-emerald-700">叫貨（{selItems} 項・{selQty} 件）</button>
+                    </div>
+                  )}
+                </>
+              ) : (
+                <>
+                  {tallyBatchViews.length === 0 ? (
+                    <div className="text-center py-16 text-slate-400 bg-white rounded-2xl border border-dashed border-slate-200">
+                      <IconCheckSquare size={48} className="mx-auto mb-3 opacity-40" />
+                      <p className="text-sm sm:text-base font-medium">還沒有叫貨紀錄</p>
+                      <p className="text-xs mt-1">在「待叫貨」選取商品後按「叫貨」，就會出現在這裡。</p>
+                    </div>
+                  ) : (
+                    <TallyOrderedPanel batchViews={tallyBatchViews} surplus={tallySurplus} onCancel={handleCancelTallyLines} onSetArrival={handleSetTallyArrival} />
+                  )}
+                </>
+              )}
+            </div>
         </>
       );
     }
@@ -8638,7 +8905,10 @@
       // Firebase Synchronized States
       const [orders, setOrders] = React.useState([]);
       const [products, setProducts] = React.useState([]);
-      const [tallyChecked, setTallyChecked] = React.useState({});
+      // [v2.14.46] 理貨清單：叫貨批次（資料庫 settings/tallyBatches）、目前在哪一頁、待叫貨頁的選取（只存在這台裝置的畫面，不同步）
+      const [tallyBatchesRaw, setTallyBatchesRaw] = React.useState({});
+      const [tallyView, setTallyView] = React.useState('pending'); // 'pending' | 'ordered'
+      const [tallySelected, setTallySelected] = React.useState({});
       const [isConnected, setIsConnected] = React.useState(false);
       const [isSyncing, setIsSyncing] = React.useState(true);
       const [permissionDenied, setPermissionDenied] = React.useState(false);
@@ -8822,9 +9092,12 @@
         });
 
         // 5. Listen to Tally States
-        const tallyRef = dbRef('settings/tally');
-        tallyRef.on('value', (snapshot) => {
-          setTallyChecked(snapshot.val() || {});
+        // [v2.14.46] 舊的 settings/tally（逐項勾選）不再使用、也不遷移；改監聽叫貨批次
+        const tallyBatchesRef = dbRef('settings/tallyBatches');
+        tallyBatchesRef.on('value', (snapshot) => {
+          setTallyBatchesRaw(snapshot.val() || {});
+        }, (error) => {
+          console.error("RTDB Tally Batches Error:", error);
         });
 
         // 5. [V2.7] 回收桶
@@ -9670,25 +9943,138 @@
         }
       };
 
-      const handleToggleTallyCheck = async (key) => {
-        const updated = { ...tallyChecked, [key]: !tallyChecked[key] };
-        setTallyChecked(updated);
+      // [v2.14.46] 待叫貨頁的選取（純畫面，不寫資料庫）
+      const handleToggleTallySelect = (key) => {
+        setTallySelected(prev => {
+          const next = { ...prev };
+          if (next[key]) delete next[key]; else next[key] = true;
+          return next;
+        });
+      };
+      const handleSetTallySelect = (keys, value) => {
+        setTallySelected(prev => {
+          const next = { ...prev };
+          keys.forEach(k => { if (value) next[k] = true; else delete next[k]; });
+          return next;
+        });
+      };
+      const handleClearTallySelect = () => setTallySelected({});
+
+      // [v2.14.46] 叫貨：把選取的規格「每張訂單的待叫件數」記成一個批次（單次寫入，要嘛全成功、要嘛全不動）
+      const handleOrderTallySelected = async () => {
+        const picked = tallyPending.filter(it => tallySelected[it.key]);
+        if (picked.length === 0) return;
+        if (!requireConnection('叫貨')) return;
+        const totalQty = picked.reduce((sum, it) => sum + it.totalQty, 0);
+        const shown = picked.slice(0, 8).map(it => `・${it.sku ? `[${it.sku}] ` : ''}${it.name} ${it.color || '預設'}；${it.size || 'F'} ×${it.totalQty}`);
+        const more = picked.length > 8 ? [`・…另外 ${picked.length - 8} 項`] : [];
+        const message = [`叫貨 ${picked.length} 項、共 ${totalQty} 件？`, '', ...shown, ...more, '', '（叫貨後這些件數會移到「已叫貨」；之後新增的訂單才會再出現在「待叫貨」。）'].join('\n');
+        if (!(await askConfirm(message, { confirmLabel: '確定叫貨' }))) return;
+
+        const lines = {};
+        let n = 0;
+        picked.forEach(it => it.buyers.forEach(b => {
+          lines[`l${n++}`] = {
+            o: b.orderId || '', k: it.key, c: b.customerName || '', q: Number(b.qty) || 0,
+            sku: it.sku || '', name: it.name || '', color: it.color || '', size: it.size || '',
+            arrived: false
+          };
+        }));
         try {
-          await withSyncTracking(dbRef('settings/tally').set(updated));
+          const ref = dbRef('settings/tallyBatches').push();
+          const batchId = ref.key;
+          await withSyncTracking(ref.set({ createdAt: Date.now(), createdBy: userEmail, lines }));
+          logAction('tally_order', 'system', batchId, `叫貨：${picked.length} 項、${totalQty} 件`);
+          setTallySelected({});
+          showUndoToast(`✅ 已叫貨：${picked.length} 項、${totalQty} 件`, async () => {
+            try {
+              await withSyncTracking(dbRef(`settings/tallyBatches/${batchId}`).remove());
+              logAction('tally_order', 'system', batchId, `復原叫貨：${picked.length} 項、${totalQty} 件`);
+              setUndoToast(null);
+              showToast('↩️ 已復原叫貨');
+            } catch (err) {
+              console.error('Undo tally order error:', err);
+              showToast('❌ 復原失敗，請檢查網路後再試');
+            }
+          });
         } catch (err) {
-          console.error("Tally sync error:", err);
+          console.error('Tally order error:', err);
+          showToast('❌ 叫貨失敗，請檢查網路後再試');
         }
       };
 
-      // [v2.14.45] 一次勾選／取消一組商品的所有規格（單次寫入，避免逐筆寫入互相覆蓋）
-      const handleSetTallyChecks = async (keys, value) => {
-        const updated = { ...tallyChecked };
-        keys.forEach(k => { if (value) updated[k] = true; else delete updated[k]; });
-        setTallyChecked(updated);
+      // [v2.14.46] 到貨狀態：把某幾列（lineIds）標成已到貨／未到貨（單次寫入）。整批操作時 6 秒內可復原。
+      const handleSetTallyArrival = async (batchId, lineIds, value, label = '', withUndo = false) => {
+        const batch = tallyBatchesRaw[batchId];
+        if (!batch || !batch.lines || lineIds.length === 0) return;
+        if (!requireConnection('更新到貨狀態')) return;
+        const prev = {};
+        lineIds.forEach(id => { if (batch.lines[id]) prev[id] = !!batch.lines[id].arrived; });
+        const toPatch = (getVal) => {
+          const patch = {};
+          Object.keys(prev).forEach(id => { patch[`lines/${id}/arrived`] = getVal(id); });
+          return patch;
+        };
         try {
-          await withSyncTracking(dbRef('settings/tally').set(updated));
+          await withSyncTracking(dbRef(`settings/tallyBatches/${batchId}`).update(toPatch(() => value)));
+          logAction('tally_arrival', 'system', batchId, `${value ? '已到貨' : '改回未到貨'}：${label || `${Object.keys(prev).length} 筆`}`);
+          if (withUndo) {
+            showUndoToast(value ? `✅ 已標記到貨：${label}` : `已改回未到貨：${label}`, async () => {
+              try {
+                await withSyncTracking(dbRef(`settings/tallyBatches/${batchId}`).update(toPatch((id) => prev[id])));
+                setUndoToast(null);
+                showToast('↩️ 已復原');
+              } catch (err) {
+                console.error('Undo tally arrival error:', err);
+                showToast('❌ 復原失敗，請檢查網路後再試');
+              }
+            });
+          }
         } catch (err) {
-          console.error("Tally sync error:", err);
+          console.error('Tally arrival error:', err);
+          showToast('❌ 更新到貨狀態失敗，請檢查網路後再試');
+        }
+      };
+
+      // [v2.14.46] 取消叫貨：移除批次裡的某幾列（lineIds）；全部移光就整批移除。6 秒內可復原。
+      const handleCancelTallyLines = async (batchId, lineIds, label) => {
+        const batch = tallyBatchesRaw[batchId];
+        if (!batch || !batch.lines || lineIds.length === 0) return;
+        if (!requireConnection('取消叫貨')) return;
+        if (!(await askConfirm(`取消叫貨：${label}？\n\n這些件數會回到「待叫貨」。`, { confirmLabel: '取消叫貨', cancelLabel: '先不要', danger: true }))) return;
+        const removeAll = Object.keys(batch.lines).every(id => lineIds.includes(id));
+        const backup = {};
+        lineIds.forEach(id => { if (batch.lines[id]) backup[id] = batch.lines[id]; });
+        const batchBackup = batch;
+        try {
+          if (removeAll) {
+            await withSyncTracking(dbRef(`settings/tallyBatches/${batchId}`).remove());
+          } else {
+            const patch = {};
+            lineIds.forEach(id => { patch[`lines/${id}`] = null; });
+            await withSyncTracking(dbRef(`settings/tallyBatches/${batchId}`).update(patch));
+          }
+          logAction('tally_cancel', 'system', batchId, `取消叫貨：${label}`);
+          showUndoToast(`已取消叫貨：${label}`, async () => {
+            try {
+              if (removeAll) {
+                await withSyncTracking(dbRef(`settings/tallyBatches/${batchId}`).set(batchBackup));
+              } else {
+                const patch = {};
+                Object.entries(backup).forEach(([id, v]) => { patch[`lines/${id}`] = v; });
+                await withSyncTracking(dbRef(`settings/tallyBatches/${batchId}`).update(patch));
+              }
+              logAction('tally_cancel', 'system', batchId, `復原取消叫貨：${label}`);
+              setUndoToast(null);
+              showToast('↩️ 已復原');
+            } catch (err) {
+              console.error('Undo tally cancel error:', err);
+              showToast('❌ 復原失敗，請檢查網路後再試');
+            }
+          });
+        } catch (err) {
+          console.error('Tally cancel error:', err);
+          showToast('❌ 取消叫貨失敗，請檢查網路後再試');
         }
       };
 
@@ -10798,7 +11184,12 @@
       // Picking List Matrix
       const tallyMatrix = React.useMemo(() => computeTallyMatrix(orders), [orders]);
       // [v2.14.45] 理貨清單依商品分組（含商品縮圖）
-      const tallyGroups = React.useMemo(() => computeTallyGroups(tallyMatrix, enrichedProducts), [tallyMatrix, enrichedProducts]);
+      // [v2.14.46] 待叫貨＝理貨彙總扣掉已叫貨批次涵蓋的件數；已叫貨頁＝每個批次依商品分組
+      const tallyBatchList = React.useMemo(() => computeTallyBatchList(tallyBatchesRaw), [tallyBatchesRaw]);
+      const tallyPending = React.useMemo(() => computeTallyPending(tallyMatrix, tallyBatchList), [tallyMatrix, tallyBatchList]);
+      const tallyGroups = React.useMemo(() => computeTallyGroups(tallyPending, enrichedProducts), [tallyPending, enrichedProducts]);
+      const tallySurplus = React.useMemo(() => computeTallySurplus(orders, tallyBatchList), [orders, tallyBatchList]);
+      const tallyBatchViews = React.useMemo(() => computeTallyBatchViews(tallyBatchList, enrichedProducts), [tallyBatchList, enrichedProducts]);
 
       // Export Orders CSV
       const handleExportCSV = () => {
@@ -11929,7 +12320,7 @@
 
             {/* Tab 3: Picking List → tab-tally.js */}
             <TallyTab
-              tally={{ activeTab, handleToggleTallyCheck, handleSetTallyChecks, tallyChecked, tallyGroups }}
+              tally={{ activeTab, tallyView, setTallyView, tallyGroups, tallySelected, handleToggleTallySelect, handleSetTallySelect, handleClearTallySelect, handleOrderTallySelected, tallyBatchViews, tallySurplus, handleCancelTallyLines, handleSetTallyArrival }}
             />
 
             {/* Tab 4: Upgraded Product Library V5.1 → tab-products.js */}
