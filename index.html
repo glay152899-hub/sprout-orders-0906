@@ -59,7 +59,7 @@
     // ==========================================
     // config.js — 版本號 / Firebase設定 / 常數設定值
     // ==========================================
-    const APP_VERSION = '2.14.42';
+    const APP_VERSION = '2.14.43';
 
     // [v2.14.18] 尺寸系列：新增訂單與商品庫的尺寸快捷選項。存進資料庫的仍是「80, 90, 100」這種逗號字串，系列只是輸入輔助。
     // 要增減尺寸只改這裡；統一存大寫（與既有資料、sortSizes 的排序表一致）。
@@ -7224,14 +7224,14 @@
                       <thead className="bg-slate-50 border-b border-slate-200 text-slate-500">
                         <tr>
                           {productSelectMode && <th className="p-3 w-8"></th>}
-                          <th className="p-3">圖片</th>
-                          <th className="p-3">款號</th>
-                          <th className="p-3">商品名稱</th>
-                          <th className="p-3">分類</th>
-                          <th className="p-3">售價</th>
-                          <th className="p-3">尺寸 / 顏色</th>
-                          <th className="p-3">滯銷與銷售狀態</th>
-                          <th className="p-3 text-right">操作</th>
+                          <th className="p-3 whitespace-nowrap">圖片</th>
+                          <th className="p-3 whitespace-nowrap">款號</th>
+                          <th className="p-3 min-w-[16rem]">商品名稱</th>
+                          <th className="p-3 whitespace-nowrap">分類</th>
+                          <th className="p-3 whitespace-nowrap">售價</th>
+                          <th className="p-3 min-w-[11rem]">尺寸 / 顏色</th>
+                          <th className="p-3 whitespace-nowrap">滯銷與銷售狀態</th>
+                          <th className="p-3 text-right whitespace-nowrap">操作</th>
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-slate-100">
@@ -7271,21 +7271,21 @@
                                   )}
                                 </div>
                               </td>
-                              <td className="p-3 font-mono font-bold text-emerald-600">{p.sku || '-'}</td>
-                              <td className="p-3 font-bold text-slate-800">{p.pinned ? '📌 ' : ''}{p.name}</td>
-                              <td className="p-3 text-slate-500">{p.category || '未分類'}</td>
-                              <td className="p-3 font-semibold text-slate-900">${p.price}</td>
-                              <td className="p-3 text-slate-500 text-xs">{p.sizes} / {p.colors}</td>
-                              <td className="p-3">
-                                <span className={`text-xs px-2.5 py-1 rounded-full border ${stagnant.color}`}>
+                              <td className="p-3 font-mono font-bold text-emerald-600 whitespace-nowrap">{p.sku || '-'}</td>
+                              <td className="p-3 font-bold text-slate-800 min-w-[16rem]">{p.pinned ? '📌 ' : ''}{p.name}</td>
+                              <td className="p-3 text-slate-500 whitespace-nowrap">{p.category || '未分類'}</td>
+                              <td className="p-3 font-semibold text-slate-900 whitespace-nowrap">${p.price}</td>
+                              <td className="p-3 text-slate-500 text-xs min-w-[11rem] break-words">{p.sizes} / {p.colors}</td>
+                              <td className="p-3 whitespace-nowrap">
+                                <span className={`text-xs px-2.5 py-1 rounded-full border whitespace-nowrap ${stagnant.color}`}>
                                   {stagnant.label}
                                 </span>
                               </td>
-                              <td className="p-3 text-right">
+                              <td className="p-3 text-right whitespace-nowrap">
                                 <div className={`flex items-center justify-end gap-1 ${productSelectMode ? 'hidden' : ''}`}>
                                   <button
                                     onClick={() => handleQuickSelectToOrder(p)}
-                                    className="px-2 py-1 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 font-bold rounded-lg text-xs"
+                                    className="px-2 py-1 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 font-bold rounded-lg text-xs whitespace-nowrap"
                                   >
                                     帶入
                                   </button>
@@ -11565,7 +11565,7 @@
                           <p className="text-center text-xs text-slate-400 py-4">找不到符合的商品</p>
                         ) : (
                           <>
-                            <div className="grid grid-cols-1 md:grid-cols-2 gap-1.5 md:gap-2">
+                            <div className="grid grid-cols-1 md:grid-cols-[repeat(auto-fill,minmax(20rem,1fr))] gap-1.5 md:gap-2">
                               {pickerSearchResults.slice(0, 8).map((p, idx) => (
                                 <QuickPickChip
                                   key={p.id}
@@ -11599,7 +11599,7 @@
                               <span className="text-[11px] sm:text-xs font-bold text-slate-600">⚡ 常用（📌 釘選 + 🔥 近期熱銷）</span>
                               <span className="hidden sm:inline text-[10px] text-slate-400">依近期訂單自動排序</span>
                             </div>
-                            <div className="grid grid-cols-1 md:grid-cols-2 gap-1.5 md:gap-2">
+                            <div className="grid grid-cols-1 md:grid-cols-[repeat(auto-fill,minmax(20rem,1fr))] gap-1.5 md:gap-2">
                               {quickPickData.quick.map(p => (
                                 <QuickPickChip
                                   key={p.id}
@@ -11625,7 +11625,7 @@
                             >
                               {quickPickData.quick.length === 0 ? '🆕 最新商品（還沒有足夠的訂單紀錄可排序）' : '🆕 新品'}
                             </span>
-                            <div className="grid grid-cols-1 md:grid-cols-2 gap-1.5 md:gap-2">
+                            <div className="grid grid-cols-1 md:grid-cols-[repeat(auto-fill,minmax(20rem,1fr))] gap-1.5 md:gap-2">
                               {quickPickData.fresh.map(p => (
                                 <QuickPickChip
                                   key={p.id}
