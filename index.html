@@ -59,7 +59,7 @@
     // ==========================================
     // config.js — 版本號 / Firebase設定 / 常數設定值
     // ==========================================
-    const APP_VERSION = '2.14.43';
+    const APP_VERSION = '2.14.44';
 
     // [v2.14.18] 尺寸系列：新增訂單與商品庫的尺寸快捷選項。存進資料庫的仍是「80, 90, 100」這種逗號字串，系列只是輸入輔助。
     // 要增減尺寸只改這裡；統一存大寫（與既有資料、sortSizes 的排序表一致）。
@@ -674,6 +674,17 @@
     // 規則：取件人姓名、聯絡方式（手機／LINE／IG，見 checkOrdersMergeable）、門市（宅配＝地址）、取貨方式都要一樣，而且每一張都「未出貨、未領貨、不是棄單」。
     // 勾選幾張都可以：全部併進「下單時間最晚」的那張（後單）；後單保留自己的下單日期與其他欄位。
     // ==========================================
+    // [v2.14.44] 同一天有好幾張單時，只寫「10/21」分不出是哪一張（UAT 發現）：同日期的單加上下單時間，例如「10/21 12:50」
+    // （時間用既有的 formatOrderTimeShort(timestamp)：Excel 匯入的訂單沒有真正的時間，會回傳空字串，這時只能顯示日期）
+    const mergeDateLabels = (list) => {
+      const counts = {};
+      list.forEach(o => { const d = formatOrderDateShort(o.createdAt); counts[d] = (counts[d] || 0) + 1; });
+      return list.map(o => {
+        const d = formatOrderDateShort(o.createdAt);
+        const t = formatOrderTimeShort(o.timestamp);
+        return counts[d] > 1 && t ? `${d} ${t}` : d;
+      });
+    };
     const normalizeMergeText = (v) => String(v == null ? '' : v).replace(/\s+/g, '').toLowerCase();
     const normalizeMergePhone = (v) => String(v == null ? '' : v).replace(/\D/g, '');
     // LINE／IG：去頭尾空白與空白字元、拿掉開頭的 @、不分大小寫
@@ -686,7 +697,8 @@
       if (list.length < 2) return { ok: false, reasons: ['請至少勾選兩張訂單'], warnings, base: null, earlier: [] };
       const base = list[list.length - 1];
       const earlier = list.slice(0, -1);
-      const tag = (o) => `「${o.customerName || '（未填姓名）'} ${formatOrderDateShort(o.createdAt)}」`;
+      const labelList = mergeDateLabels(list);
+      const tag = (o) => `「${o.customerName || '（未填姓名）'} ${labelList[list.indexOf(o)]}」`;
 
       list.forEach(o => {
         if (o.closeStatus === 'abandoned') reasons.push(`${tag(o)}是棄單，無法併單`);
@@ -751,7 +763,7 @@
       if (!check.ok) return check;
       const { base, earlier } = check;
       const ordered = [...earlier, base]; // 舊 → 新
-      const dates = ordered.map(o => formatOrderDateShort(o.createdAt));
+      const dates = mergeDateLabels(ordered); // 同一天的單會帶上時間
 
       // 商品：前單的接在前面、後單的在後面，不分來源、不自動合計數量；id 若重複就加尾碼，避免畫面 key 衝突
       const seen = new Set();
@@ -790,7 +802,7 @@
         earlier,
         merged: { items, note: noteLines.join('\n'), shippingFee: newShipping, customerPhone: pick('customerPhone'), customerLine: pick('customerLine'), customerIg: pick('customerIg') },
         preview: {
-          rows: ordered.map(o => ({ id: o.id, date: formatOrderDateShort(o.createdAt), itemCount: (o.items || []).length, subtotal: calcOrderSubtotal(o), isBase: o.id === base.id })),
+          rows: ordered.map((o, idx) => ({ id: o.id, date: formatOrderDateShort(o.createdAt), time: dates[idx] === formatOrderDateShort(o.createdAt) ? '' : formatOrderTimeShort(o.timestamp), itemCount: (o.items || []).length, subtotal: calcOrderSubtotal(o), isBase: o.id === base.id })),
           mergedItemCount: items.length,
           subtotal,
           oldShipping,
@@ -800,8 +812,8 @@
           prepaid: ordered.every(o => Boolean(o.prepaidDate)),
           paidAmount: ordered.reduce((sum, o) => sum + calcOrderTotal(o), 0),
           newTotal: Math.round(subtotal + newShipping),
-          earlierDates: earlier.map(o => formatOrderDateShort(o.createdAt)),
-          baseDate: formatOrderDateShort(base.createdAt)
+          earlierDates: dates.slice(0, -1),
+          baseDate: dates[dates.length - 1]
         }
       };
     };
@@ -847,7 +859,15 @@
           key,
           name: newest.customerName,
           orders: sorted,
-          dates: sorted.map(o => formatOrderDateShort(o.createdAt)),
+          dates: mergeDateLabels(sorted),
+          conflictText: (() => {
+            const kinds = [];
+            check.reasons.forEach(r => {
+              const k = /^款項/.test(r) ? '款項狀態不同' : /^(手機|LINE|IG)/.test(r) ? '聯絡方式不一致' : '條件不符';
+              if (!kinds.includes(k)) kinds.push(k);
+            });
+            return kinds.join('、');
+          })(),
           deliveryMethod: newest.deliveryMethod,
           place: String(mergePlaceOf(newest) || '').trim(),
           contact,
@@ -2440,7 +2460,6 @@
         '門市名稱': deriveStoreDisplay(o).name,
         '地址': deriveStoreDisplay(o).address,
         '領貨狀態': o.closeStatus === 'abandoned' ? '棄單' : (o.paymentStatus ? '已領貨' : '未領貨'),
-        '款項已收日': o.prepaidDate || '', // [v2.14.42]
         '出貨狀態': o.shipmentStatus === 'shipped' ? '已出貨' : '待出貨',
         '商品明細': o.items.map(i =>
           isAdjustmentItem(i)
@@ -2451,7 +2470,8 @@
         '運費': o.shippingFee,
         '訂單總金額': calcOrderTotal(o),
         '備註': o.note || '',
-        '建立時間': o.createdAt
+        '建立時間': o.createdAt,
+        '款項已收日': o.prepaidDate || '' // [v2.14.42／v2.14.44 修正] 放在最後，不影響既有欄位順序（v2.14.42 誤放在「領貨狀態」旁邊）
       }));
     };
 
@@ -3832,7 +3852,7 @@
           <div className="bg-slate-50 rounded-xl px-3 py-2.5 mb-2.5">
             {p.rows.map(r => (
               <div key={r.id} className="flex items-baseline gap-2 text-sm leading-8">
-                <span className="flex-none w-11 font-bold text-slate-800">{r.date}</span>
+                <span className="flex-none w-11 font-bold text-slate-800 leading-tight">{r.date}{r.time && <span className="block text-[10px] font-normal text-slate-400">{r.time}</span>}</span>
                 <span className="flex-1 min-w-0 text-xs text-slate-500">
                   <span className={`inline-block px-1.5 mr-1 rounded text-[11px] ${r.isBase ? 'bg-emerald-100 text-emerald-800' : 'bg-amber-100 text-amber-800'}`}>{r.isBase ? '後單' : '前單'}</span>
                   {r.itemCount} 項・{r.isBase ? '保留這筆' : '併入後單'}
@@ -3918,7 +3938,8 @@
         setBusy(true);
         try { await onMerge(selected); } finally { setBusy(false); }
       };
-      const statusBadge = { conflict: ['聯絡方式不一致，請確認勾選', 'bg-red-100 text-red-700'], confirm: ['聯絡方式不足，需確認', 'bg-amber-100 text-amber-800'] };
+      // [v2.14.44] 紅色標籤依實際原因顯示（款項狀態不同／聯絡方式不一致…），不再一律寫「聯絡方式不一致」
+      const statusBadge = { confirm: ['聯絡方式不足，需確認', 'bg-amber-100 text-amber-800'] };
 
       return (
         <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-sm flex items-end sm:items-center justify-center" onClick={onClose}>
@@ -3972,7 +3993,7 @@
                 const selected = g.orders.filter(o => !unchecked.has(o.id));
                 const baseId = selected.length > 0 ? selected[selected.length - 1].id : '';
                 const live = open && selected.length >= 2 ? checkOrdersMergeable(selected) : null;
-                const badge = statusBadge[g.status];
+                const badge = g.status === 'conflict' ? [`${g.conflictText || '條件不符'}，請確認勾選`, 'bg-red-100 text-red-700'] : statusBadge[g.status];
                 return (
                   <div key={g.key} className={`rounded-2xl border bg-white ${open ? 'border-emerald-400 shadow-sm' : 'border-slate-200'}`}>
                     <button type="button" onClick={() => setOpenKey(open ? '' : g.key)} className="w-full text-left px-3.5 py-3">
@@ -3988,14 +4009,15 @@
 
                     {open && (
                       <div className="px-3.5 pb-3.5">
-                        {g.orders.map(o => {
+                        {g.orders.map((o, idx) => {
                           const checked = !unchecked.has(o.id);
+                          const dateLabel = String(g.dates[idx] || '').split(' ');
                           const first = (o.items || [])[0];
                           const itemText = first ? `${first.name}${first.qty > 1 ? ` ×${first.qty}` : ''}${(o.items || []).length > 1 ? ` 等 ${(o.items || []).length} 項` : ''}` : '（沒有商品）';
                           return (
                             <button key={o.id} type="button" onClick={() => toggle(o.id)} className="w-full flex items-center gap-2.5 py-2.5 border-t border-slate-100 text-left">
                               <span className={`flex-none w-[18px] h-[18px] rounded-[5px] flex items-center justify-center text-[12px] leading-none ${checked ? 'bg-emerald-600 text-white' : 'border-[1.5px] border-slate-300'}`}>{checked ? '✓' : ''}</span>
-                              <span className="flex-none w-11 text-sm font-bold text-slate-800">{formatOrderDateShort(o.createdAt)}</span>
+                              <span className="flex-none w-11 text-sm font-bold text-slate-800 leading-tight">{dateLabel[0]}{dateLabel[1] && <span className="block text-[10px] font-normal text-slate-400">{dateLabel[1]}</span>}</span>
                               <span className="flex-1 min-w-0 text-xs text-slate-500 truncate">
                                 {itemText}
                                 {o.id === baseId && <span className="ml-1 px-1.5 rounded bg-emerald-100 text-emerald-800 text-[11px] font-bold">後單</span>}
@@ -5638,6 +5660,12 @@
                                   </table>
                                 </div>
 
+                                {(order.prepaidDate || (order.paymentStatus && order.paidDate)) && (
+                                  <p className="mt-3 text-sm text-slate-500 flex flex-wrap gap-x-5 gap-y-0.5">
+                                    {order.prepaidDate && <span>💰 款項已收日：{order.prepaidDate}</span>}
+                                    {order.paymentStatus && order.paidDate && <span>📦 領貨日：{order.paidDate}</span>}
+                                  </p>
+                                )}
                                 {order.note && (
                                   <p className="mt-3 text-sm text-amber-800 bg-amber-50 border border-amber-200 px-3 py-2 rounded-lg">
                                     備註：{order.note}
@@ -5850,6 +5878,13 @@
                                 </div>
                               </div>
 
+                              {/* [v2.14.44] 款項已收日／領貨日：UAT 發現改日期後列表看不出有沒有存到，展開明細時顯示 */}
+                              {(order.prepaidDate || (order.paymentStatus && order.paidDate)) && (
+                                <p className="text-xs text-slate-500 flex flex-wrap gap-x-4 gap-y-0.5">
+                                  {order.prepaidDate && <span>💰 款項已收日：{order.prepaidDate}</span>}
+                                  {order.paymentStatus && order.paidDate && <span>📦 領貨日：{order.paidDate}</span>}
+                                </p>
+                              )}
                               {order.note && (
                                 <p className="text-xs text-amber-700 bg-amber-50 p-2 rounded-lg">
                                   💬 備註：{order.note}
