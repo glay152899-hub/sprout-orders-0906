@@ -59,7 +59,7 @@
     // ==========================================
     // config.js — 版本號 / Firebase設定 / 常數設定值
     // ==========================================
-    const APP_VERSION = '2.14.47';
+    const APP_VERSION = '2.14.48';
 
     // [v2.14.18] 尺寸系列：新增訂單與商品庫的尺寸快捷選項。存進資料庫的仍是「80, 90, 100」這種逗號字串，系列只是輸入輔助。
     // 要增減尺寸只改這裡；統一存大寫（與既有資料、sortSizes 的排序表一致）。
@@ -7090,11 +7090,15 @@
 
     // 已叫貨：一個批次（依商品分組）。每列有「未到貨／已到貨」按鈕；整批到貨；未到貨的可取消叫貨（已到貨的要先改回未到貨）。
     // 全部到貨的批次預設收成一行，點「展開」才看明細（篩選「未到貨／已到貨」時一律展開）。
+    // [v2.14.48] 批次卡片「展開／收合」：使用者手動按過就照使用者的；沒按過時的預設＝篩選「未到貨／已到貨」時展開（要看符合的列）、
+    // 「全部」時只有還有未到貨的批次展開（全部到貨的批次收成一行）。（v2.14.46 的寫法在篩選時一律展開，收合鈕按了沒反應。）
+    const tallyBatchShowBody = (manualOpen, filter, fullyArrived) => (manualOpen === null ? (filter !== 'all' || !fullyArrived) : manualOpen);
+
     function TallyBatchCard({ batch, filter, onCancel, onSetArrival }) {
       const [openRows, setOpenRows] = React.useState({});
       const fullyArrived = batch.arrivedItemCount === batch.itemCount;
-      const [expanded, setExpanded] = React.useState(!fullyArrived);
-      const showBody = filter !== 'all' || expanded;
+      const [manualOpen, setManualOpen] = React.useState(null); // null＝照預設；true／false＝使用者按過
+      const showBody = tallyBatchShowBody(manualOpen, filter, fullyArrived);
       const pendingLineIds = [];
       batch.groups.forEach(g => g.rows.forEach(r => r.lineIds.forEach(id => {
         if (!r.arrived) pendingLineIds.push(id);
@@ -7109,11 +7113,11 @@
                 {fullyArrived ? `已全部到貨 ${batch.itemCount}/${batch.itemCount} 項` : `未到貨 ${batch.itemCount - batch.arrivedItemCount}／共 ${batch.itemCount} 項・${batch.totalQty} 件`}
               </div>
             </div>
-            {!fullyArrived ? (
+            {pendingLineIds.length > 0 ? (
               <button type="button" onClick={() => onSetArrival(batch.id, pendingLineIds, true, `${batchName}整批`, true)}
                 className="flex-shrink-0 px-3 py-1.5 rounded-xl text-xs font-bold border border-green-700 text-green-700 bg-white hover:bg-green-50">整批到貨</button>
             ) : (
-              <button type="button" onClick={() => setExpanded(v => !v)}
+              <button type="button" onClick={() => setManualOpen(!showBody)}
                 className="flex-shrink-0 px-3 py-1.5 rounded-xl text-xs font-bold border border-slate-300 text-slate-600 bg-white hover:bg-slate-50">{showBody ? '收合' : '展開'}</button>
             )}
           </div>
@@ -7217,7 +7221,7 @@
           ) : (
             <div className="space-y-3">
               {views.map((batch) => (
-                <TallyBatchCard key={batch.id} batch={batch} filter={filter} onCancel={onCancel} onSetArrival={onSetArrival} />
+                <TallyBatchCard key={`${batch.id}|${filter}`} batch={batch} filter={filter} onCancel={onCancel} onSetArrival={onSetArrival} />
               ))}
             </div>
           )}
