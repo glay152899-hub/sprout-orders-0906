@@ -59,7 +59,7 @@
     // ==========================================
     // config.js — 版本號 / Firebase設定 / 常數設定值
     // ==========================================
-    const APP_VERSION = '2.14.48';
+    const APP_VERSION = '2.14.49';
 
     // [v2.14.18] 尺寸系列：新增訂單與商品庫的尺寸快捷選項。存進資料庫的仍是「80, 90, 100」這種逗號字串，系列只是輸入輔助。
     // 要增減尺寸只改這裡；統一存大寫（與既有資料、sortSizes 的排序表一致）。
@@ -685,10 +685,21 @@
         return counts[d] > 1 && t ? `${d} ${t}` : d;
       });
     };
-    const normalizeMergeText = (v) => String(v == null ? '' : v).replace(/\s+/g, '').toLowerCase();
-    const normalizeMergePhone = (v) => String(v == null ? '' : v).replace(/\D/g, '');
     // LINE／IG：去頭尾空白與空白字元、拿掉開頭的 @、不分大小寫
-    const normalizeMergeHandle = (v) => String(v == null ? '' : v).trim().replace(/^@/, '').replace(/\s+/g, '').toLowerCase();
+
+    // [v2.14.49] 比對前先清理文字（UAT：兩張單畫面看起來完全一樣，卻被當成不同門市／不是同一組）：
+    // ① NFKC 正規化（全形→半形、相容字形與部首字元→一般字，例如「＊」→「*」、「⾨」→「門」）；② 去掉看不見的字元（零寬空白 U+200B～200D、U+2060、U+FEFF、軟連字號 U+00AD）與控制字元；③ 空白全部拿掉、不分大小寫。
+    const cleanMergeText = (v) => String(v == null ? '' : v).normalize('NFKC').replace(/[\u200B-\u200D\u2060\uFEFF\u00AD\u180E]/g, '').replace(/[\u0000-\u001F\u007F]/g, ' ');
+    const normalizeMergeText = (v) => cleanMergeText(v).replace(/\s+/g, '').toLowerCase();
+    const normalizeMergePhone = (v) => cleanMergeText(v).replace(/\D/g, '');
+    // LINE／IG：去頭尾空白與空白字元、拿掉開頭的 @、不分大小寫
+    const normalizeMergeHandle = (v) => cleanMergeText(v).trim().replace(/^@/, '').replace(/\s+/g, '').toLowerCase();
+    // 門市：舊格式「門市（地址）」先用 deriveStoreDisplay 拆出門市名稱（宅配到府＝地址）；比對時再忽略品牌前綴（7-11／全家／萊爾富）與結尾的「門市／分店／店」
+    const mergePlaceRaw = (o) => {
+      const d = deriveStoreDisplay(o);
+      return String((o && o.deliveryMethod === '宅配到府' ? (d.address || o.storeAddress) : (d.name || o.storeName)) || '').trim();
+    };
+    const normalizeStoreText = (v) => normalizeMergeText(v).replace(/^(7-?11|全家|萊爾富)/, '').replace(/(門市|分店|店)$/, '');
 
     const checkOrdersMergeable = (selected) => {
       const list = [...(selected || [])].sort((a, b) => (Number(a.timestamp) || 0) - (Number(b.timestamp) || 0)); // 舊 → 新
@@ -748,10 +759,10 @@
       if (!contactConflict && !hasCommonContact) warnings.push('contact-none');
 
       const isHome = (o) => o.deliveryMethod === '宅配到府';
-      const placeOf = (o) => (isHome(o) ? o.storeAddress : o.storeName);
-      const places = distinct(placeOf, normalizeMergeText);
+      const placeOf = mergePlaceRaw;
+      const places = distinct(placeOf, normalizeStoreText);
       if (places.size > 1) reasons.push(`${list.every(isHome) ? '收件地址' : '門市'}不一樣：${joinShown(places)}`);
-      else if (anyBlank(placeOf, normalizeMergeText)) warnings.push('store-blank');
+      else if (anyBlank(placeOf, normalizeStoreText)) warnings.push('store-blank');
 
       return { ok: reasons.length === 0, reasons, warnings, base, earlier };
     };
@@ -822,7 +833,7 @@
     // 能併的單＝未出貨、未領貨、非棄單。分組只看「姓名＋取貨方式＋門市（宅配＝地址）」；聯絡方式的比對留到按下去之後（checkOrdersMergeable），
     // 因為客人可能只留 LINE 或 IG，分組太嚴會漏掉可併的單。
     const isMergeEligibleOrder = (o) => o.closeStatus !== 'abandoned' && o.shipmentStatus !== 'shipped' && !o.paymentStatus;
-    const mergePlaceOf = (o) => (o.deliveryMethod === '宅配到府' ? o.storeAddress : o.storeName);
+    const mergePlaceOf = mergePlaceRaw; // [v2.14.49] 舊格式「門市（地址）」會先拆開，與分欄格式視為同一個門市
 
     const orderMatchesMergeQuery = (o, query) => {
       const q = normalizeMergeText(query);
@@ -838,7 +849,7 @@
     const findMergeCandidateGroups = (orders, query) => {
       const map = new Map();
       (orders || []).filter(isMergeEligibleOrder).forEach(o => {
-        const key = [normalizeMergeText(o.customerName), normalizeMergeText(o.deliveryMethod), normalizeMergeText(mergePlaceOf(o))].join('|');
+        const key = [normalizeMergeText(o.customerName), normalizeMergeText(o.deliveryMethod), normalizeStoreText(mergePlaceOf(o))].join('|');
         if (!map.has(key)) map.set(key, []);
         map.get(key).push(o);
       });
@@ -878,6 +889,73 @@
       return groups.sort((a, b) => b.latestTs - a.latestTs);
     };
 
+    // ---------- [v2.14.49] 「同姓名但條件不符」：差一點就能併的客人，逐項寫出差在哪 ----------
+    const mergeCodeOf = (ch) => `U+${ch.codePointAt(0).toString(16).toUpperCase().padStart(4, '0')}`;
+    const MERGE_INVISIBLE_RE = /[\u200B-\u200D\u2060\uFEFF\u00AD\u180E\u0000-\u001F\u007F]/;
+    const describeStringDiff = (a, b) => {
+      const A = Array.from(String(a == null ? '' : a));
+      const B = Array.from(String(b == null ? '' : b));
+      const invisible = (arr) => Array.from(new Set(arr.filter(ch => MERGE_INVISIBLE_RE.test(ch)).map(mergeCodeOf)));
+      const parts = [];
+      const hA = invisible(A);
+      const hB = invisible(B);
+      if (hA.length) parts.push(`前者含看不見的字元 ${hA.join('、')}`);
+      if (hB.length) parts.push(`後者含看不見的字元 ${hB.join('、')}`);
+      if (!hA.length && !hB.length) {
+        const n = Math.min(A.length, B.length);
+        let i = 0;
+        while (i < n && A[i] === B[i]) i += 1;
+        if (i < n) parts.push(`第 ${i + 1} 個字不同：「${A[i]}」${mergeCodeOf(A[i])} 對「${B[i]}」${mergeCodeOf(B[i])}`);
+        else if (A.length !== B.length) parts.push(`長度不同（${A.length} 字對 ${B.length} 字）`);
+      }
+      return parts.join('；');
+    };
+    // 兩個字串「看起來很像」才附上字元差異（完全不同的門市名稱不用逐字比）
+    const looksSimilarText = (a, b) => {
+      const na = cleanMergeText(a).replace(/\s+/g, '');
+      const nb = cleanMergeText(b).replace(/\s+/g, '');
+      if (!na || !nb) return false;
+      if (na.includes(nb) || nb.includes(na)) return true;
+      if (na.length !== nb.length) return false;
+      let same = 0;
+      for (let i = 0; i < na.length; i += 1) if (na[i] === nb[i]) same += 1;
+      return same / na.length >= 0.7;
+    };
+
+    const findMergeNearMisses = (orders, query) => {
+      const byName = new Map();
+      (orders || []).filter(isMergeEligibleOrder).forEach(o => {
+        const k = normalizeMergeText(o.customerName);
+        if (!byName.has(k)) byName.set(k, []);
+        byName.get(k).push(o);
+      });
+      const result = [];
+      byName.forEach((list, nameKey) => {
+        if (list.length < 2) return;
+        if (normalizeMergeText(query) && !list.some(o => orderMatchesMergeQuery(o, query))) return;
+        const keyOf = (o) => [normalizeMergeText(o.deliveryMethod), normalizeStoreText(mergePlaceOf(o))].join('|');
+        if (new Set(list.map(keyOf)).size < 2) return; // 全部同一組＝一般分組，不是「差一點」
+        const sorted = [...list].sort((a, b) => (Number(a.timestamp) || 0) - (Number(b.timestamp) || 0));
+        const diffs = [];
+        const addDiff = (label, getter, normalize) => {
+          const seen = new Map();
+          sorted.forEach(o => { const raw = String(getter(o) == null ? '' : getter(o)).trim(); const k = normalize(raw); if (!seen.has(k)) seen.set(k, raw); });
+          if (seen.size < 2) return;
+          const vals = Array.from(seen.values());
+          let text = `${label}不同：${vals.map(v => `「${v || '（空白）'}」`).join('、')}`;
+          if (vals.length === 2 && looksSimilarText(vals[0], vals[1])) {
+            const d = describeStringDiff(vals[0], vals[1]);
+            if (d) text += `（${d}）`;
+          }
+          diffs.push(text);
+        };
+        addDiff('取貨方式', o => o.deliveryMethod, normalizeMergeText);
+        addDiff(sorted.every(o => o.deliveryMethod === '宅配到府') ? '收件地址' : '門市', mergePlaceOf, normalizeStoreText);
+        result.push({ key: nameKey, name: sorted[sorted.length - 1].customerName, orders: sorted, dates: mergeDateLabels(sorted), diffs, latestTs: Number(sorted[sorted.length - 1].timestamp) || 0 });
+      });
+      return result.sort((a, b) => b.latestTs - a.latestTs);
+    };
+
     // 搜尋不到可併的組別時，說明原因（而不是一片空白）
     const explainMergeSearch = (orders, query) => {
       const matched = (orders || []).filter(o => orderMatchesMergeQuery(o, query));
@@ -903,7 +981,7 @@
         if (abandoned) parts.push(`${abandoned} 筆棄單`);
         if (eligible === 0) lines.push(`「${name}」共 ${list.length} 筆，但 ${parts.join('、')}，都不能再併`);
         else if (eligible === 1) lines.push(`「${name}」共 ${list.length} 筆，只有 1 筆還沒出貨、未領貨，至少要兩筆才能併${parts.length ? `（其餘：${parts.join('、')}）` : ''}`);
-        else lines.push(`「${name}」有 ${eligible} 筆還能併，但門市或取貨方式不同，不是同一組`);
+        // 有 2 筆以上還能併、卻不同組 → 由「同姓名但條件不符」區逐項說明（findMergeNearMisses），這裡不重複
       });
       return lines;
     };
@@ -4005,7 +4083,7 @@
     // ==========================================
     // [v2.14.37] 併單的視窗內容（放進 askConfirm 的 body；外框、標題「系統提示」、按鈕由 SystemConfirmDialog 負責）
     // ==========================================
-    function OrderMergePreviewBody({ plan }) {
+    function OrderMergePreviewBody({ plan, tallyMoveCount = 0 }) {
       const p = plan.preview;
       const earlierText = p.earlierDates.join('、');
       return (
@@ -4043,6 +4121,7 @@
             </div>
           )}
           <p className="text-xs leading-relaxed text-slate-400 break-words">・備註會加上「{p.mergeLine}」</p>
+          {tallyMoveCount > 0 && <p className="text-xs leading-relaxed text-slate-400 break-words">・前單已叫過貨的記錄（{tallyMoveCount} 列）會跟著併到後單，不會重複叫貨</p>}
           <p className="text-xs leading-relaxed text-slate-400 break-words">・{earlierText} 那{p.earlierDates.length > 1 ? ` ${p.earlierDates.length} ` : ''}筆會移到回收桶，併單後 6 秒內可按「復原」</p>
         </div>
       );
@@ -4093,6 +4172,7 @@
       const [unchecked, setUnchecked] = React.useState(() => new Set());
       const [busy, setBusy] = React.useState(false);
       const groups = React.useMemo(() => findMergeCandidateGroups(orders, query), [orders, query]);
+      const nearMisses = React.useMemo(() => findMergeNearMisses(orders, query), [orders, query]); // [v2.14.49]
       const emptyHints = React.useMemo(() => (groups.length === 0 && query.trim() ? explainMergeSearch(orders, query) : []), [groups, orders, query]);
       const toggle = (id) => setUnchecked(prev => { const n = new Set(prev); if (n.has(id)) n.delete(id); else n.add(id); return n; });
       const runMerge = async (selected) => {
@@ -4145,7 +4225,7 @@
               )}
               {groups.length === 0 && query.trim() && (
                 <div className="text-sm text-slate-600 py-4 px-1 space-y-2 leading-relaxed">
-                  <p className="font-bold text-slate-700">找不到可以併的訂單。</p>
+                  <p className="font-bold text-slate-700">{nearMisses.length > 0 ? '沒有可以直接併的訂單。' : '找不到可以併的訂單。'}</p>
                   {emptyHints.map((h, i) => <p key={i} className="text-xs text-slate-500">{h}</p>)}
                 </div>
               )}
@@ -4207,6 +4287,24 @@
                   </div>
                 );
               })}
+
+              {/* [v2.14.49] 同姓名、都還能併，但門市或取貨方式不同（沒有成組）：逐項寫出差在哪，必要時請到「編輯」把寫法改成一樣 */}
+              {nearMisses.length > 0 && (
+                <div className="pt-2 space-y-2">
+                  <p className="text-xs text-slate-500 px-0.5">同姓名但條件不符（{nearMisses.length} 位）</p>
+                  {nearMisses.map(m => (
+                    <div key={m.key} className="rounded-2xl border border-amber-200 bg-amber-50/60 px-3.5 py-3">
+                      <div className="flex items-baseline justify-between gap-2">
+                        <span className="font-bold text-sm text-slate-800 truncate">{m.name}</span>
+                        <span className="flex-none text-xs font-bold text-amber-700">{m.orders.length} 筆，未成組</span>
+                      </div>
+                      <p className="text-xs text-slate-500 mt-0.5 break-words">{m.dates.join('、')}</p>
+                      {m.diffs.map((d, i) => <p key={i} className="text-xs text-amber-800 mt-1 leading-relaxed break-words">・{d}</p>)}
+                      <p className="text-[11px] text-slate-400 mt-1.5 leading-relaxed">若其實是同一位、同一間門市：請到訂單「編輯」，把「門市名稱」重新輸入成一樣，就會出現在上面的名單。</p>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           </div>
         </div>
@@ -10326,7 +10424,10 @@
             const go = await askConfirm('', { body: <OrderMergeWarningBody warnings={plan.warnings} name={plan.base.customerName} />, confirmLabel: '繼續併單' });
             if (!go) return false;
           }
-          const confirmed = await askConfirm('', { body: <OrderMergePreviewBody plan={plan} />, confirmLabel: '確定併單' });
+          // [v2.14.49] 前單已叫過貨的記錄會跟著搬到後單（見下方寫入）；預覽先告訴使用者有幾列
+          const earlierIdSet = new Set(plan.earlier.map(o => o.id));
+          const tallyMoveCount = Object.values(tallyBatchesRaw || {}).reduce((sum, b) => sum + Object.values((b && b.lines) || {}).filter(l => l && earlierIdSet.has(l.o)).length, 0);
+          const confirmed = await askConfirm('', { body: <OrderMergePreviewBody plan={plan} tallyMoveCount={tallyMoveCount} />, confirmLabel: '確定併單' });
           if (!confirmed) return false;
           if (!requireConnection('併單')) return false;
 
@@ -10359,10 +10460,19 @@
             updates[`orders/${o.id}`] = null;                    // 前單從訂單移除
             updates[`trash/orders/${o.id}`] = trashEntry(o);     // 同時放進回收桶（一次寫入，要嘛全成功、要嘛全不動）
           });
+          // [v2.14.49] 叫貨記錄（settings/tallyBatches）裡指向前單的列，改指向後單：否則前單消失後，理貨清單會把後單多出來的商品當成「沒叫過」（重複叫貨），
+          // 同時把前單那幾列當成「多叫」。覆蓋單位是「訂單 × 規格」，所以只要改 o；到貨狀態與件數都不動。與訂單的改動在同一次寫入裡。
+          const earlierIdsNow = new Set(earlier.map(o => o.id));
+          const batchesNow = (await dbRef('settings/tallyBatches').once('value')).val() || {};
+          const movedLines = [];
+          Object.entries(batchesNow).forEach(([bid, b]) => Object.entries((b && b.lines) || {}).forEach(([lid, l]) => {
+            if (l && earlierIdsNow.has(l.o)) movedLines.push({ bid, lid, from: l.o });
+          }));
+          movedLines.forEach(m => { updates[`settings/tallyBatches/${m.bid}/lines/${m.lid}/o`] = base.id; });
           await withSyncTracking(dbRoot().update(updates));
 
           const name = base.customerName;
-          logAction('order_merge', 'order', base.id, `併單：${name}　${preview.earlierDates.join('、')} 併入 ${preview.baseDate}（${preview.rows.length} 筆併成 1 筆，${preview.mergedItemCount} 項，商品合計 $${preview.subtotal.toLocaleString()}）`);
+          logAction('order_merge', 'order', base.id, `併單：${name}　${preview.earlierDates.join('、')} 併入 ${preview.baseDate}（${preview.rows.length} 筆併成 1 筆，${preview.mergedItemCount} 項，商品合計 $${preview.subtotal.toLocaleString()}${movedLines.length > 0 ? `；叫貨記錄 ${movedLines.length} 列改指向後單` : ''}）`);
 
           showUndoToast(`✅ 已併單：${name}（${preview.earlierDates.join('、')} 併入 ${preview.baseDate}）`, async () => {
             try {
@@ -10378,6 +10488,13 @@
                 undo[`orders/${o.id}`] = cleanForDb(rawById[o.id]);  // 把前單原樣放回
                 undo[`trash/orders/${o.id}`] = null;                  // 並從回收桶拿掉
               });
+              // [v2.14.49] 叫貨記錄改回指向前單；只還原「現在還存在」的列（這 6 秒內若被取消叫貨，就不要把殘缺的資料寫回去）
+              if (movedLines.length > 0) {
+                const batchesAfter = (await dbRef('settings/tallyBatches').once('value')).val() || {};
+                movedLines.forEach(m => {
+                  if (batchesAfter[m.bid] && batchesAfter[m.bid].lines && batchesAfter[m.bid].lines[m.lid]) undo[`settings/tallyBatches/${m.bid}/lines/${m.lid}/o`] = m.from;
+                });
+              }
               await withSyncTracking(dbRoot().update(undo));
               logAction('order_merge', 'order', base.id, `復原併單：${name}（${preview.earlierDates.join('、')} 已還原）`);
               setUndoToast(null);
