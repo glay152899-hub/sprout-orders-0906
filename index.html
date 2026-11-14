@@ -59,7 +59,7 @@
     // ==========================================
     // config.js — 版本號 / Firebase設定 / 常數設定值
     // ==========================================
-    const APP_VERSION = '2.14.50';
+    const APP_VERSION = '2.14.51';
 
     // [v2.14.18] 尺寸系列：新增訂單與商品庫的尺寸快捷選項。存進資料庫的仍是「80, 90, 100」這種逗號字串，系列只是輸入輔助。
     // 要增減尺寸只改這裡；統一存大寫（與既有資料、sortSizes 的排序表一致）。
@@ -4133,7 +4133,7 @@
           )}
           <p className="text-xs leading-relaxed text-slate-400 break-words">・備註會加上「{p.mergeLine}」</p>
           {tallyMoveCount > 0 && <p className="text-xs leading-relaxed text-slate-400 break-words">・前單已叫過貨的記錄（{tallyMoveCount} 列）會跟著併到後單，不會重複叫貨</p>}
-          <p className="text-xs leading-relaxed text-slate-400 break-words">・{earlierText} 那{p.earlierDates.length > 1 ? ` ${p.earlierDates.length} ` : ''}筆會移到回收桶，併單後 6 秒內可按「復原」</p>
+          <p className="text-xs leading-relaxed text-slate-400 break-words">・{earlierText} 那{p.earlierDates.length > 1 ? ` ${p.earlierDates.length} ` : ''}筆會移到回收桶；併單後 15 秒內可按「復原」，之後也能到「更多 → 操作日誌」按「還原併單」</p>
         </div>
       );
     }
@@ -8928,15 +8928,26 @@
       );
     }
 
-    function UndoBanner({ message, onUndo }) {
+    // [v2.14.51] durationMs（選填）：有給才在「復原」鈕上顯示倒數秒數（例：復原 15）；沒給的維持原樣。
+    // 倒數只是畫面提示，真正的消失時間由 app-shell.js 的 showUndoToast 控制；換新提示時外面用 key 重新掛載，倒數會重來。
+    function UndoBanner({ message, onUndo, durationMs }) {
       const { icon, text } = splitLeadingEmoji(message);
       const tone = TOAST_TONE_BORDER[toastToneOf(icon)];
+      const [secondsLeft, setSecondsLeft] = React.useState(durationMs ? Math.ceil(durationMs / 1000) : null);
+      React.useEffect(() => {
+        if (!durationMs) return undefined;
+        const startedAt = Date.now();
+        const timer = setInterval(() => {
+          setSecondsLeft(Math.max(0, Math.ceil((durationMs - (Date.now() - startedAt)) / 1000)));
+        }, 250);
+        return () => clearInterval(timer);
+      }, [durationMs]);
       return (
         <div className="fixed bottom-24 md:bottom-8 inset-x-0 z-[70] flex justify-center px-3 pointer-events-none">
           <div role="status" className={`pointer-events-auto w-full max-w-md bg-slate-900 text-white rounded-2xl border-l-4 ${tone} shadow-2xl flex items-center gap-2 pl-3.5 pr-2.5 py-2 text-[13px] leading-relaxed`}>
             {icon && <span className="flex-none w-5 text-center">{icon}</span>}
             <span className="flex-1 min-w-0 break-words">{text}</span>
-            <button type="button" onClick={onUndo} className="flex-none px-3.5 py-1.5 rounded-full bg-amber-400 text-slate-900 font-bold text-xs">復原</button>
+            <button type="button" onClick={onUndo} className="flex-none px-3.5 py-1.5 rounded-full bg-amber-400 text-slate-900 font-bold text-xs">復原{secondsLeft !== null ? `（${secondsLeft}）` : ''}</button>
           </div>
         </div>
       );
@@ -9147,7 +9158,7 @@
       const undoTimerRef = React.useRef(null);
       const showUndoToast = (msg, onUndo, durationMs = 6000) => {
         if (undoTimerRef.current) clearTimeout(undoTimerRef.current);
-        setUndoToast({ msg, onUndo });
+        setUndoToast({ msg, onUndo, durationMs: durationMs !== 6000 ? durationMs : null, at: Date.now() }); // [v2.14.51] 只有指定較長時間的（併單）才顯示倒數
         undoTimerRef.current = setTimeout(() => setUndoToast(null), durationMs);
       };
 
@@ -11681,7 +11692,7 @@
           {confirmDialog && <SystemConfirmDialog dialog={confirmDialog} onClose={closeConfirm} />}
 
           {/* [v2.14.30] 領貨狀態「復原」提示（6 秒）；[v2.14.36] 改用 UndoBanner */}
-          {undoToast && <UndoBanner message={undoToast.msg} onUndo={undoToast.onUndo} />}
+          {undoToast && <UndoBanner key={undoToast.at} message={undoToast.msg} onUndo={undoToast.onUndo} durationMs={undoToast.durationMs} />}
 
           {/* [v2.13.5] 還原JSON備份 Modal */}
           {isRestoreModalOpen && (
