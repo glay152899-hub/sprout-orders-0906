@@ -59,7 +59,7 @@
     // ==========================================
     // config.js — 版本號 / Firebase設定 / 常數設定值
     // ==========================================
-    const APP_VERSION = '2.14.49';
+    const APP_VERSION = '2.14.50';
 
     // [v2.14.18] 尺寸系列：新增訂單與商品庫的尺寸快捷選項。存進資料庫的仍是「80, 90, 100」這種逗號字串，系列只是輸入輔助。
     // 要增減尺寸只改這裡；統一存大寫（與既有資料、sortSizes 的排序表一致）。
@@ -700,6 +700,17 @@
       return String((o && o.deliveryMethod === '宅配到府' ? (d.address || o.storeAddress) : (d.name || o.storeName)) || '').trim();
     };
     const normalizeStoreText = (v) => normalizeMergeText(v).replace(/^(7-?11|全家|萊爾富)/, '').replace(/(門市|分店|店)$/, '');
+
+    // [v2.14.50] 併單「事後還原」用的內容指紋：只看併單會改動的六個欄位（商品、備註、運費、手機、LINE、IG），
+    // 商品只取款號／品名／顏色／尺寸／單價／數量（不含隨機 id），字串空白與「缺欄位 vs 空字串」視為相同，
+    // 這樣「併單後沒有人動過」時指紋一定相同，而編輯視窗存檔造成的無意義差異不會誤判成「被改過」。
+    const mergeContentSig = (raw) => {
+      const o = raw || {};
+      const str = (v) => (v === undefined || v === null ? '' : String(v).trim());
+      const itemsRaw = Array.isArray(o.items) ? o.items : (o.items && typeof o.items === 'object' ? Object.values(o.items) : []);
+      const items = itemsRaw.map(it => [str(it && it.sku), str(it && it.name), str(it && it.color), str(it && it.size), Number(it && it.price) || 0, Number(it && it.qty) || 0]);
+      return JSON.stringify([items, str(o.note), Number(o.shippingFee) || 0, str(o.customerPhone), str(o.customerLine), str(o.customerIg)]);
+    };
 
     const checkOrdersMergeable = (selected) => {
       const list = [...(selected || [])].sort((a, b) => (Number(a.timestamp) || 0) - (Number(b.timestamp) || 0)); // 舊 → 新
@@ -5360,7 +5371,7 @@
     // ==========================================
     // [V2.7] 操作日誌視窗：最近 200 筆，編輯訂單可「還原此次修改」
     // ==========================================
-    function LogModal({ orders, onRevert, onClose }) {
+    function LogModal({ orders, onRevert, onRevertMerge, onClose }) {
       const [entries, setEntries] = React.useState(null); // null = 載入中
       const [filter, setFilter] = React.useState('all');
 
@@ -5449,6 +5460,22 @@
                     </div>
                     <div className="text-xs sm:text-sm text-slate-800 leading-snug break-words">{e.summary}</div>
                     {diff && <div className="text-[11px] text-slate-500 leading-snug break-words">{diff}</div>}
+                    {/* [v2.14.50] 併單：有還原快照的才有按鈕；已還原顯示標記；舊版（v2.14.49 以前）的併單沒有快照，只提示手動 */}
+                    {e.action === 'order_merge' && e.merge && !e.revertedAt && (
+                      <button
+                        type="button"
+                        onClick={() => onRevertMerge && onRevertMerge(e)}
+                        className="mt-1 px-2.5 py-1 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 font-bold rounded-lg text-[11px]"
+                      >
+                        ↩︎ 還原併單
+                      </button>
+                    )}
+                    {e.action === 'order_merge' && e.merge && e.revertedAt && (
+                      <div className="text-[11px] text-slate-400">✓ 已還原（{formatLogTime(e.revertedAt)}）</div>
+                    )}
+                    {e.action === 'order_merge' && !e.merge && !/^復原併單/.test(e.summary || '') && (
+                      <div className="text-[11px] text-slate-400">此筆無法一鍵還原，請至「回收桶」還原前單</div>
+                    )}
                     {canRevert && (
                       <button
                         type="button"
@@ -9118,10 +9145,10 @@
       // [v2.14.30] 可「復原」的提示：領貨狀態標錯時，6 秒內點一下就回到原本的狀態（含領貨日）
       const [undoToast, setUndoToast] = React.useState(null);
       const undoTimerRef = React.useRef(null);
-      const showUndoToast = (msg, onUndo) => {
+      const showUndoToast = (msg, onUndo, durationMs = 6000) => {
         if (undoTimerRef.current) clearTimeout(undoTimerRef.current);
         setUndoToast({ msg, onUndo });
-        undoTimerRef.current = setTimeout(() => setUndoToast(null), 6000);
+        undoTimerRef.current = setTimeout(() => setUndoToast(null), durationMs);
       };
 
       // ------------------------------------------
@@ -9818,9 +9845,10 @@
 
       // 寫入日誌（失敗不影響主要操作）。日誌只記姓名與金額，不記電話、地址。
       const cleanForDb = (obj) => JSON.parse(JSON.stringify(obj));
+      // [v2.14.50] 回傳這筆日誌的 key（寫入失敗或出錯回傳空字串），併單還原要用它在原日誌上標記「已還原」
       const logAction = (action, target, targetId, summary, extra = {}) => {
         try {
-          dbRef('logs').push({
+          const logRef = dbRef('logs').push({
             ts: Date.now(),
             user: userEmail,
             action,
@@ -9828,9 +9856,12 @@
             targetId: targetId || '',
             summary,
             ...cleanForDb(extra)
-          }).catch((err) => console.error('Log write error:', err));
+          });
+          logRef.catch((err) => console.error('Log write error:', err));
+          return logRef.key || '';
         } catch (err) {
           console.error('Log error:', err);
+          return '';
         }
       };
 
@@ -10404,6 +10435,73 @@
         }
       };
 
+      // ---------- [v2.14.50] 併單還原（共用：15 秒復原提示、操作日誌的「還原併單」） ----------
+      // 先檢查、再用「單一多路徑 update」一次寫入（要嘛全成功、要嘛全不動）。回傳 { ok, reason }，不自己跳提示（呼叫端決定怎麼顯示）。
+      // 擋下的情況：後單已不存在／已出貨／已領貨／棄單／併單後內容被改過；前單已不在回收桶或訂單列表已有同 id。
+      const revertMerge = async (snap, logId) => {
+        try {
+          if (!snap || !snap.baseId || !Array.isArray(snap.earlierIds) || snap.earlierIds.length === 0 || !snap.baseBefore) {
+            return { ok: false, reason: '這筆併單沒有足夠的還原資料，請到「更多 → 回收桶」手動還原前單。' };
+          }
+          if (!requireConnection('還原併單')) return { ok: false, reason: '目前沒有網路連線，請連線後再試。' };
+          const baseSnap = await dbRef(`orders/${snap.baseId}`).once('value');
+          if (!baseSnap.exists()) return { ok: false, reason: '併單後的這張訂單已不存在（可能已刪除或在回收桶），無法還原。' };
+          const baseRaw = baseSnap.val();
+          if (baseRaw.shipmentStatus === 'shipped') return { ok: false, reason: '這張訂單已經標記「已出貨」，不能再還原併單。' };
+          if (baseRaw.paymentStatus === true) return { ok: false, reason: '這張訂單已經標記「已領貨」，不能再還原併單（收支報表已計入收入）。' };
+          if (baseRaw.closeStatus === 'abandoned') return { ok: false, reason: '這張訂單已標記為棄單，不能還原併單。' };
+          if (snap.afterSig && mergeContentSig(baseRaw) !== snap.afterSig) {
+            return { ok: false, reason: '併單之後，這張訂單的商品、備註、運費或聯絡方式被修改過。為了不蓋掉後來的修改，無法自動還原，請手動調整，或到「更多 → 回收桶」把前單還原後再自行刪除重複的商品。' };
+          }
+          const trashSnaps = await Promise.all(snap.earlierIds.map(id => dbRef(`trash/orders/${id}`).once('value')));
+          const liveSnaps = await Promise.all(snap.earlierIds.map(id => dbRef(`orders/${id}`).once('value')));
+          if (trashSnaps.some(t => !t.exists())) return { ok: false, reason: '前單已不在回收桶（可能被永久刪除或已還原），無法自動還原。' };
+          if (liveSnaps.some(l => l.exists())) return { ok: false, reason: '前單已經在訂單列表裡了（可能已手動還原），請先確認後再處理。' };
+
+          const b = snap.baseBefore;
+          const undo = {
+            [`orders/${snap.baseId}/items`]: cleanForDb(b.items ?? null),
+            [`orders/${snap.baseId}/note`]: b.note ?? null,
+            [`orders/${snap.baseId}/shippingFee`]: b.shippingFee ?? null,
+            [`orders/${snap.baseId}/customerPhone`]: b.customerPhone ?? null,
+            [`orders/${snap.baseId}/customerLine`]: b.customerLine ?? null,
+            [`orders/${snap.baseId}/customerIg`]: b.customerIg ?? null
+          };
+          snap.earlierIds.forEach((id, i) => {
+            const { deletedAt, deletedBy, ...orig } = trashSnaps[i].val() || {};
+            undo[`orders/${id}`] = cleanForDb(orig);   // 前單從回收桶放回訂單
+            undo[`trash/orders/${id}`] = null;
+          });
+          // 叫貨記錄：只還原「現在還存在、而且仍指向後單」的列（期間被取消叫貨或改過的就不碰）
+          const moved = Array.isArray(snap.movedLines) ? snap.movedLines : [];
+          if (moved.length > 0) {
+            const batchesNow = (await dbRef('settings/tallyBatches').once('value')).val() || {};
+            moved.forEach(m => {
+              const line = batchesNow[m.bid] && batchesNow[m.bid].lines && batchesNow[m.bid].lines[m.lid];
+              if (line && line.o === snap.baseId) undo[`settings/tallyBatches/${m.bid}/lines/${m.lid}/o`] = m.from;
+            });
+          }
+          if (logId) undo[`logs/${logId}/revertedAt`] = Date.now();
+          await withSyncTracking(dbRoot().update(undo));
+          logAction('order_merge_revert', 'order', snap.baseId, `還原併單：${snap.name || ''}（${snap.label || ''} 已還原）`);
+          return { ok: true };
+        } catch (err) {
+          console.error('Revert merge error:', err);
+          return { ok: false, reason: '還原失敗，訂單沒有被改動。請檢查網路連線，或到「更多 → 回收桶」手動還原前單。' };
+        }
+      };
+
+      // 操作日誌的「還原併單」按鈕
+      const handleRevertMergeFromLog = async (entry) => {
+        const snap = entry && entry.merge;
+        if (!snap) return;
+        const go = await askConfirm(`要取消「${snap.name || ''}」的這次併單嗎？\n・後單會回到併單前的內容\n・前單會從回收桶放回訂單列表\n（如果併單後這張訂單又被修改過、或已出貨／已領貨，會擋下不處理）`, { confirmLabel: '還原併單' });
+        if (!go) return;
+        const res = await revertMerge(snap, entry.id);
+        if (res.ok) showToast('↩️ 已還原併單，前單回到訂單列表');
+        else await askConfirm('', { lead: '無法還原併單', body: <div className="text-sm text-slate-700 leading-relaxed">{res.reason}</div>, confirmLabel: '知道了', hideCancel: true });
+      };
+
       // ---------- [v2.14.37] 併單：把選好的訂單（同一位客人）合併成一張，前單併到「下單時間最晚的後單」 ----------
       // [v2.14.39] 改由「併單選擇視窗」傳入要併的訂單；回傳 true＝併單完成（視窗才關閉），false＝取消或失敗（視窗留著讓使用者調整）
       const handleMergeOrders = async (selectedOrders) => {
@@ -10472,38 +10570,39 @@
           await withSyncTracking(dbRoot().update(updates));
 
           const name = base.customerName;
-          logAction('order_merge', 'order', base.id, `併單：${name}　${preview.earlierDates.join('、')} 併入 ${preview.baseDate}（${preview.rows.length} 筆併成 1 筆，${preview.mergedItemCount} 項，商品合計 $${preview.subtotal.toLocaleString()}${movedLines.length > 0 ? `；叫貨記錄 ${movedLines.length} 列改指向後單` : ''}）`);
+          // [v2.14.50] 還原快照：存在 order_merge 日誌的 merge 欄位（舊版的併單日誌沒有，所以舊併單不能一鍵還原）。
+          // 後單併單前的六個欄位＋前單 id（前單本體在 trash/orders）＋被改指向的叫貨列＋併單後後單的內容指紋（還原前用來確認沒被改過）。
+          let afterSig = '';
+          try { afterSig = mergeContentSig((await dbRef(`orders/${base.id}`).once('value')).val()); } catch (e) { afterSig = ''; }
+          const snapshot = {
+            baseId: base.id,
+            earlierIds: earlier.map(o => o.id),
+            label: preview.earlierDates.join('、'),
+            name,
+            baseBefore: {
+              items: cleanForDb(rawBase.items ?? null),
+              note: rawBase.note ?? null,
+              shippingFee: rawBase.shippingFee ?? null,
+              customerPhone: rawBase.customerPhone ?? null,
+              customerLine: rawBase.customerLine ?? null,
+              customerIg: rawBase.customerIg ?? null
+            },
+            movedLines,
+            afterSig
+          };
+          const logId = logAction('order_merge', 'order', base.id, `併單：${name}　${preview.earlierDates.join('、')} 併入 ${preview.baseDate}（${preview.rows.length} 筆併成 1 筆，${preview.mergedItemCount} 項，商品合計 $${preview.subtotal.toLocaleString()}${movedLines.length > 0 ? `；叫貨記錄 ${movedLines.length} 列改指向後單` : ''}）`, afterSig ? { merge: snapshot } : {});
 
+          // 15 秒內可直接「復原」；之後可到「更多 → 資料保護 → 操作日誌」的這筆併單按「還原併單」
           showUndoToast(`✅ 已併單：${name}（${preview.earlierDates.join('、')} 併入 ${preview.baseDate}）`, async () => {
-            try {
-              const undo = {
-                [`orders/${base.id}/items`]: cleanForDb(rawBase.items ?? null),
-                [`orders/${base.id}/note`]: rawBase.note ?? null,
-                [`orders/${base.id}/shippingFee`]: rawBase.shippingFee ?? null,
-                [`orders/${base.id}/customerPhone`]: rawBase.customerPhone ?? null,
-                [`orders/${base.id}/customerLine`]: rawBase.customerLine ?? null,
-                [`orders/${base.id}/customerIg`]: rawBase.customerIg ?? null
-              };
-              earlier.forEach(o => {
-                undo[`orders/${o.id}`] = cleanForDb(rawById[o.id]);  // 把前單原樣放回
-                undo[`trash/orders/${o.id}`] = null;                  // 並從回收桶拿掉
-              });
-              // [v2.14.49] 叫貨記錄改回指向前單；只還原「現在還存在」的列（這 6 秒內若被取消叫貨，就不要把殘缺的資料寫回去）
-              if (movedLines.length > 0) {
-                const batchesAfter = (await dbRef('settings/tallyBatches').once('value')).val() || {};
-                movedLines.forEach(m => {
-                  if (batchesAfter[m.bid] && batchesAfter[m.bid].lines && batchesAfter[m.bid].lines[m.lid]) undo[`settings/tallyBatches/${m.bid}/lines/${m.lid}/o`] = m.from;
-                });
-              }
-              await withSyncTracking(dbRoot().update(undo));
-              logAction('order_merge', 'order', base.id, `復原併單：${name}（${preview.earlierDates.join('、')} 已還原）`);
+            const res = await revertMerge(snapshot, logId);
+            if (res.ok) {
               setUndoToast(null);
               showToast('↩️ 已復原併單');
-            } catch (err) {
-              console.error('Undo merge error:', err);
-              showToast('❌ 復原失敗，請到「更多 → 回收桶」手動還原前單。');
+            } else {
+              setUndoToast(null);
+              await askConfirm('', { lead: '無法復原併單', body: <div className="text-sm text-slate-700 leading-relaxed">{res.reason}</div>, confirmLabel: '知道了', hideCancel: true });
             }
-          });
+          }, 15000);
           return true;
         } catch (err) {
           console.error('Merge orders error:', err);
@@ -11671,6 +11770,7 @@
             <LogModal
               orders={orders}
               onRevert={handleRevertOrderEdit}
+              onRevertMerge={handleRevertMergeFromLog}
               onClose={() => setIsLogOpen(false)}
             />
           )}
