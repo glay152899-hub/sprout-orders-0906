@@ -59,7 +59,7 @@
     // ==========================================
     // config.js — 版本號 / Firebase設定 / 常數設定值
     // ==========================================
-    const APP_VERSION = '2.14.55';
+    const APP_VERSION = '2.14.56';
 
     // [v2.14.18] 尺寸系列：新增訂單與商品庫的尺寸快捷選項。存進資料庫的仍是「80, 90, 100」這種逗號字串，系列只是輸入輔助。
     // 要增減尺寸只改這裡；統一存大寫（與既有資料、sortSizes 的排序表一致）。
@@ -6148,17 +6148,11 @@
                               <div className="space-y-1.5 bg-white p-3 rounded-xl border border-slate-200/60">
                                 <div className="flex justify-between text-[11px] font-semibold text-slate-400 border-b border-slate-100 pb-1">
                                   <span>商品項目 ({realItemCount} 項)</span>
-                                  {/* 欄位寬度需與下方每一列完全相同，數字才會對齊標題 */}
-                                  <span className="flex items-baseline flex-shrink-0">
-                                    <span className="w-12 text-right">單價</span>
-                                    <span className="w-4 text-center">×</span>
-                                    <span className="w-6 text-right">數量</span>
-                                    <span className="w-4 text-center">=</span>
-                                    <span className="min-w-[3.5rem] text-right">小計</span>
-                                  </span>
+                                  {/* [v2.14.56] 手機展開明細改成單一「金額」欄：數量 1 只顯示金額；數量大於 1 時下面多一行小字「單價 × 數量」，數量用亮藍色標出來 */}
+                                  <span className="flex-shrink-0 min-w-[3.5rem] text-right">金額</span>
                                 </div>
                                 {order.items.map((item, idx) => (
-                                  <div key={idx} className="flex items-center justify-between gap-2 text-xs">
+                                  <div key={idx} className="flex items-start justify-between gap-2 text-xs">
                                     <span className="text-slate-700 min-w-0">
                                       {isAdjustmentItem(item) ? (
                                         <span className="font-semibold text-rose-600">🏷️ {item.name}</span>
@@ -6174,12 +6168,11 @@
                                         <span className="min-w-[3.5rem] text-right whitespace-nowrap font-semibold text-rose-600">{item.price * item.qty < 0 ? '- ' : '+ '}${Math.abs(item.price * item.qty)}</span>
                                       </span>
                                     ) : (
-                                      <span className="flex items-baseline flex-shrink-0 tabular-nums font-semibold text-slate-800">
-                                        <span className="w-12 text-right">${item.price}</span>
-                                        <span className="w-4 text-center font-normal text-slate-400">×</span>
-                                        <span className="w-6 text-right">{item.qty}</span>
-                                        <span className="w-4 text-center font-normal text-slate-400">=</span>
-                                        <span className="min-w-[3.5rem] text-right whitespace-nowrap">${item.price * item.qty}</span>
+                                      <span className="flex flex-col items-end flex-shrink-0 tabular-nums">
+                                        <span className="min-w-[3.5rem] text-right whitespace-nowrap font-semibold text-slate-800">${item.price * item.qty}</span>
+                                        {Number(item.qty) > 1 && (
+                                          <span className="text-[11px] font-normal text-slate-400 whitespace-nowrap">${item.price} × <span className="text-sm font-bold text-blue-600">{item.qty}</span></span>
+                                        )}
                                       </span>
                                     )}
                                   </div>
