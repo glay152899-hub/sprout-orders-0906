@@ -59,7 +59,7 @@
     // ==========================================
     // config.js — 版本號 / Firebase設定 / 常數設定值
     // ==========================================
-    const APP_VERSION = '2.14.54';
+    const APP_VERSION = '2.14.55';
 
     // [v2.14.18] 尺寸系列：新增訂單與商品庫的尺寸快捷選項。存進資料庫的仍是「80, 90, 100」這種逗號字串，系列只是輸入輔助。
     // 要增減尺寸只改這裡；統一存大寫（與既有資料、sortSizes 的排序表一致）。
@@ -2726,7 +2726,8 @@
           name: l?.name || '',
           color: l?.color || '',
           size: l?.size || '',
-          arrived: !!l?.arrived
+          arrived: !!l?.arrived,
+          n: Number.isFinite(Number(l?.n)) && l?.n !== undefined && l?.n !== null ? Number(l.n) : null // [v2.14.55] 叫貨順序，舊批次沒有
         }))
       }))
       .filter(b => b.lines.length > 0)
@@ -2759,10 +2760,25 @@
 
     // 已叫貨頁：每個批次 → 依商品分組（沿用 computeTallyGroups）。回傳由新到舊。
     // 每個規格列帶 lineIds（這列對應的明細 id）、arrivedCount／arrived（到貨狀態：整列的明細都到貨才算到貨）。
+    // [v2.14.55] 依「叫貨順序」分組：順序不動，只把「連續、同一商品」的規格併成一組（共用一個標題）。
+    // 同一商品被其他商品隔開時會各自成一組（標題重複出現），這是照叫貨先後排的必然結果。
+    const computeTallyRuns = (orderedItems, products = []) => {
+      const gKeyOf = (it) => (it.sku ? `sku:${it.sku}` : `name:${it.name}`);
+      const chunks = [];
+      orderedItems.forEach(it => {
+        const last = chunks[chunks.length - 1];
+        if (last && gKeyOf(last[0]) === gKeyOf(it)) last.push(it); else chunks.push([it]);
+      });
+      return chunks.map((chunk, i) => {
+        const g = computeTallyGroups(chunk, products)[0]; // 只借它算標題資訊（款號、品名、圖片、總件數）
+        return { ...g, key: `${g.key}#${i}`, rows: chunk };
+      });
+    };
+
     const computeTallyBatchViews = (batchList, products = []) => batchList.map((b, idx) => {
       const map = {};
       b.lines.forEach(l => {
-        const m = map[l.key] || (map[l.key] = { key: l.key, sku: l.sku, name: l.name, color: l.color, size: l.size, totalQty: 0, buyers: [], lineIds: [], arrivedCount: 0 });
+        const m = map[l.key] || (map[l.key] = { key: l.key, sku: l.sku, name: l.name, color: l.color, size: l.size, totalQty: 0, buyers: [], lineIds: [], arrivedCount: 0, n: l.n });
         m.totalQty += l.qty;
         m.buyers.push({ orderId: l.orderId, customerName: l.customerName, qty: l.qty });
         m.lineIds.push(l.lid);
@@ -2776,7 +2792,10 @@
         itemCount: items.length,
         arrivedItemCount: items.filter(i => i.arrived).length,
         totalQty: items.reduce((sum, i) => sum + i.totalQty, 0),
-        groups: computeTallyGroups(items, products)
+        // 這批所有列都有叫貨順序（v2.14.55 之後叫的）→ 照叫貨先後；否則（舊批次）維持依款號分組
+        groups: b.lines.every(l => l.n !== null)
+          ? computeTallyRuns([...items].sort((x, y) => (x.n - y.n)), products)
+          : computeTallyGroups(items, products)
       };
     }).reverse();
 
@@ -10106,17 +10125,23 @@
       };
 
       // [v2.14.46] 待叫貨頁的選取（純畫面，不寫資料庫）
+      // [v2.14.55] 勾選時記「第幾個勾的」（正整數，越小越早）。原本存 true，所有判斷都只看有沒有值（truthy），所以相容。
+      // 叫貨時依這個順序寫進批次，已叫貨頁就能照她叫貨的先後顯示。
+      const nextTallySeq = (state) => Object.values(state).reduce((m, v) => Math.max(m, Number(v) || 0), 0) + 1;
       const handleToggleTallySelect = (key) => {
         setTallySelected(prev => {
           const next = { ...prev };
-          if (next[key]) delete next[key]; else next[key] = true;
+          if (next[key]) delete next[key]; else next[key] = nextTallySeq(prev);
           return next;
         });
       };
       const handleSetTallySelect = (keys, value) => {
         setTallySelected(prev => {
           const next = { ...prev };
-          keys.forEach(k => { if (value) next[k] = true; else delete next[k]; });
+          keys.forEach(k => {
+            if (!value) { delete next[k]; return; }
+            if (!next[k]) next[k] = nextTallySeq(next); // 已經勾過的保留原本順序
+          });
           return next;
         });
       };
@@ -10124,7 +10149,8 @@
 
       // [v2.14.46] 叫貨：把選取的規格「每張訂單的待叫件數」記成一個批次（單次寫入，要嘛全成功、要嘛全不動）
       const handleOrderTallySelected = async () => {
-        const picked = tallyPending.filter(it => tallySelected[it.key]);
+        // [v2.14.55] 依勾選先後排（不是依款號）；之後寫進批次的 n 也用這個順序
+        const picked = tallyPending.filter(it => tallySelected[it.key]).sort((a, b) => (Number(tallySelected[a.key]) || 0) - (Number(tallySelected[b.key]) || 0));
         if (picked.length === 0) return;
         if (!requireConnection('叫貨')) return;
         const totalQty = picked.reduce((sum, it) => sum + it.totalQty, 0);
@@ -10135,11 +10161,12 @@
 
         const lines = {};
         let n = 0;
-        picked.forEach(it => it.buyers.forEach(b => {
+        picked.forEach((it, itemIdx) => it.buyers.forEach(b => {
           lines[`l${n++}`] = {
             o: b.orderId || '', k: it.key, c: b.customerName || '', q: Number(b.qty) || 0,
             sku: it.sku || '', name: it.name || '', color: it.color || '', size: it.size || '',
-            arrived: false
+            arrived: false,
+            n: itemIdx // [v2.14.55] 叫貨順序（同一規格的各列相同）；舊批次沒有這個欄位，已叫貨頁維持舊排法
           };
         }));
         try {
