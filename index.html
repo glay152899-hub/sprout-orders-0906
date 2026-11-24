@@ -59,7 +59,7 @@
     // ==========================================
     // config.js — 版本號 / Firebase設定 / 常數設定值
     // ==========================================
-    const APP_VERSION = '2.14.53';
+    const APP_VERSION = '2.14.54';
 
     // [v2.14.18] 尺寸系列：新增訂單與商品庫的尺寸快捷選項。存進資料庫的仍是「80, 90, 100」這種逗號字串，系列只是輸入輔助。
     // 要增減尺寸只改這裡；統一存大寫（與既有資料、sortSizes 的排序表一致）。
@@ -6145,7 +6145,7 @@
                                         <span className="font-semibold text-rose-600">🏷️ {item.name}</span>
                                       ) : (
                                         <>
-                                          {item.sku && <span className="font-mono text-slate-400 mr-1.5">[{item.sku}]</span>}
+                                          {/* [v2.14.54] 手機展開明細不顯示款號（讓品名有更多寬度、少換行）；電腦版仿紙本表單的「款號」欄、理貨清單照舊 */}
                                           {item.name} <span className="text-slate-400">({item.color}/{item.size})</span>
                                         </>
                                       )}
