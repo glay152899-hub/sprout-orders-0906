@@ -59,7 +59,7 @@
     // ==========================================
     // config.js — 版本號 / Firebase設定 / 常數設定值
     // ==========================================
-    const APP_VERSION = '2.14.56';
+    const APP_VERSION = '2.14.57';
 
     // [v2.14.18] 尺寸系列：新增訂單與商品庫的尺寸快捷選項。存進資料庫的仍是「80, 90, 100」這種逗號字串，系列只是輸入輔助。
     // 要增減尺寸只改這裡；統一存大寫（與既有資料、sortSizes 的排序表一致）。
@@ -2885,6 +2885,33 @@
         receivedRevenue,
         pendingRevenue
       };
+    };
+
+    // [v2.14.57] 月統計（訂單列表最上方的「月統計」卡）：依「下單日」歸月（與收支報表的記帳日一致），
+    // 金額一律是商品金額、不含運費；棄單不計入金額與訂單數，只另外記筆數。已實收／待收的定義同 computeOrderListStats
+    // （已領貨或先匯款＝已實收；兩者都沒有＝待收）。回傳 { months: [{ key:'YYYY-MM', count, amount, received, pending, abandonedCount }]（新到舊）, all: {...} }。
+    // 一定包含「當月」（就算當月還沒有訂單），讓預設畫面永遠有東西可顯示。
+    const computeMonthlyOrderStats = (orders, nowMs = Date.now()) => {
+      const blank = (key) => ({ key, count: 0, amount: 0, received: 0, pending: 0, abandonedCount: 0 });
+      const byMonth = {};
+      const all = blank('all');
+      const add = (bucket, o) => {
+        if (o.closeStatus === 'abandoned') { bucket.abandonedCount += 1; return; }
+        const total = calcOrderSubtotal(o);
+        bucket.count += 1;
+        bucket.amount += total;
+        if (o.paymentStatus || o.prepaidDate) bucket.received += total; else bucket.pending += total;
+      };
+      (orders || []).forEach(o => {
+        add(all, o);
+        const ym = toDateInputValue(o.timestamp).slice(0, 7);
+        if (!ym) return;
+        add(byMonth[ym] || (byMonth[ym] = blank(ym)), o);
+      });
+      const currentKey = toDateInputValue(nowMs).slice(0, 7);
+      if (!byMonth[currentKey]) byMonth[currentKey] = blank(currentKey);
+      const months = Object.values(byMonth).sort((a, b) => (a.key < b.key ? 1 : -1));
+      return { months, all, currentKey };
     };
 
     // 全域統計（stats 的 useMemo 內容；傳入 orders 與 enrichedProducts）
@@ -5787,6 +5814,109 @@
       );
     }
 
+    // [v2.14.57] 月統計卡：預設當月，可用下拉選單或左右箭頭換月份，也可選「全部月份」。
+    // 只管這張卡自己的數字，**不篩選下面的訂單列表、也不影響四張階段卡**（列表永遠顯示全部訂單）。
+    // 內含純畫面 state（選了哪個月、選單開關），與 FilterCollapse 同樣為了讓 OrderListTab 本身維持沒有 hook。
+    function MonthStatsCard({ orders }) {
+      const stats = React.useMemo(() => computeMonthlyOrderStats(orders), [orders]);
+      const [selected, setSelected] = React.useState(null); // null＝當月
+      const [menuOpen, setMenuOpen] = React.useState(false);
+      const selKey = selected || stats.currentKey;
+      const isAll = selKey === 'all';
+      const data = isAll ? stats.all : (stats.months.find(m => m.key === selKey) || { key: selKey, count: 0, amount: 0, received: 0, pending: 0, abandonedCount: 0 });
+      const monthLabel = (key) => `${key.slice(0, 4)} 年 ${Number(key.slice(5, 7))} 月`;
+      const idx = isAll ? -1 : stats.months.findIndex(m => m.key === selKey);
+      const olderKey = idx >= 0 && idx < stats.months.length - 1 ? stats.months[idx + 1].key : null;
+      const newerKey = idx > 0 ? stats.months[idx - 1].key : null;
+      const pick = (key) => { setSelected(key === stats.currentKey ? null : key); setMenuOpen(false); };
+      const title = isAll ? '全部月份' : (selKey === stats.currentKey ? '本月' : `${Number(selKey.slice(5, 7))} 月`);
+      const money = (n) => `$${n.toLocaleString()}`;
+      const arrowBtn = (key, dir) => (
+        <button
+          type="button"
+          disabled={!key}
+          onClick={() => key && pick(key)}
+          aria-label={dir === 'prev' ? '上個月' : '下個月'}
+          className="w-10 h-10 flex-shrink-0 rounded-xl bg-slate-100 text-slate-600 flex items-center justify-center disabled:opacity-30"
+        >
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            <path d={dir === 'prev' ? 'M15 6l-6 6 6 6' : 'M9 6l6 6-6 6'} />
+          </svg>
+        </button>
+      );
+      return (
+        <div className="relative bg-white border border-slate-200 rounded-2xl px-3.5 py-3 mb-2 sm:mb-3">
+          <div className="flex items-center justify-between gap-2 mb-2.5">
+            {arrowBtn(olderKey, 'prev')}
+            <button
+              type="button"
+              onClick={() => setMenuOpen(o => !o)}
+              className="flex-1 min-w-0 h-10 px-3 rounded-xl border border-slate-300 bg-white flex items-center justify-center gap-1.5 font-bold text-base text-slate-800"
+            >
+              <span className="truncate">{isAll ? '全部月份' : monthLabel(selKey)}</span>
+              <IconChevronDown size={16} />
+            </button>
+            {arrowBtn(newerKey, 'next')}
+          </div>
+
+          {menuOpen && (
+            <>
+              <button type="button" aria-label="關閉選單" onClick={() => setMenuOpen(false)} className="fixed inset-0 z-10 cursor-default" />
+              <div className="absolute left-3.5 right-3.5 top-[3.9rem] z-20 bg-white border border-slate-300 rounded-2xl shadow-lg p-1.5 max-h-72 overflow-y-auto">
+                {[{ key: 'all', label: '全部月份', count: stats.all.count, amount: stats.all.amount }].concat(
+                  stats.months.map(m => ({ key: m.key, label: monthLabel(m.key), count: m.count, amount: m.amount }))
+                ).map(opt => {
+                  const on = opt.key === selKey;
+                  return (
+                    <button
+                      key={opt.key}
+                      type="button"
+                      onClick={() => pick(opt.key)}
+                      className={`w-full min-h-[44px] px-3 rounded-xl flex items-center justify-between gap-2 text-left ${on ? 'bg-emerald-50 text-emerald-700 font-bold' : 'text-slate-700'}`}
+                    >
+                      <span className="text-sm whitespace-nowrap">{opt.label}</span>
+                      <span className={`text-xs tabular-nums whitespace-nowrap ${on ? 'text-emerald-700' : 'text-slate-400'}`}>{opt.count} 筆・{money(opt.amount)}{on ? ' ✓' : ''}</span>
+                    </button>
+                  );
+                })}
+              </div>
+            </>
+          )}
+
+          {data.count === 0 ? (
+            <div className="py-3 text-center text-sm text-slate-400">
+              {isAll ? '還沒有訂單' : (selKey === stats.currentKey ? '本月尚無訂單' : '這個月尚無訂單')}
+              {data.abandonedCount > 0 && <div className="text-xs mt-1">另有棄單 {data.abandonedCount} 筆，不計入金額</div>}
+            </div>
+          ) : (
+            <>
+              <div className="flex items-baseline justify-between gap-2 px-0.5 pb-2.5">
+                <div className="min-w-0">
+                  <div className="text-xs text-slate-500">{title}商品金額（不含運費）</div>
+                  <div className="text-2xl font-bold text-emerald-600 tabular-nums">{money(data.amount)}</div>
+                </div>
+                <div className="text-right flex-shrink-0">
+                  <div className="text-xs text-slate-500">訂單數</div>
+                  <div className="text-base font-bold text-slate-700 tabular-nums">{data.count} 筆</div>
+                </div>
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                <div className="rounded-xl bg-slate-50 border border-slate-100 px-3 py-2">
+                  <div className="text-xs text-slate-500">已實收</div>
+                  <div className="text-lg font-bold text-emerald-700 tabular-nums truncate">{money(data.received)}</div>
+                </div>
+                <div className="rounded-xl bg-slate-50 border border-slate-100 px-3 py-2">
+                  <div className="text-xs text-slate-500">待收</div>
+                  <div className="text-lg font-bold text-amber-600 tabular-nums truncate">{money(data.pending)}</div>
+                </div>
+              </div>
+              {data.abandonedCount > 0 && <div className="text-xs text-slate-400 mt-2 pl-0.5">另有棄單 {data.abandonedCount} 筆，不計入以上金額</div>}
+            </>
+          )}
+        </div>
+      );
+    }
+
     function OrderListTab({ list }) {
       const {
         orders,
@@ -6262,6 +6392,8 @@
                     </button>
                   </div>
                 </div>
+
+                <MonthStatsCard orders={orders} />
 
                 {/* Stats [v2.14.34]：四個「互不重疊」的階段（待出貨／待領貨／已領貨／棄單），加起來＝總訂單；金額另放一行 */}
                 {(() => {
