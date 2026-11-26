@@ -59,7 +59,7 @@
     // ==========================================
     // config.js — 版本號 / Firebase設定 / 常數設定值
     // ==========================================
-    const APP_VERSION = '2.14.58';
+    const APP_VERSION = '2.14.59';
 
     // [v2.14.18] 尺寸系列：新增訂單與商品庫的尺寸快捷選項。存進資料庫的仍是「80, 90, 100」這種逗號字串，系列只是輸入輔助。
     // 要增減尺寸只改這裡；統一存大寫（與既有資料、sortSizes 的排序表一致）。
@@ -5817,9 +5817,11 @@
     // [v2.14.57] 月統計卡：預設當月，可用下拉選單或左右箭頭換月份，也可選「全部月份」。
     // 只管這張卡自己的數字，**不篩選下面的訂單列表、也不影響四張階段卡**（列表永遠顯示全部訂單）。
     // 內含純畫面 state（選了哪個月、選單開關），與 FilterCollapse 同樣為了讓 OrderListTab 本身維持沒有 hook。
-    function MonthStatsCard({ orders }) {
+    // [v2.14.59] 月份與「只看這個月」開關（scope）由 app-shell.js 持有，因為開關開啟時列表與階段卡也要跟著只看那個月；
+    // 開關預設關閉＝跟 v2.14.57 一樣，月份只影響這張卡。這裡只剩選單開關這個純畫面 state。
+    function MonthStatsCard({ orders, scope }) {
       const stats = React.useMemo(() => computeMonthlyOrderStats(orders), [orders]);
-      const [selected, setSelected] = React.useState(null); // null＝當月
+      const selected = scope.sel; // null＝當月
       const [menuOpen, setMenuOpen] = React.useState(false);
       const selKey = selected || stats.currentKey;
       const isAll = selKey === 'all';
@@ -5828,7 +5830,12 @@
       const idx = isAll ? -1 : stats.months.findIndex(m => m.key === selKey);
       const olderKey = idx >= 0 && idx < stats.months.length - 1 ? stats.months[idx + 1].key : null;
       const newerKey = idx > 0 ? stats.months[idx - 1].key : null;
-      const pick = (key) => { setSelected(key === stats.currentKey ? null : key); setMenuOpen(false); };
+      const pick = (key) => {
+        scope.setSel(key === stats.currentKey ? null : key);
+        if (key === 'all') scope.setOnly(false); // 全部月份沒有「這個月」，開關自動關閉
+        setMenuOpen(false);
+      };
+      const linkOn = scope.only && !isAll;
       const title = isAll ? '全部月份' : (selKey === stats.currentKey ? '本月' : `${Number(selKey.slice(5, 7))} 月`);
       const money = (n) => `$${n.toLocaleString()}`;
       const arrowBtn = (key, dir) => (
@@ -5845,6 +5852,7 @@
         </button>
       );
       return (
+        <>
         <div className="relative bg-white border border-slate-200 rounded-2xl px-3.5 py-3 mb-2 sm:mb-3">
           <div className="flex items-center justify-between gap-2 mb-2.5">
             {arrowBtn(olderKey, 'prev')}
@@ -5913,13 +5921,44 @@
               {data.abandonedCount > 0 && <div className="text-xs text-slate-400 mt-2 pl-0.5">另有棄單 {data.abandonedCount} 筆，不計入以上金額</div>}
             </>
           )}
+
+          {/* [v2.14.59] 只看這個月：預設關閉；開啟後下面的階段卡、商品合計、列表都只算這個月。選「全部月份」時不能用 */}
+          <div className="flex items-center justify-between gap-3 border-t border-slate-100 mt-2.5 pt-2.5 min-h-[44px]">
+            <div className="min-w-0">
+              <div className={`text-sm font-medium ${isAll ? 'text-slate-300' : 'text-slate-700'}`}>只看這個月的訂單</div>
+              {isAll && <div className="text-[11px] text-slate-400">選了「全部月份」時無法使用</div>}
+            </div>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={linkOn}
+              aria-label="只看這個月的訂單"
+              disabled={isAll}
+              onClick={() => scope.setOnly(!scope.only)}
+              className={`relative w-12 h-7 rounded-full flex-shrink-0 transition-colors disabled:opacity-40 ${linkOn ? 'bg-emerald-600' : 'bg-slate-300'}`}
+            >
+              <span className={`absolute top-[3px] w-[22px] h-[22px] rounded-full bg-white shadow transition-all ${linkOn ? 'left-[23px]' : 'left-[3px]'}`}></span>
+            </button>
+          </div>
         </div>
+        {linkOn && (
+          <button
+            type="button"
+            onClick={() => scope.setOnly(false)}
+            className="w-full flex items-center justify-between gap-2 bg-emerald-50 border border-emerald-200 text-emerald-700 rounded-xl px-3 py-2 mb-2 sm:mb-3 text-[13px] font-bold"
+          >
+            <span>僅顯示 {monthLabel(selKey)} 的訂單</span>
+            <span className="font-medium whitespace-nowrap">全部顯示 ✕</span>
+          </button>
+        )}
+        </>
       );
     }
 
     function OrderListTab({ list }) {
       const {
         orders,
+        monthScope,
         filteredOrders,
         filteredOrdersTotal,
         orderListStats,
@@ -6393,7 +6432,7 @@
                   </div>
                 </div>
 
-                <MonthStatsCard orders={orders} />
+                <MonthStatsCard orders={orders} scope={monthScope} />
 
                 {/* Stats [v2.14.34]：四個「互不重疊」的階段（待出貨／待領貨／已領貨／棄單），加起來＝總訂單；金額另放一行 */}
                 {(() => {
@@ -6537,7 +6576,7 @@
 
                   <div className="text-[11px] sm:text-xs text-slate-400 flex items-center justify-between gap-2 border-t border-slate-100 pt-2">
                     <span className="min-w-0 truncate">
-                      {filteredOrders.length} / {orders.length} 筆 · 商品合計 <b className="text-slate-600">${filteredOrdersTotal.toLocaleString()}</b>
+                      {filteredOrders.length} / {orderListStats.total} 筆 · 商品合計 <b className="text-slate-600">${filteredOrdersTotal.toLocaleString()}</b>
                     </span>
                     <div className="flex items-center gap-1 flex-shrink-0">
                       {hasActiveOrderFilter && (
@@ -9624,6 +9663,10 @@
       const [filterPayment, setFilterPayment] = React.useState('all');
       const [filterShipment, setFilterShipment] = React.useState('all');
       const [filterDate, setFilterDate] = React.useState('all'); // [V2.6] 'all' 或 'YYYY-MM-DD'
+      // [v2.14.59] 月統計卡的月份與「只看這個月」開關（預設關）。monthSel：null＝當月、'all'＝全部月份、'YYYY-MM'。
+      // 開關關閉時，月份只影響月統計卡的數字，列表與階段卡永遠是全部訂單；開啟時才一起只看那個月。離開訂單列表分頁就重置（見下方 effect）。
+      const [monthSel, setMonthSel] = React.useState(null);
+      const [monthOnly, setMonthOnly] = React.useState(false);
       const [filterDelivery, setFilterDelivery] = React.useState('all'); // [V2.1] 'all' | '7-11' | '全家' | '宅配'
       const [expandedOrders, setExpandedOrders] = React.useState({});
       // [v2.14.12] 訂單列表在電腦寬螢幕（≥1280px）改左右分欄：目前選取要在右側顯示的訂單 id
@@ -11496,10 +11539,22 @@
         return importRawRows.length > 0 ? Object.keys(importRawRows[0]) : [];
       }, [importRawRows]);
 
+      // [v2.14.59] 離開訂單列表分頁就把月份與「只看這個月」重置，避免忘了開著、以為訂單不見了
+      React.useEffect(() => {
+        if (activeTab !== 'list') { setMonthSel(null); setMonthOnly(false); }
+      }, [activeTab]);
+
+      // [v2.14.59] 「只看這個月」開啟時，列表、階段卡、商品合計都只算這個月的訂單（依下單日歸月，同收支報表）；關閉時就是全部訂單
+      const activeMonthKey = monthOnly && monthSel !== 'all' ? (monthSel || toDateInputValue(Date.now()).slice(0, 7)) : null;
+      const scopedOrders = React.useMemo(
+        () => (activeMonthKey ? orders.filter(o => toDateInputValue(o.timestamp).slice(0, 7) === activeMonthKey) : orders),
+        [orders, activeMonthKey]
+      );
+
       // Filtered Orders for Tab 2
       const filteredOrders = React.useMemo(() => {
         const q = searchTerm.trim().toLowerCase();
-        return orders.filter(o => {
+        return scopedOrders.filter(o => {
           const matchSearch = !q || (
             o.customerName.toLowerCase().includes(q) ||
             o.customerPhone.includes(searchTerm.trim()) ||
@@ -11531,10 +11586,10 @@
 
           return matchSearch && matchPayment && matchShipment && matchDelivery && matchDate;
         });
-      }, [orders, searchTerm, filterPayment, filterShipment, filterDelivery, filterDate]);
+      }, [scopedOrders, searchTerm, filterPayment, filterShipment, filterDelivery, filterDate]);
 
-      // [V2.1] 訂單列表上方的統計卡片（以全部訂單計算，不受篩選影響）
-      const orderListStats = React.useMemo(() => computeOrderListStats(orders), [orders]);
+      // [V2.1] 訂單列表上方的統計卡片（不受搜尋與篩選影響；[v2.14.59] 只有「只看這個月」開啟時才限定該月）
+      const orderListStats = React.useMemo(() => computeOrderListStats(scopedOrders), [scopedOrders]);
 
       const filteredOrdersTotal = React.useMemo(() => {
         return filteredOrders.reduce((sum, o) => sum + calcOrderSubtotal(o), 0); // [v2.14.27] 商品合計，不含運費（與統計卡一致）
@@ -12667,6 +12722,7 @@
                 list={{
                   setMessageOrder,
                   orders,
+                  monthScope: { sel: monthSel, setSel: setMonthSel, only: monthOnly, setOnly: setMonthOnly },
                   filteredOrders,
                   filteredOrdersTotal,
                   orderListStats,
